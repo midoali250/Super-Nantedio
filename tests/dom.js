@@ -34,7 +34,12 @@ function requireJsdom() {
 
 function jsdomUnavailableReason() {
   requireJsdom();
-  return jsdomError ? String(jsdomError.message || jsdomError) : null;
+  if (!jsdomError) return null;
+  const msg = String(jsdomError.message || jsdomError);
+  const hint = /reading 'bind'|node:|ERR_REQUIRE/.test(msg)
+    ? ' (jsdom 30 needs Node >= 20.19 or >= 22.12; this is ' + process.version + ')'
+    : '';
+  return msg + hint;
 }
 
 /**
