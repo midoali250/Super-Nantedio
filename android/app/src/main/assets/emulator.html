@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Super Mario Bros. NES</title>
+    <title>Super Mario Bros. NES - Full Screen</title>
     <script src="https://cdn.jsdelivr.net/npm/jsnes@latest"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -14,7 +14,9 @@
             height: 100vh;
             width: 100vw;
             overflow: hidden;
+            touch-action: none;
         }
+        /* --- Full Screen Game Area --- */
         #screen-container {
             position: relative;
             width: 100vw;
@@ -32,26 +34,26 @@
             image-rendering: pixelated;
         }
 
-        /* Controls overlay at bottom */
+        /* --- Controls Overlay (Bottom) --- */
         #controls {
             position: absolute;
             bottom: 0;
             left: 0;
             right: 0;
             width: 100%;
-            height: 38vh;
+            height: 42vh;
             display: flex;
             padding: 12px 8px;
             gap: 15px;
             pointer-events: none;
-            background: linear-gradient(transparent, rgba(0,0,0,0.85));
+            background: linear-gradient(transparent, rgba(0,0,0,0.9));
         }
 
-        /* Joystick - LEFT side ( traditional NES D-pad position ) */
+        /* --- Joystick / D-Pad - LEFT side (Atari Style) --- */
         #joystick-container {
             position: relative;
-            width: 150px;
-            height: 150px;
+            width: 160px;
+            height: 160px;
             pointer-events: auto;
             display: flex;
             align-items: center;
@@ -59,23 +61,23 @@
             flex-shrink: 0;
         }
         #joystick-base {
-            width: 150px;
-            height: 150px;
-            background: rgba(255,255,255,0.08);
-            border: 3px solid rgba(0,255,255,0.35);
+            width: 160px;
+            height: 160px;
+            background: rgba(255,255,255,0.10);
+            border: 3px solid rgba(0,255,255,0.40);
             border-radius: 50%;
             position: absolute;
             top: 0; left: 0;
         }
         #joystick-knob {
-            width: 62px;
-            height: 62px;
+            width: 66px;
+            height: 66px;
             background: #00ffff;
-            border: 4px solid #fff;
+            border: 5px solid #fff;
             border-radius: 50%;
             position: absolute;
-            top: 44px; left: 44px;
-            box-shadow: 0 0 25px rgba(0,255,255,0.7);
+            top: 47px; left: 47px;
+            box-shadow: 0 0 30px rgba(0,255,255,0.8);
             pointer-events: none;
         }
         #joystick-touch {
@@ -85,7 +87,7 @@
             background: transparent;
         }
 
-        /* Action Buttons - RIGHT side */
+        /* --- Action Buttons - RIGHT side --- */
         #action-buttons {
             display: flex;
             flex-direction: column;
@@ -93,7 +95,7 @@
             justify-content: center;
             gap: 12px;
             pointer-events: auto;
-            width: 170px;
+            width: 180px;
             flex-shrink: 0;
         }
         .btn-row {
@@ -101,76 +103,79 @@
             gap: 12px;
         }
         .btn {
-            width: 72px;
-            height: 72px;
+            width: 76px;
+            height: 76px;
             border: none;
             border-radius: 50%;
             color: #fff;
             font-weight: bold;
-            font-size: 22px;
+            font-size: 24px;
             display: flex;
             align-items: center;
             justify-content: center;
             cursor: pointer;
-            box-shadow: 0 5px 0 rgba(0,0,0,0.4);
+            box-shadow: 0 6px 0 rgba(0,0,0,0.4);
             position: relative;
             touch-action: none;
         }
         .btn:active {
-            transform: translateY(5px);
+            transform: translateY(6px);
             box-shadow: 0 0 0 rgba(0,0,0,0.4);
         }
         /* A = Big Jump - Red */
-        .btn-a { background: #ff3333; font-size: 28px; }
+        .btn-a { background: #ff3333; font-size: 30px; }
         /* B = Small Jump - Green */
-        .btn-b { background: #33ff33; color: #000; font-size: 22px; }
+        .btn-b { background: #33ff33; color: #000; font-size: 24px; }
         /* SELECT = Single Shot - Orange */
-        .btn-select { background: #ff9900; font-size: 14px; padding: 0 8px; }
+        .btn-select { background: #ff9900; font-size: 15px; padding: 0 8px; }
         /* START = Rapid Fire - Purple */
-        .btn-start { background: #9933ff; font-size: 14px; padding: 0 8px; }
+        .btn-start { background: #9933ff; font-size: 15px; padding: 0 8px; }
 
         .btn-label {
             position: absolute;
-            top: -22px;
+            top: -24px;
             left: 50%;
             transform: translateX(-50%);
-            font-size: 11px;
+            font-size: 12px;
             color: #fff;
-            background: rgba(0,0,0,0.75);
-            padding: 2px 6px;
+            background: rgba(0,0,0,0.8);
+            padding: 3px 8px;
             border-radius: 4px;
             pointer-events: none;
             white-space: nowrap;
             border: 1px solid rgba(255,255,255,0.3);
         }
 
+        /* --- Loading Overlay --- */
         #loading {
             position: absolute;
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
             text-align: center;
-            display: none;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
             z-index: 100;
         }
         #loading.spinner {
-            width: 54px;
-            height: 54px;
-            border: 6px solid #222;
-            border-top: 6px solid #00ffff;
+            width: 60px;
+            height: 60px;
+            border: 7px solid #222;
+            border-top: 7px solid #00ffff;
             border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin: 0 auto 20px;
+            margin-bottom: 20px;
         }
         #loading-text {
             color: #00ffff;
-            font-size: 16px;
+            font-size: 18px;
             font-weight: bold;
-            text-shadow: 0 0 10px rgba(0,255,255,0.5);
+            text-shadow: 0 0 15px rgba(0,255,255,0.6);
         }
         @keyframes spin { 0% { transform: translate(-50%, -50%) rotate(0deg); } 100% { transform: translate(-50%, -50%) rotate(360deg); } }
 
-        /* Error message */
+        /* --- Error Message --- */
         #error-msg {
             position: absolute;
             top: 50%;
@@ -178,13 +183,14 @@
             transform: translate(-50%, -50%);
             text-align: center;
             color: #ff3333;
-            font-size: 15px;
+            font-size: 16px;
             display: none;
             z-index: 100;
-            background: rgba(0,0,0,0.8);
-            padding: 20px;
+            background: rgba(0,0,0,0.85);
+            padding: 24px;
             border-radius: 12px;
             border: 2px solid #ff3333;
+            max-width: 80%;
         }
     </style>
 </head>
@@ -197,13 +203,14 @@
         </div>
         <div id="error-msg">
             فشل في تحميل لعبة سوبر ماريو<br>
-            تأكد من تثبيت التطبيق بشكل صحيح
+            تأكد من تثبيت التطبيق بشكل صحيح<br>
+            اضغط START للمحاولة مرة أخرى
         </div>
         <canvas id="canvas"></canvas>
     </div>
 
     <div id="controls">
-        <!-- Joystick (Left) - traditional D-pad position -->
+        <!-- Joystick (Left) - Atari Style D-Pad Position -->
         <div id="joystick-container">
             <div id="joystick-base"></div>
             <div id="joystick-knob"></div>
@@ -258,7 +265,7 @@
     }
 
     function nesLoadROM() {
-        loadingDiv.style.display = 'block';
+        loadingDiv.style.display = 'flex';
         errorDiv.style.display = 'none';
 
         fetch('file:///android_asset/mario.nes')
@@ -281,7 +288,7 @@
 
     function nesPlay()  { if (nes) nes.play(); }
     function nesPause() { if (nes) nes.pause(); }
-    function nesReset() { if (nes) nes.reset(); }
+    function nesReset() { if (nes) { nes.reset(); nesLoadROM(); } }
 
     var KEY = {
         UP: JSNES.KEY_UP, DOWN: JSNES.KEY_DOWN, LEFT: JSNES.KEY_LEFT, RIGHT: JSNES.KEY_RIGHT,
@@ -312,7 +319,6 @@
         el.addEventListener('mouseup', function(e) { e.preventDefault(); release(key); });
         el.addEventListener('mouseleave', function(e) { e.preventDefault(); release(key); });
     }
-    // A = Big Jump, B = Small Jump, SELECT = Single Shot, START = Rapid Fire
     setupButton('btn-a', KEY.A);
     setupButton('btn-b', KEY.B);
     setupButton('btn-select', KEY.SELECT);
@@ -322,9 +328,9 @@
     var joystickBase   = document.getElementById('joystick-base');
     var joystickKnob   = document.getElementById('joystick-knob');
     var joystickTouch  = document.getElementById('joystick-touch');
-    var containerRect  = {cx: 75, cy: 75};
-    var maxStickDist   = 55;
-    var deadzone       = 15;
+    var containerRect  = {cx: 80, cy: 80};
+    var maxStickDist   = 60;
+    var deadzone       = 16;
     var joyActive      = false;
 
     function getTouchPos(e) {
@@ -339,7 +345,7 @@
         var nx = dx / maxStickDist;
         var ny = dy / maxStickDist;
 
-        var kx = dx - 31, ky = dy - 31;
+        var kx = dx - 33, ky = dy - 33;
         if (dist > deadzone) {
             joystickKnob.style.transform = 'translate(' + kx + 'px,' + ky + 'px)';
         } else {

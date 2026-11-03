@@ -1,17 +1,19 @@
-name: Android CI - Build & Test NES Emulator
+name: Android CI - Build, Emulate & Test NES Emulator
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
     env:
       ANDROID_HOME: /opt/android-sdk
       GRADLE_USER_HOME: ~/.gradle
+      ANDROID_AVD_HOME: /root/.android/avd
 
     steps:
       - name: Checkout repository
@@ -39,7 +41,7 @@ jobs:
 
       - name: Install Android SDK components
         run: |
-          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "emulator" "system-images;android-34;google_apis_playstore;x86_64"
 
       - name: Install Gradle
         run: |
@@ -56,6 +58,45 @@ jobs:
           cd android
           gradle assembleDebug --no-daemon --stacktrace
 
+      - name: Create Android Emulator AVD
+        run: |
+          echo "no" | ${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager create avd -n test_avd -k "system-images;android-34;google_apis_playstore;x86_64" -d pixel_4 --force
+
+      - name: Start Android Emulator
+        run: |
+          ${ANDROID_HOME}/emulator/emulator -avd test_avd -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim &
+          echo "Waiting for emulator to boot..."
+          ${ANDROID_HOME}/platform-tools/adb wait-for-device
+          until [ "$(${ANDROID_HOME}/platform-tools/adb shell getprop sys.boot_completed | tr -d '\r')" == "1" ]; do
+            sleep 5
+            echo "Still booting..."
+          done
+          echo "Emulator booted successfully!"
+          ${ANDROID_HOME}/platform-tools/adb devices
+
+      - name: Install APK on Emulator
+        run: |
+          ${ANDROID_HOME}/platform-tools/adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+          ${ANDROID_HOME}/platform-tools/adb shell pm list packages | grep bitvaultengine
+
+      - name: Launch Game on Emulator
+        run: |
+          ${ANDROID_HOME}/platform-tools/adb shell am start -n com.bitvaultengine.nes/.MainActivity
+          sleep 10
+          echo "Game launched on emulator"
+
+      - name: Capture Gameplay Screenshot
+        run: |
+          ${ANDROID_HOME}/platform-tools/adb shell screencap -p /sdcard/gameplay.png
+          ${ANDROID_HOME}/platform-tools/adb pull /sdcard/gameplay.png gameplay_screenshot.png
+          ls -la gameplay_screenshot.png
+
+      - name: Capture Gameplay Video (30 seconds)
+        run: |
+          ${ANDROID_HOME}/platform-tools/adb shell screenrecord --time-limit 30 /sdcard/gameplay.mp4
+          ${ANDROID_HOME}/platform-tools/adb pull /sdcard/gameplay.mp4 gameplay_video.mp4
+          ls -la gameplay_video.mp4
+
       - name: Verify APK exists
         run: |
           ls -la android/app/build/outputs/apk/debug/app-debug.apk
@@ -66,6 +107,20 @@ jobs:
         with:
           name: bitvault-engine-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: Upload Gameplay Screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: gameplay-screenshot
+          path: gameplay_screenshot.png
+          retention-days: 30
+
+      - name: Upload Gameplay Video
+        uses: actions/upload-artifact@v4
+        with:
+          name: gameplay-video
+          path: gameplay_video.mp4
           retention-days: 30
 
       - name: Disassemble NES ROM
@@ -80,7 +135,7 @@ jobs:
           retention-days: 30
 
   test:
-    needs: build
+    needs: build-and-test
     runs-on: ubuntu-latest
 
     steps:
@@ -108,3 +163,17 @@ jobs:
             exit 1
           fi
           echo "✅ NES ROM found: $(ls roms/*.nes)"
+
+      - name: Download Gameplay Screenshot
+        uses: actions/download-artifact@v4
+        with:
+          name: gameplay-screenshot
+          path: ./screenshot
+
+      - name: Verify Screenshot exists
+        run: |
+          if [ -f ./screenshot/gameplay_screenshot.png ]; then
+            echo "✅ Gameplay screenshot captured: $(wc -c < ./screenshot/gameplay_screenshot.png) bytes"
+          else
+            echo "⚠️ No gameplay screenshot found (emulator may not have completed)"
+          fi
