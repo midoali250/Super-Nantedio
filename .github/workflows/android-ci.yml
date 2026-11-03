@@ -20,13 +20,13 @@ jobs:
     name: Test the game (core, gameplay, UI)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '20'
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -51,7 +51,7 @@ jobs:
       - name: Emulator screenshots
         run: node tools/capture_screens.js
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: screenshots
@@ -66,21 +66,27 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Install Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install platform 34 + build-tools
+      # The runner image already ships the Android SDK; the command line tools
+      # let us add the exact platform/build-tools this project targets.
+      - name: Install Android SDK components
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" > /dev/null
-          echo "sdk.dir=${ANDROID_SDK_ROOT}" > android/local.properties
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SDKMGR="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMGR" ]; then SDKMGR="$(command -v sdkmanager)"; fi
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          echo "sdk.dir=$SDK" > android/local.properties
 
       - name: Sync the tested web assets into the APK
         run: ./tools/sync_web_assets.sh
@@ -103,7 +109,7 @@ jobs:
           unzip -l bitvaultengine.apk | grep -q 'assets/games/'
           echo "APK contains the emulator, the wasm core and the ROM"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: bitvaultengine-apk
           path: bitvaultengine.apk
