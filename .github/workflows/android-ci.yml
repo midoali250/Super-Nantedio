@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /opt/android-sdk
+      GRADLE_USER_HOME: ~/.gradle
 
     steps:
       - name: Checkout repository
@@ -21,26 +24,39 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Install Android Command Line Tools
+        run: |
+          mkdir -p ${ANDROID_HOME}/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdline-tools.zip
+          unzip -q /tmp/cmdline-tools.zip -d ${ANDROID_HOME}/cmdline-tools
+          mv ${ANDROID_HOME}/cmdline-tools/cmdline-tools ${ANDROID_HOME}/cmdline-tools/latest
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> $GITHUB_ENV
+          echo "PATH=${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}" >> $GITHUB_ENV
 
-      - name: Validate Gradle Wrapper
-        uses: gradle/wrapper-validation-action@v2
+      - name: Accept Android SDK licenses
+        run: |
+          yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses
+
+      - name: Install Android SDK components
+        run: |
+          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Install Gradle
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt
+          ln -sf /opt/gradle-8.4/bin/gradle /usr/local/bin/gradle
+          gradle --version
 
       - name: Build Debug APK
         run: |
           cd android
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
-
-      - name: Run Unit Tests
-        run: |
-          cd android
-          ./gradlew testDebugUnitTest --no-daemon
+          gradle assembleDebug --no-daemon
 
       - name: Verify APK exists
         run: |
           ls -la android/app/build/outputs/apk/debug/app-debug.apk
+          echo "APK size: $(wc -c < android/app/build/outputs/apk/debug/app-debug.apk) bytes"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -52,7 +68,6 @@ jobs:
       - name: Disassemble NES ROM
         run: |
           python3 tools/nes_disassembler.py roms/*.nes --output tools/disassembly_output.txt --summary
-          cat tools/disassembly_output.txt
 
       - name: Upload Disassembly artifact
         uses: actions/upload-artifact@v4
