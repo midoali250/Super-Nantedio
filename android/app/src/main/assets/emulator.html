@@ -3,94 +3,80 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>bitvaultengine NES Emulator</title>
+    <title>Super Mario Bros. NES</title>
     <script src="https://cdn.jsdelivr.net/npm/jsnes@latest"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-        body {
+        html, body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #1a1a2e;
+            background: #000;
             color: #fff;
             height: 100vh;
-            display: flex;
-            flex-direction: column;
+            width: 100vw;
             overflow: hidden;
         }
         #screen-container {
-            flex: 1;
+            position: relative;
+            width: 100vw;
+            height: 100vh;
             display: flex;
-            flex-direction: column;
             align-items: center;
             justify-content: center;
-            position: relative;
-            padding: 15px;
+            background: #000;
         }
         #canvas {
-            background: #000;
-            border: 4px solid #333;
-            border-radius: 8px;
-            box-shadow: 0 0 20px rgba(0,0,0,0.5);
-            max-width: 100%;
-            max-height: 65vh;
-            touch-action: none;
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
             display: block;
-        }
-        #status-bar {
-            padding: 8px;
-            background: #16213e;
-            text-align: center;
-            font-size: 13px;
-            color: #03dac5;
-            width: 100%;
+            image-rendering: pixelated;
         }
 
-        /* --- Controls Layout --- */
+        /* Controls overlay at bottom */
         #controls {
             position: absolute;
             bottom: 0;
             left: 0;
             right: 0;
             width: 100%;
-            height: 35vh;
+            height: 38vh;
             display: flex;
-            padding: 15px 10px;
-            gap: 20px;
+            padding: 12px 8px;
+            gap: 15px;
             pointer-events: none;
+            background: linear-gradient(transparent, rgba(0,0,0,0.85));
         }
 
-        /* --- Joystick (Left Side) --- */
+        /* Joystick - LEFT side ( traditional NES D-pad position ) */
         #joystick-container {
             position: relative;
-            width: 140px;
-            height: 140px;
+            width: 150px;
+            height: 150px;
             pointer-events: auto;
             display: flex;
             align-items: center;
             justify-content: center;
+            flex-shrink: 0;
         }
         #joystick-base {
-            width: 140px;
-            height: 140px;
-            background: rgba(255,255,255,0.12);
-            border: 3px solid rgba(3,218,197,0.35);
+            width: 150px;
+            height: 150px;
+            background: rgba(255,255,255,0.08);
+            border: 3px solid rgba(0,255,255,0.35);
             border-radius: 50%;
             position: absolute;
             top: 0; left: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
         }
         #joystick-knob {
-            width: 56px;
-            height: 56px;
-            background: #03dac5;
+            width: 62px;
+            height: 62px;
+            background: #00ffff;
             border: 4px solid #fff;
             border-radius: 50%;
             position: absolute;
-            top: 42px; left: 42px;
-            box-shadow: 0 0 15px rgba(3,218,197,0.6);
+            top: 44px; left: 44px;
+            box-shadow: 0 0 25px rgba(0,255,255,0.7);
             pointer-events: none;
-            touch-action: none;
         }
         #joystick-touch {
             position: absolute;
@@ -99,45 +85,65 @@
             background: transparent;
         }
 
-        /* --- Action Buttons (Right Side) --- */
+        /* Action Buttons - RIGHT side */
         #action-buttons {
             display: flex;
             flex-direction: column;
             align-items: flex-end;
             justify-content: center;
-            gap: 14px;
+            gap: 12px;
             pointer-events: auto;
-            width: 140px;
+            width: 170px;
+            flex-shrink: 0;
         }
         .btn-row {
             display: flex;
-            gap: 14px;
+            gap: 12px;
         }
         .btn {
-            width: 64px;
-            height: 64px;
+            width: 72px;
+            height: 72px;
             border: none;
             border-radius: 50%;
             color: #fff;
             font-weight: bold;
-            font-size: 20px;
+            font-size: 22px;
             display: flex;
             align-items: center;
             justify-content: center;
             cursor: pointer;
-            box-shadow: 0 4px 0 rgba(0,0,0,0.3);
+            box-shadow: 0 5px 0 rgba(0,0,0,0.4);
             position: relative;
+            touch-action: none;
         }
         .btn:active {
-            transform: translateY(4px);
-            box-shadow: 0 0 0 rgba(0,0,0,0.3);
+            transform: translateY(5px);
+            box-shadow: 0 0 0 rgba(0,0,0,0.4);
         }
-        .btn-a { background: #ff6b6b; }
-        .btn-b { background: #4ecdc4; color: #000; }
-        .btn-select { background: #ffa502; font-size: 13px; padding: 0 6px; }
-        .btn-start { background: #6c5ce7; font-size: 13px; padding: 0 6px; }
+        /* A = Big Jump - Red */
+        .btn-a { background: #ff3333; font-size: 28px; }
+        /* B = Small Jump - Green */
+        .btn-b { background: #33ff33; color: #000; font-size: 22px; }
+        /* SELECT = Single Shot - Orange */
+        .btn-select { background: #ff9900; font-size: 14px; padding: 0 8px; }
+        /* START = Rapid Fire - Purple */
+        .btn-start { background: #9933ff; font-size: 14px; padding: 0 8px; }
 
-        /* --- Loading Overlay --- */
+        .btn-label {
+            position: absolute;
+            top: -22px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 11px;
+            color: #fff;
+            background: rgba(0,0,0,0.75);
+            padding: 2px 6px;
+            border-radius: 4px;
+            pointer-events: none;
+            white-space: nowrap;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+
         #loading {
             position: absolute;
             top: 50%;
@@ -145,34 +151,59 @@
             transform: translate(-50%, -50%);
             text-align: center;
             display: none;
-            z-index: 10;
+            z-index: 100;
         }
         #loading.spinner {
-            width: 44px;
-            height: 44px;
-            border: 5px solid #333;
-            border-top: 5px solid #03dac5;
+            width: 54px;
+            height: 54px;
+            border: 6px solid #222;
+            border-top: 6px solid #00ffff;
             border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin: 0 auto 16px;
+            margin: 0 auto 20px;
+        }
+        #loading-text {
+            color: #00ffff;
+            font-size: 16px;
+            font-weight: bold;
+            text-shadow: 0 0 10px rgba(0,255,255,0.5);
         }
         @keyframes spin { 0% { transform: translate(-50%, -50%) rotate(0deg); } 100% { transform: translate(-50%, -50%) rotate(360deg); } }
 
-        /* Hide joystick hints for RTL cleanliness */
-        .hint { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); font-size: 11px; color: #888; pointer-events: none; }
+        /* Error message */
+        #error-msg {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            color: #ff3333;
+            font-size: 15px;
+            display: none;
+            z-index: 100;
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            border-radius: 12px;
+            border: 2px solid #ff3333;
+        }
     </style>
 </head>
 <body>
 
     <div id="screen-container">
-        <div id="loading" class="spinner"></div>
-        <div id="loading">جاري تحميل الروم…</div>
-        <canvas id="canvas" width="256" height="240"></canvas>
-        <div id="status-bar">المحاكي جاهز — منتظر تحميل الروم</div>
+        <div id="loading">
+            <div class="spinner"></div>
+            <div id="loading-text">جاري تحميل لعبة سوبر ماريو…</div>
+        </div>
+        <div id="error-msg">
+            فشل في تحميل لعبة سوبر ماريو<br>
+            تأكد من تثبيت التطبيق بشكل صحيح
+        </div>
+        <canvas id="canvas"></canvas>
     </div>
 
     <div id="controls">
-        <!-- Joystick (Left) -->
+        <!-- Joystick (Left) - traditional D-pad position -->
         <div id="joystick-container">
             <div id="joystick-base"></div>
             <div id="joystick-knob"></div>
@@ -182,30 +213,31 @@
         <!-- Action Buttons (Right) -->
         <div id="action-buttons">
             <div class="btn-row">
-                <button class="btn btn-b" id="btn-b">B</button>
+                <div class="btn-label">قفزة كبيرة (A)</div>
                 <button class="btn btn-a" id="btn-a">A</button>
+                <div class="btn-label">طلقة واحدة (SELECT)</div>
+                <button class="btn btn-select" id="btn-select">SHOT</button>
             </div>
             <div class="btn-row">
-                <button class="btn btn-select" id="btn-select">SELECT</button>
-                <button class="btn btn-start" id="btn-start">START</button>
+                <div class="btn-label">قفزة صغيرة (B)</div>
+                <button class="btn btn-b" id="btn-b">B</button>
+                <div class="btn-label">طلق متعدد (START)</div>
+                <button class="btn btn-start" id="btn-start">RAPID</button>
             </div>
         </div>
     </div>
 
-<div class="hint">عصاية حركة يسار • أزرار A/B/SELECT/START يمين</div>
-
 <script>
-    /* ============ NES Core ============ */
     var nes = null;
     var canvas = document.getElementById('canvas');
-    var ctx = canvas.getContext('2d');
+    var ctx = canvas.getContext('2d', { alpha: false });
     var imageData = null;
-    var statusBar = document.getElementById('status-bar');
     var loadingDiv = document.getElementById('loading');
+    var errorDiv = document.getElementById('error-msg');
 
-    function setStatus(msg) {
-        statusBar.textContent = msg;
-        if (window.NES) window.NES.onStatus(msg);
+    function resizeCanvas() {
+        canvas.width = 256;
+        canvas.height = 240;
     }
 
     function initNES() {
@@ -223,15 +255,13 @@
                 ctx.putImageData(imageData, 0, 0);
             }
         });
-        setStatus('تم تهيئة المحاكي بنجاح');
     }
 
-    /* ============ ROM Loading ============ */
     function nesLoadROM() {
         loadingDiv.style.display = 'block';
-        setStatus('جاري تحميل الروم من الأصول…');
+        errorDiv.style.display = 'none';
 
-        fetch('file:///android_asset/Super%20Mario%20Bros.%20%2B%20Duck%20Hunt%20%2B%20World%20Class%20Track%20Meet%20(U)%20(PRG0)%20[!].nes')
+        fetch('file:///android_asset/mario.nes')
             .then(function(response) {
                 if (!response.ok) throw new Error('HTTP error! status: ' + response.status);
                 return response.arrayBuffer();
@@ -240,36 +270,25 @@
                 var romData = new Uint8Array(buffer);
                 nes.loadROM(romData);
                 loadingDiv.style.display = 'none';
-                setStatus('تم تحميل الروم — Super Mario Bros.');
-                if (window.NES) window.NES.onROMLoaded(true);
                 nesPlay();
             })
             .catch(function(error) {
                 console.error('Error loading ROM:', error);
                 loadingDiv.style.display = 'none';
-                setStatus('فشل تحميل الروم: ' + error.message);
-                if (window.NES) window.NES.onROMLoaded(false);
+                errorDiv.style.display = 'block';
             });
     }
 
-    function nesPlay()  { if (nes) { nes.play();  setStatus('التشغيل جاري…'); } }
-    function nesPause() { if (nes) { nes.pause(); setStatus('متوقف مؤقتاً'); } }
-    function nesReset() { if (nes) { nes.reset(); setStatus('تم إعادة التشغيل'); } }
+    function nesPlay()  { if (nes) nes.play(); }
+    function nesPause() { if (nes) nes.pause(); }
+    function nesReset() { if (nes) nes.reset(); }
 
-    /* ============ Key Mapping ============ */
     var KEY = {
-        UP:    JSNES.KEY_UP,
-        DOWN:  JSNES.KEY_DOWN,
-        LEFT:  JSNES.KEY_LEFT,
-        RIGHT: JSNES.KEY_RIGHT,
-        A:     JSNES.KEY_A,
-        B:     JSNES.KEY_B,
-        SELECT: JSNES.KEY_SELECT,
-        START: JSNES.KEY_START
+        UP: JSNES.KEY_UP, DOWN: JSNES.KEY_DOWN, LEFT: JSNES.KEY_LEFT, RIGHT: JSNES.KEY_RIGHT,
+        A: JSNES.KEY_A, B: JSNES.KEY_B, SELECT: JSNES.KEY_SELECT, START: JSNES.KEY_START
     };
 
     var activeKeys = {};
-
     function press(key) {
         if (!activeKeys[key]) {
             activeKeys[key] = true;
@@ -283,31 +302,30 @@
         }
     }
 
-    /* ============ Action Buttons ============ */
     function setupButton(id, key) {
         var el = document.getElementById(id);
         if (!el) return;
         el.addEventListener('touchstart', function(e) { e.preventDefault(); press(key); }, {passive:false});
-        el.addEventListener('touchend',   function(e) { e.preventDefault(); release(key); }, {passive:false});
-        el.addEventListener('touchcancel',function(e) { e.preventDefault(); release(key); }, {passive:false});
-        el.addEventListener('mousedown',  function(e) { e.preventDefault(); press(key); });
-        el.addEventListener('mouseup',    function(e) { e.preventDefault(); release(key); });
+        el.addEventListener('touchend', function(e) { e.preventDefault(); release(key); }, {passive:false});
+        el.addEventListener('touchcancel', function(e) { e.preventDefault(); release(key); }, {passive:false});
+        el.addEventListener('mousedown', function(e) { e.preventDefault(); press(key); });
+        el.addEventListener('mouseup', function(e) { e.preventDefault(); release(key); });
         el.addEventListener('mouseleave', function(e) { e.preventDefault(); release(key); });
     }
+    // A = Big Jump, B = Small Jump, SELECT = Single Shot, START = Rapid Fire
     setupButton('btn-a', KEY.A);
     setupButton('btn-b', KEY.B);
     setupButton('btn-select', KEY.SELECT);
     setupButton('btn-start', KEY.START);
 
-    /* ============ Virtual Joystick ============ */
+    /* Joystick - LEFT side */
     var joystickBase   = document.getElementById('joystick-base');
     var joystickKnob   = document.getElementById('joystick-knob');
     var joystickTouch  = document.getElementById('joystick-touch');
-    var containerRect  = {cx: 70, cy: 70}; // center of 140px container
-    var maxStickDist   = 52; // base radius (70) - knob radius (28) - small gap
-    var deadzone       = 14;
+    var containerRect  = {cx: 75, cy: 75};
+    var maxStickDist   = 55;
+    var deadzone       = 15;
     var joyActive      = false;
-    var joyDir         = {x: 0, y: 0};
 
     function getTouchPos(e) {
         var r = joystickTouch.getBoundingClientRect();
@@ -317,17 +335,11 @@
 
     function updateJoystick(dx, dy) {
         var dist = Math.sqrt(dx*dx + dy*dy);
-        var angle = Math.atan2(dy, dx);
-
-        // Clamp to max radius
         if (dist > maxStickDist) dist = maxStickDist;
-
-        var nx = dx / maxStickDist; // normalized -1..1
+        var nx = dx / maxStickDist;
         var ny = dy / maxStickDist;
 
-        // Move knob visually
-        var kx = dx - 28; // knob half-size
-        var ky = dy - 28;
+        var kx = dx - 31, ky = dy - 31;
         if (dist > deadzone) {
             joystickKnob.style.transform = 'translate(' + kx + 'px,' + ky + 'px)';
         } else {
@@ -335,43 +347,22 @@
             nx = 0; ny = 0;
         }
 
-        // Map to NES directions (8-way)
         var up = false, down = false, left = false, right = false;
-
         if (dist > deadzone) {
-            // Threshold for cardinal vs diagonal
             var absX = Math.abs(nx), absY = Math.abs(ny);
             if (absY > 0.35) { if (ny < 0) up = true; else down = true; }
             if (absX > 0.35) { if (nx < 0) left = true; else right = true; }
         }
 
-        // Update keys
-        pressRelease(KEY.UP,    up);
-        pressRelease(KEY.DOWN,  down);
-        pressRelease(KEY.LEFT,  left);
+        pressRelease(KEY.UP, up);
+        pressRelease(KEY.DOWN, down);
+        pressRelease(KEY.LEFT, left);
         pressRelease(KEY.RIGHT, right);
-
-        joyDir = {x: nx, y: ny};
     }
 
     function pressRelease(key, state) {
         if (state) press(key); else release(key);
     }
-
-    // Touch events on joystick area
-    joystickTouch.addEventListener('touchstart', function(e) {
-        e.preventDefault();
-        joyActive = true;
-        var p = getTouchPos(e);
-        updateJoystick(p.x - containerRect.cx, p.y - containerRect.cy);
-    }, {passive:false});
-
-    joystickTouch.addEventListener('touchmove', function(e) {
-        e.preventDefault();
-        if (!joyActive) return;
-        var p = getTouchPos(e);
-        updateJoystick(p.x - containerRect.cx, p.y - containerRect.cy);
-    }, {passive:false});
 
     function endJoystick() {
         joyActive = false;
@@ -380,17 +371,30 @@
         pressRelease(KEY.DOWN, false);
         pressRelease(KEY.LEFT, false);
         pressRelease(KEY.RIGHT, false);
-        joyDir = {x: 0, y: 0};
     }
 
-    joystickTouch.addEventListener('touchend',   function(e) { e.preventDefault(); endJoystick(); }, {passive:false});
-    joystickTouch.addEventListener('touchcancel',function(e) { e.preventDefault(); endJoystick(); }, {passive:false});
-
-    // Mouse fallback for testing on PC
-    joystickTouch.addEventListener('mousedown', function(e) {
+    joystickTouch.addEventListener('touchstart', function(e) {
+        e.preventDefault();
         joyActive = true;
         var p = getTouchPos(e);
         updateJoystick(p.x - containerRect.cx, p.y - containerRect.cy);
+    }, {passive:false});
+    joystickTouch.addEventListener('touchmove', function(e) {
+        e.preventDefault();
+        if (!joyActive) return;
+        var p = getTouchPos(e);
+        updateJoystick(p.x - containerRect.cx, p.y - containerRect.cy);
+    }, {passive:false});
+    joystickTouch.addEventListener('touchend', function(e) { e.preventDefault(); endJoystick(); }, {passive:false});
+    joystickTouch.addEventListener('touchcancel', function(e) { e.preventDefault(); endJoystick(); }, {passive:false});
+
+    window.addEventListener('mousedown', function(e) {
+        var r = joystickTouch.getBoundingClientRect();
+        if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) {
+            joyActive = true;
+            var p = getTouchPos(e);
+            updateJoystick(p.x - containerRect.cx, p.y - containerRect.cy);
+        }
     });
     window.addEventListener('mousemove', function(e) {
         if (!joyActive) return;
@@ -399,7 +403,7 @@
     });
     window.addEventListener('mouseup', endJoystick);
 
-    /* ============ Keyboard (PC testing) ============ */
+    // Keyboard for PC testing
     var keyMapCode = {
         'ArrowUp': KEY.UP, 'ArrowDown': KEY.DOWN, 'ArrowLeft': KEY.LEFT, 'ArrowRight': KEY.RIGHT,
         'z': KEY.A, 'x': KEY.B, 'a': KEY.SELECT, 's': KEY.START,
@@ -414,11 +418,12 @@
         if (k) { e.preventDefault(); release(k); }
     });
 
-    /* ============ Init ============ */
     window.addEventListener('DOMContentLoaded', function() {
+        resizeCanvas();
         initNES();
-        setTimeout(nesLoadROM, 400);
+        setTimeout(nesLoadROM, 600);
     });
+    window.addEventListener('resize', resizeCanvas);
 </script>
 
 </body>
