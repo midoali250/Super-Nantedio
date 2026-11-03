@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Super Mario Bros. NES - Full Screen</title>
+    <title>Super Mario Bros. NES</title>
     <script src="https://cdn.jsdelivr.net/npm/jsnes@latest"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -16,7 +16,6 @@
             overflow: hidden;
             touch-action: none;
         }
-        /* --- Full Screen Game Area --- */
         #screen-container {
             position: relative;
             width: 100vw;
@@ -33,8 +32,6 @@
             display: block;
             image-rendering: pixelated;
         }
-
-        /* --- Controls Overlay (Bottom) --- */
         #controls {
             position: absolute;
             bottom: 0;
@@ -48,8 +45,6 @@
             pointer-events: none;
             background: linear-gradient(transparent, rgba(0,0,0,0.9));
         }
-
-        /* --- Joystick / D-Pad - LEFT side (Atari Style) --- */
         #joystick-container {
             position: relative;
             width: 160px;
@@ -86,8 +81,6 @@
             width: 100%; height: 100%;
             background: transparent;
         }
-
-        /* --- Action Buttons - RIGHT side --- */
         #action-buttons {
             display: flex;
             flex-direction: column;
@@ -122,15 +115,10 @@
             transform: translateY(6px);
             box-shadow: 0 0 0 rgba(0,0,0,0.4);
         }
-        /* A = Big Jump - Red */
         .btn-a { background: #ff3333; font-size: 30px; }
-        /* B = Small Jump - Green */
         .btn-b { background: #33ff33; color: #000; font-size: 24px; }
-        /* SELECT = Single Shot - Orange */
         .btn-select { background: #ff9900; font-size: 15px; padding: 0 8px; }
-        /* START = Rapid Fire - Purple */
         .btn-start { background: #9933ff; font-size: 15px; padding: 0 8px; }
-
         .btn-label {
             position: absolute;
             top: -24px;
@@ -145,8 +133,6 @@
             white-space: nowrap;
             border: 1px solid rgba(255,255,255,0.3);
         }
-
-        /* --- Loading Overlay --- */
         #loading {
             position: absolute;
             top: 50%;
@@ -174,8 +160,6 @@
             text-shadow: 0 0 15px rgba(0,255,255,0.6);
         }
         @keyframes spin { 0% { transform: translate(-50%, -50%) rotate(0deg); } 100% { transform: translate(-50%, -50%) rotate(360deg); } }
-
-        /* --- Error Message --- */
         #error-msg {
             position: absolute;
             top: 50%;
@@ -203,14 +187,13 @@
         </div>
         <div id="error-msg">
             فشل في تحميل لعبة سوبر ماريو<br>
-            تأكد من تثبيت التطبيق بشكل صحيح<br>
-            اضغط START للمحاولة مرة أخرى
+            تأكد من تثبيت التطبيق بشكل صحيح
         </div>
         <canvas id="canvas"></canvas>
     </div>
 
     <div id="controls">
-        <!-- Action Buttons (Right side in RTL layout) -->
+        <!-- Action Buttons (Right side - Atari style) -->
         <div id="action-buttons">
             <div class="btn-row">
                 <div class="btn-label">قفزة كبيرة (A)</div>
@@ -226,7 +209,7 @@
             </div>
         </div>
 
-        <!-- Joystick / D-Pad (Left side in RTL layout - Atari Style) -->
+        <!-- Joystick / D-Pad (Left side - Atari style) -->
         <div id="joystick-container">
             <div id="joystick-base"></div>
             <div id="joystick-knob"></div>
@@ -268,37 +251,25 @@
         loadingDiv.style.display = 'flex';
         errorDiv.style.display = 'none';
 
-        // Get ROM base64 from Android Java interface
-        var romBase64 = window.NES ? window.NES.getROMBase64() : null;
+        // ROM filename EXACTLY as in the project: Super Mario Bros. + Duck Hunt (E) [!].nes
+        var romFilename = 'Super%20Mario%20Bros.%20%2B%20Duck%20Hunt%20(E)%20[%21].nes';
 
-        if (!romBase64) {
-            loadingDiv.style.display = 'none';
-            errorDiv.style.display = 'block';
-            return;
-        }
-
-        try {
-            var romData = base64ToUint8Array(romBase64);
-            nes.loadROM(romData);
-            loadingDiv.style.display = 'none';
-            if (window.NES) window.NES.onROMLoaded(true);
-            nesPlay();
-        } catch (e) {
-            console.error('Error loading ROM:', e);
-            loadingDiv.style.display = 'none';
-            errorDiv.style.display = 'block';
-            if (window.NES) window.NES.onROMLoaded(false);
-        }
-    }
-
-    function base64ToUint8Array(base64) {
-        var binary = atob(base64);
-        var len = binary.length;
-        var bytes = new Uint8Array(len);
-        for (var i = 0; i < len; i++) {
-            bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes;
+        fetch('file:///android_asset/' + romFilename)
+            .then(function(response) {
+                if (!response.ok) throw new Error('HTTP error! status: ' + response.status);
+                return response.arrayBuffer();
+            })
+            .then(function(buffer) {
+                var romData = new Uint8Array(buffer);
+                nes.loadROM(romData);
+                loadingDiv.style.display = 'none';
+                nesPlay();
+            })
+            .catch(function(error) {
+                console.error('Error loading ROM:', error);
+                loadingDiv.style.display = 'none';
+                errorDiv.style.display = 'block';
+            });
     }
 
     function nesPlay()  { if (nes) nes.play(); }
@@ -339,7 +310,6 @@
     setupButton('btn-select', KEY.SELECT);
     setupButton('btn-start', KEY.START);
 
-    /* Joystick - LEFT side */
     var joystickBase   = document.getElementById('joystick-base');
     var joystickKnob   = document.getElementById('joystick-knob');
     var joystickTouch  = document.getElementById('joystick-touch');
@@ -424,7 +394,6 @@
     });
     window.addEventListener('mouseup', endJoystick);
 
-    // Keyboard for PC testing
     var keyMapCode = {
         'ArrowUp': KEY.UP, 'ArrowDown': KEY.DOWN, 'ArrowLeft': KEY.LEFT, 'ArrowRight': KEY.RIGHT,
         'z': KEY.A, 'x': KEY.B, 'a': KEY.SELECT, 's': KEY.START,
