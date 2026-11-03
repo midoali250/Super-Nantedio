@@ -99,6 +99,21 @@ class Assertions {
 
 async function main() {
   const only = process.argv[2];
+
+  // environment banner: makes CI logs self-explanatory
+  let jsdomInfo = 'jsdom: missing';
+  try {
+    jsdomInfo = 'jsdom: ' + require('jsdom/package.json').version;
+  } catch (e) { /* reported below */ }
+  process.stdout.write('node ' + process.version + ' · ' + jsdomInfo + '\n');
+  if (process.env.REQUIRE_JSDOM) {
+    const dom = require('./dom');
+    if (!dom.requireJsdom()) {
+      process.stdout.write(C.red + 'jsdom is required but unavailable: ' +
+        dom.jsdomUnavailableReason() + C.reset + '\n');
+      process.exit(1);
+    }
+  }
   const dir = path.join(__dirname, 'suites');
   const files = fs.readdirSync(dir).filter((f) => f.endsWith('.test.js')).sort();
 

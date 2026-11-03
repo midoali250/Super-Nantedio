@@ -43,7 +43,15 @@ jobs:
           git diff --exit-code --stat android/app/src/main/assets \
             || (echo "::error::android assets were out of date; run tools/sync_web_assets.sh" && exit 1)
 
+      - name: Check the test toolchain
+        run: |
+          node --version
+          npm --version
+          node -e "console.log('jsdom', require('jsdom/package.json').version)"
+
       - name: Run the test-suite (ROM, core, gameplay, golden frames, UI)
+        env:
+          REQUIRE_JSDOM: '1'
         run: |
           set -o pipefail
           node tests/run.js 2>&1 | tee /tmp/tests.log

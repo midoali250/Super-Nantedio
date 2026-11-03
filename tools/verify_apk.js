@@ -118,7 +118,8 @@ function main() {
   /* ------------------------ 4. boot the app from the APK's own assets */
 
   if (!dom.requireJsdom()) {
-    console.log('  ! jsdom is not installed, skipping the runtime boot');
+    console.log('  ! jsdom unavailable, skipping the runtime boot: ' + dom.jsdomUnavailableReason());
+    fail('jsdom is required to boot the app from the APK');
   } else {
     const page = dom.bootPage(assetsRoot);
     const window = page.window;

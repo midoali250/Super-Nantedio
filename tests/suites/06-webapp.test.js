@@ -15,6 +15,10 @@ const dom = require('../dom');
 
 const WWW = path.join(h.ROOT, 'emulator', 'www');
 const jsdom = dom.requireJsdom();
+if (!jsdom && process.env.REQUIRE_JSDOM) {
+  throw new Error('jsdom is required in this environment but could not be loaded: ' +
+    dom.jsdomUnavailableReason());
+}
 const bootPage = () => dom.bootPage(WWW);
 const { pump, waitBooted, hold, release, press, click, startMario, skyPixels } = dom;
 
@@ -29,7 +33,7 @@ module.exports = {
   name: 'Web UI (index.html + app.js in a real DOM)',
   tests: {
     'index.html boots the wasm core and starts the game': async (t) => {
-      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped');
+      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped: ' + dom.jsdomUnavailableReason());
       const dom = bootPage();
       const window = dom.window;
       t.ok(window.document.getElementById('canvas'), 'the game canvas exists');
@@ -47,7 +51,7 @@ module.exports = {
     },
 
     'the boot overlay is hidden once the ROM is running': async (t) => {
-      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped');
+      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped: ' + dom.jsdomUnavailableReason());
       const dom = bootPage();
       const window = dom.window;
       await waitBooted(window);
@@ -58,7 +62,7 @@ module.exports = {
     },
 
     'on-screen pad buttons reach the game (START boots World 1-1)': async (t) => {
-      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped');
+      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped: ' + dom.jsdomUnavailableReason());
       const dom = bootPage();
       const window = dom.window;
       await waitBooted(window);
@@ -71,7 +75,7 @@ module.exports = {
     },
 
     'holding RIGHT on the pad moves Mario': async (t) => {
-      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped');
+      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped: ' + dom.jsdomUnavailableReason());
       const dom = bootPage();
       const window = dom.window;
       await waitBooted(window);
@@ -87,7 +91,7 @@ module.exports = {
     },
 
     'keyboard controls work (Enter = START)': async (t) => {
-      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped');
+      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped: ' + dom.jsdomUnavailableReason());
       const dom = bootPage();
       const window = dom.window;
       await waitBooted(window);
@@ -105,7 +109,7 @@ module.exports = {
     },
 
     'menu sheet opens, saves and restores a state': async (t) => {
-      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped');
+      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped: ' + dom.jsdomUnavailableReason());
       const dom = bootPage();
       const window = dom.window;
       await waitBooted(window);
@@ -129,7 +133,7 @@ module.exports = {
     },
 
     'the in-app self-test passes inside the real UI': async (t) => {
-      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped');
+      if (!jsdom) return t.ok(true, 'jsdom not installed, skipped: ' + dom.jsdomUnavailableReason());
       const page = bootPage();
       const window = page.window;
       await waitBooted(window);

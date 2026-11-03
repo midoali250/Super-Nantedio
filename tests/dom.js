@@ -18,12 +18,23 @@ const ORIGIN = 'https://appassets.androidplatform.net/assets/';
 const ROM_NAME = 'Super Mario Bros. + Duck Hunt (E) [!].nes';
 const ROM_URL = 'games/Super%20Mario%20Bros.%20%2B%20Duck%20Hunt%20(E)%20%5B!%5D.nes';
 
+let jsdomModule;
+let jsdomError = null;
+
 function requireJsdom() {
+  if (jsdomModule) return jsdomModule;
   try {
-    return require('jsdom');
+    jsdomModule = require('jsdom');
+    return jsdomModule;
   } catch (e) {
+    jsdomError = e;   // kept so the runner can print the real reason
     return null;
   }
+}
+
+function jsdomUnavailableReason() {
+  requireJsdom();
+  return jsdomError ? String(jsdomError.message || jsdomError) : null;
 }
 
 /**
@@ -207,6 +218,7 @@ module.exports = {
   ROM_NAME,
   ROM_URL,
   requireJsdom,
+  jsdomUnavailableReason,
   bootPage,
   pump,
   waitBooted,
