@@ -31,7 +31,7 @@ jobs:
           unzip -q /tmp/cmdline-tools.zip -d ${ANDROID_HOME}/cmdline-tools
           mv ${ANDROID_HOME}/cmdline-tools/cmdline-tools ${ANDROID_HOME}/cmdline-tools/latest
           echo "ANDROID_HOME=${ANDROID_HOME}" >> $GITHUB_ENV
-          echo "PATH=${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}" >> $GITHUB_ENV
+          echo "PATH=${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/34.0.0:${PATH}" >> $GITHUB_ENV
 
       - name: Accept Android SDK licenses
         run: |
@@ -46,12 +46,15 @@ jobs:
           wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip -O /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d /opt
           ln -sf /opt/gradle-8.4/bin/gradle /usr/local/bin/gradle
-          gradle --version
+
+      - name: Create local.properties
+        run: |
+          echo "sdk.dir=${ANDROID_HOME}" > android/local.properties
 
       - name: Build Debug APK
         run: |
           cd android
-          gradle assembleDebug --no-daemon
+          gradle assembleDebug --no-daemon --stacktrace
 
       - name: Verify APK exists
         run: |
