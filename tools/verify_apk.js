@@ -36,13 +36,35 @@ const REQUIRED_ASSETS = [
   'games/Super Mario Bros. + Duck Hunt (E) [!].nes'
 ];
 
+const checks = [];
+
 function fail(msg) {
+  checks.push({ ok: false, message: msg });
   console.error('  ✗ ' + msg);
   process.exitCode = 1;
 }
 
 function ok(msg) {
+  checks.push({ ok: true, message: msg });
   console.log('  ✓ ' + msg);
+}
+
+/** Write apk-verification.json next to the APK (used by CI's release notes). */
+function writeReport(apk) {
+  const passed = checks.filter((c) => c.ok).length;
+  const report = {
+    apk: path.basename(apk),
+    size: fs.statSync(apk).size,
+    sha256: sha256(apk),
+    checks: checks.length,
+    passed: passed,
+    verified: process.exitCode !== 1 && checks.length > 0 && passed === checks.length,
+    results: checks
+  };
+  const out = path.join(process.cwd(), 'apk-verification.json');
+  fs.writeFileSync(out, JSON.stringify(report, null, 2));
+  console.log('report: ' + out + ' (' + passed + '/' + checks.length + ' checks)');
+  return report;
 }
 
 function sha256(file) {
@@ -176,6 +198,7 @@ function main() {
     } else {
       console.log('\nAPK VERIFIED — this exact file plays the game.');
     }
+    writeReport(apk);
   }
 }
 

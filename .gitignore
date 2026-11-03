@@ -2,3 +2,4 @@ node_modules/
 tests/artifacts/
 *.log
 tmp/
+apk-verification.json

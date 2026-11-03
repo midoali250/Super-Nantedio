@@ -221,12 +221,16 @@ jobs:
           TAG="apk-${{ github.run_number }}-${{ github.run_attempt }}"
           SUMMARY=$(cat /tmp/ci-artifacts/tests-log.txt tests-log.txt 2>/dev/null \
             | grep -a -E 'ALL PASSED' | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^ *//' || true)
+          VERIFIED=$(node -e "const r=require('./apk-verification.json');console.log(r.passed+'/'+r.checks+' checks, sha256 '+r.sha256)" 2>/dev/null || echo 'not run')
+          SIZE=$(node -e "const r=require('./apk-verification.json');console.log((r.size/1024/1024).toFixed(2)+' MB')" 2>/dev/null || echo '?')
           cat > notes.md <<EOF
           **Super Mario Bros. + Duck Hunt (E)** — the 3-in-1 cart (Mario, Duck Hunt,
           World Class Track Meet) running on the SEN NES core (WASM).
 
           * built from commit \`${{ github.sha }}\`
           * tests: ${SUMMARY:-see the CI run}
+          * packaged APK verification: ${VERIFIED}
+          * size: ${SIZE}
           * the APK itself was unpacked, byte-compared with the tested sources and
             booted from its own assets before this release (\`tools/verify_apk.js\`)
 
@@ -241,23 +245,6 @@ jobs:
             echo "### Download"
             echo "<https://github.com/${{ github.repository }}/releases/latest/download/bitvaultengine.apk>"
           } >> $GITHUB_STEP_SUMMARY
-
-      # Debug channel: the APK verification report on the scratch branch.
-      - name: Publish the verification report
-        if: always()
-        continue-on-error: true
-        run: |
-          set +e
-          cp apk-verification.txt report.txt 2>/dev/null
-          test -s report.txt || echo "verification did not run" > report.txt
-          git stash -u -q 2>/dev/null
-          git checkout -q -B ci-logs origin/ci-logs
-          git config user.name "ci-bot"
-          git config user.email "ci@users.noreply.github.com"
-          cp /tmp/apk-verify-report.txt apk-verification.txt 2>/dev/null || true
-          git add -f apk-verification.txt
-          git commit -qm "ci: APK verification for ${GITHUB_SHA}" || true
-          git push -q -f origin ci-logs
 
       - name: Summary
         run: |
