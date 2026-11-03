@@ -268,22 +268,37 @@
         loadingDiv.style.display = 'flex';
         errorDiv.style.display = 'none';
 
-        fetch('file:///android_asset/mario.nes')
-            .then(function(response) {
-                if (!response.ok) throw new Error('HTTP error! status: ' + response.status);
-                return response.arrayBuffer();
-            })
-            .then(function(buffer) {
-                var romData = new Uint8Array(buffer);
-                nes.loadROM(romData);
-                loadingDiv.style.display = 'none';
-                nesPlay();
-            })
-            .catch(function(error) {
-                console.error('Error loading ROM:', error);
-                loadingDiv.style.display = 'none';
-                errorDiv.style.display = 'block';
-            });
+        // Get ROM base64 from Android Java interface
+        var romBase64 = window.NES ? window.NES.getROMBase64() : null;
+
+        if (!romBase64) {
+            loadingDiv.style.display = 'none';
+            errorDiv.style.display = 'block';
+            return;
+        }
+
+        try {
+            var romData = base64ToUint8Array(romBase64);
+            nes.loadROM(romData);
+            loadingDiv.style.display = 'none';
+            if (window.NES) window.NES.onROMLoaded(true);
+            nesPlay();
+        } catch (e) {
+            console.error('Error loading ROM:', e);
+            loadingDiv.style.display = 'none';
+            errorDiv.style.display = 'block';
+            if (window.NES) window.NES.onROMLoaded(false);
+        }
+    }
+
+    function base64ToUint8Array(base64) {
+        var binary = atob(base64);
+        var len = binary.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
     }
 
     function nesPlay()  { if (nes) nes.play(); }
