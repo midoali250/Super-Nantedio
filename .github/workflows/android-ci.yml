@@ -77,6 +77,12 @@ jobs:
         run: |
           cp /tmp/tests.log tests-log.txt 2>/dev/null || true
           tail -40 /tmp/tests.log 2>/dev/null || true
+          {
+            echo "### Test-suite"
+            echo '```'
+            grep -a -E "ALL PASSED|FAILED|^node " tests-log.txt | sed 's/\x1b\[[0-9;]*m//g' || true
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Fail the job if the tests failed
         if: always()
@@ -154,6 +160,13 @@ jobs:
           "$SDKMGR" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
           echo "sdk.dir=$SDK" > android/local.properties
 
+      - name: Fetch the test log of this run
+        continue-on-error: true
+        uses: actions/download-artifact@v5
+        with:
+          name: screenshots
+          path: /tmp/ci-artifacts
+
       - name: Sync the tested web assets into the APK
         run: ./tools/sync_web_assets.sh
 
@@ -198,7 +211,8 @@ jobs:
           set -euo pipefail
           # run_number is monotonic, so "latest" is always the newest build
           TAG="apk-${{ github.run_number }}-${{ github.run_attempt }}"
-          SUMMARY=$(grep -a 'ALL PASSED' tests-log.txt 2>/dev/null | tail -1 | sed 's/\x1b\[[0-9;]*m//g' || true)
+          SUMMARY=$(cat /tmp/ci-artifacts/tests-log.txt tests-log.txt 2>/dev/null \
+            | grep -a -E 'ALL PASSED' | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^ *//' || true)
           cat > notes.md <<EOF
           **Super Mario Bros. + Duck Hunt (E)** — the 3-in-1 cart (Mario, Duck Hunt,
           World Class Track Meet) running on the SEN NES core (WASM).
