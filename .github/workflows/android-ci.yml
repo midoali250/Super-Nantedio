@@ -44,7 +44,38 @@ jobs:
             || (echo "::error::android assets were out of date; run tools/sync_web_assets.sh" && exit 1)
 
       - name: Run the test-suite (ROM, core, gameplay, golden frames, UI)
-        run: node tests/run.js
+        run: |
+          set -o pipefail
+          node tests/run.js 2>&1 | tee /tmp/tests.log
+          status=$?
+          if [ $status -ne 0 ]; then
+            # surface each failure as a GitHub annotation so it is visible without logs
+            grep -a '✗' /tmp/tests.log | while read -r line; do
+              echo "::error::$line"
+            done
+            {
+              echo "### Failing tests"
+              echo '```'
+              grep -a -A 3 '✗' /tmp/tests.log
+              echo '```'
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+          exit $status
+        continue-on-error: true
+
+      - name: Test report
+        if: always()
+        run: |
+          cp /tmp/tests.log tests-log.txt 2>/dev/null || true
+          tail -40 /tmp/tests.log 2>/dev/null || true
+
+      - name: Fail the job if the tests failed
+        if: always()
+        run: |
+          if ! grep -q 'ALL PASSED' /tmp/tests.log 2>/dev/null; then
+            echo "::error::the test-suite did not pass"
+            exit 1
+          fi
 
       - name: Disassemble the ROM (proves the tooling works)
         run: |
@@ -59,8 +90,11 @@ jobs:
         if: always()
         with:
           name: screenshots
-          path: docs/screenshots/*.png
+          path: |
+            docs/screenshots/*.png
+            tests-log.txt
           retention-days: 30
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # 2. Build the installable APK.
