@@ -100,7 +100,10 @@ jobs:
         run: |
           ./gradlew --no-daemon --stacktrace assembleRelease
 
-      - name: Name and verify the APK
+      - name: Install verification dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Name and inspect the APK
         run: |
           set -euo pipefail
           SRC=android/app/build/outputs/apk/release/app-release.apk
@@ -112,6 +115,10 @@ jobs:
           unzip -l bitvaultengine.apk | grep -q 'assets/js/vendor/sen_bg.wasm'
           unzip -l bitvaultengine.apk | grep -q 'assets/games/'
           echo "APK contains the emulator, the wasm core and the ROM"
+
+      # Unpacks the finished APK and plays the game from *its own* assets.
+      - name: Verify the packaged APK (boots the app from inside it)
+        run: node tools/verify_apk.js bitvaultengine.apk
 
       - uses: actions/upload-artifact@v5
         with:
@@ -127,7 +134,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="apk-${{ github.run_number }}"
+          # run_number is monotonic, so "latest" is always the newest build
+          TAG="apk-${{ github.run_number }}-${{ github.run_attempt }}"
           gh release create "$TAG" bitvaultengine.apk \
             --title "bitvaultengine $TAG" \
             --notes "Super Mario Bros. + Duck Hunt (E) for Android.

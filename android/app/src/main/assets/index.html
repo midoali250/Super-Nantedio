@@ -87,6 +87,14 @@
         <button class="sheet-btn" id="mi-sound">🔊 الصوت: مفعّل</button>
         <button class="sheet-btn" id="mi-fullscreen">⛶ ملء الشاشة</button>
         <button class="sheet-btn" id="mi-help">❓ طريقة اللعب</button>
+        <button class="sheet-btn" id="mi-selftest">🧪 فحص اللعبة</button>
+      </div>
+      <div id="selftest-panel" class="selftest" hidden>
+        <div class="selftest-head">
+          <strong>فحص اللعبة (Self-test)</strong>
+          <span id="selftest-verdict" class="selftest-verdict" data-state="running">جارٍ…</span>
+        </div>
+        <ol id="selftest-list" class="selftest-list"></ol>
       </div>
       <div class="sheet-foot">
         <span id="fps-readout">60 FPS</span>

@@ -71,6 +71,36 @@ module.exports = {
       t.ok(failed, 'the tool must exit non-zero for invalid input');
     },
 
+    'APK verifier boots the app out of a packaged APK': (t) => {
+      if (!PY) return t.ok(true, 'python missing, skipped');
+      // Build a stand-in APK carrying the real asset payload, then run the exact
+      // script CI runs on the finished APK.
+      const apk = path.join(os.tmpdir(), 'bitvaultengine-verify-' + process.pid + '.apk');
+      const assets = path.join(h.ROOT, 'android', 'app', 'src', 'main', 'assets');
+      const script = path.join(os.tmpdir(), 'make-fake-apk-' + process.pid + '.py');
+      fs.writeFileSync(script, [
+        'import os, sys, zipfile',
+        'src, out = sys.argv[1], sys.argv[2]',
+        'with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:',
+        '    for root, _, files in os.walk(src):',
+        '        for f in files:',
+        '            p = os.path.join(root, f)',
+        '            z.write(p, "assets/" + os.path.relpath(p, src))',
+        '    z.writestr("AndroidManifest.xml", "com.bitvaultengine.nes.MainActivity".encode("utf-16le"))',
+        '    z.writestr("classes.dex", b"dex\\n035\\x00Lcom/bitvaultengine/nes/MainActivity;")',
+        '    z.writestr("resources.arsc", b"\\x02\\x00")'
+      ].join('\n'), 'utf8');
+      execFileSync(PY, [script, assets, apk], { encoding: 'utf8' });
+
+      const out = execFileSync(process.execPath,
+        [path.join(h.ROOT, 'tools', 'verify_apk.js'), apk], { encoding: 'utf8' });
+      t.match(out, /APK VERIFIED/, 'the verifier must accept a good APK');
+      t.match(out, /World 1-1 is rendered/);
+      t.match(out, /on-screen pad moves Mario/);
+      fs.unlinkSync(apk);
+      fs.unlinkSync(script);
+    },
+
     'icon generator produces every icon the APK needs': (t) => {
       if (!PY) return t.ok(true, 'python missing, skipped');
       const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'icons-'));

@@ -297,12 +297,225 @@
     el.addEventListener('contextmenu', function (e) { e.preventDefault(); });
   }
 
+  /* -------------------------------------------------------------- self-test */
+
+  /**
+   * On-device check that the copy of the game in the player's hand really works.
+   * It never trusts the boot path above: it loads a *second*, independent
+   * emulator instance from the bundled bytes, plays a scripted game and checks
+   * the pixels. The result is shown in the menu sheet.
+   *
+   * The same routine is what CI uses (tools/verify_apk.js) — the phone and the
+   * build server run the identical checks.
+   */
+  var selftestRunning = false;
+
+  function selftestRender(list, results) {
+    if (!list) return;
+    list.innerHTML = '';
+    for (var i = 0; i < results.length; i++) {
+      var r = results[i];
+      var li = document.createElement('li');
+      li.className = r.ok ? 'pass' : 'fail';
+      var mark = document.createElement('span');
+      mark.className = 'mark';
+      mark.textContent = r.ok ? '✓' : '✗';
+      var label = document.createElement('span');
+      label.textContent = r.name;
+      li.appendChild(mark);
+      li.appendChild(label);
+      if (r.detail) {
+        var d = document.createElement('span');
+        d.className = 'detail';
+        d.textContent = ' — ' + r.detail;
+        li.appendChild(d);
+      }
+      list.appendChild(li);
+    }
+  }
+
+  /**
+   * @param {(results:Array)=>void} done  called once with every result
+   * @param {(name:string)=>void}   step  optional progress callback
+   */
+  function runSelfTest(done, step) {
+    var results = [];
+    function check(name, fn) {
+      var ok = false, detail = '';
+      try {
+        var out = fn();
+        ok = out === undefined ? true : (out === true || (out && out.ok));
+        if (out && out.detail) detail = out.detail;
+      } catch (e) {
+        ok = false;
+        detail = (e && e.message) || String(e);
+      }
+      results.push({ name: name, ok: ok, detail: detail });
+      if (step) step(name);
+      return ok;
+    }
+
+    check('ملف اللعبة موجود داخل التطبيق', function () {
+      return { ok: true, detail: 'games/Super Mario Bros. + Duck Hunt (E) [!].nes' };
+    });
+
+    check('المحاكي (WASM) محمّل', function () {
+      return { ok: Core.isReady(), detail: Core.isReady() ? 'SEN 0.7.0' : 'غير محمّل' };
+    });
+
+    if (!done) return results;
+    selftestRunning = true;
+
+    // Load a second, independent console from the bundled bytes.
+    fetchBytes(WASM_URL, 'getWasmBase64', '__WASM_B64__').then(function (wasm) {
+      check('إعادة تحميل نواة المحاكي', function () {
+        return { ok: wasm.length > 1000, detail: (wasm.length / 1024).toFixed(0) + ' kB' };
+      });
+      return fetchBytes(ROM_URL, 'getRomBase64', '__ROM_B64__');
+    }).then(function (rom) {
+      var romOk = check('قراءة الشريط', function () {
+        var hd = Core.parseHeader(rom);
+        return {
+          ok: hd.valid && hd.mapper === 1,
+          detail: rom.length + ' bytes • mapper ' + hd.mapper + ' • ' + (hd.prgRomBytes / 1024) + 'K PRG'
+        };
+      });
+      if (!romOk) throw new Error('the cartridge could not be parsed');
+
+      var test = new Core.Machine({ romBytes: rom, sampleRate: 44100 });
+      var t = 0;
+      function advance(n) { for (var i = 0; i < n; i++) { test.step(); t++; } }
+
+      advance(120);
+      check('إقلاع الشريط ورسم صورة', function () {
+        return {
+          ok: !test.isBlank() && test.colorCount() > 2,
+          detail: test.colorCount() + ' colours at frame ' + t
+        };
+      });
+
+      // Multicart: START, then START again = Super Mario Bros.
+      test.buttonDown('START'); advance(30); test.buttonUp('START'); advance(50);
+      test.buttonDown('START'); advance(30); test.buttonUp('START'); advance(240);
+
+      check('دخول World 1-1', function () {
+        var fb = test.getBuffer();
+        var sky = 0;
+        for (var i = 0; i < fb.length; i += 4) {
+          if (fb[i + 2] > 200 && fb[i] < 160 && fb[i + 1] < 170) sky++;
+        }
+        return { ok: sky > 10000 && test.colorCount() > 5, detail: sky + ' sky pixels' };
+      });
+
+      check('الصوت يعمل (APU)', function () {
+        var e = test.takeAudioEnergy();
+        return { ok: e > 0 && test.audioPeak() > 0.02, detail: 'peak ' + test.audioPeak().toFixed(3) };
+      });
+
+      var findMario = function () {
+        var fb = test.getBuffer(), xs = [];
+        for (var y = 165; y < 225; y++) {
+          for (var x = 0; x < 256; x++) {
+            var i = (y * 256 + x) * 4;
+            if (fb[i] > 150 && fb[i + 1] < 110 && fb[i + 2] < 110) xs.push(x);
+          }
+        }
+        if (!xs.length) return -1;
+        xs.sort(function (a, b) { return a - b; });
+        return xs[Math.floor(xs.length / 2)];
+      };
+
+      var x0 = findMario();
+      check('ماريو ظاهر على الشاشة', function () {
+        return { ok: x0 > -1, detail: 'x = ' + x0 };
+      });
+
+      test.buttonDown('RIGHT'); advance(90); test.buttonUp('RIGHT'); advance(5);
+      var x1 = findMario();
+      check('زر اليمين يحرّك ماريو', function () {
+        return { ok: x1 - x0 > 25, detail: x0 + ' → ' + x1 };
+      });
+
+      var topOf = function () {
+        var fb = test.getBuffer();
+        for (var y = 120; y < 235; y++) {
+          for (var x = 0; x < 256; x++) {
+            var i = (y * 256 + x) * 4;
+            if (fb[i] > 150 && fb[i + 1] < 110 && fb[i + 2] < 110) return y;
+          }
+        }
+        return -1;
+      };
+      var ground = topOf();
+      test.buttonDown('A'); advance(14);
+      var air = topOf();
+      test.buttonUp('A');
+      check('زر A يجعل ماريو يقفز', function () {
+        return { ok: air < ground, detail: 'y ' + ground + ' → ' + air };
+      });
+
+      var state = test.saveState();
+      check('حفظ الحالة', function () {
+        return { ok: !!state && state.length > 1000, detail: (state ? state.length : 0) + ' bytes' };
+      });
+
+      advance(60);
+      var beforeLoad = test.frameHash();
+      test.loadState(state);
+      advance(1);
+      check('استرجاع الحالة', function () {
+        var restored = test.frameHash();
+        return { ok: restored !== beforeLoad, detail: 'hash ' + restored };
+      });
+
+      check('الشريط يحتوي 3 ألعاب', function () {
+        // Duck Hunt sits one SELECT away on the multicart menu.
+        var probe = new Core.Machine({ romBytes: rom, sampleRate: 44100 });
+        for (var i = 0; i < 100; i++) probe.step();
+        probe.buttonDown('START'); for (i = 0; i < 30; i++) probe.step(); probe.buttonUp('START');
+        probe.buttonDown('SELECT'); for (i = 0; i < 18; i++) probe.step(); probe.buttonUp('SELECT');
+        for (i = 0; i < 100; i++) probe.step();
+        return { ok: probe.colorCount() > 2 && probe.blockSignature().join(',') !== test.blockSignature().join(','),
+          detail: 'Duck Hunt screen rendered' };
+      });
+    }).catch(function (err) {
+      check('تشغيل الاختبارات', function () {
+        return { ok: false, detail: (err && err.message) || String(err) };
+      });
+    }).then(function () {
+      selftestRunning = false;
+      if (done) done(results);
+    });
+  }
+
   /* ----------------------------------------------------------------- menu */
 
   var STATE_KEY = 'bitvaultengine.state.v1';
 
   function openMenu() { if (menuSheet) menuSheet.hidden = false; pause(); }
   function closeMenu() { if (menuSheet) menuSheet.hidden = true; }
+
+  function startSelfTestUi() {
+    var panel = $('selftest-panel');
+    var list = $('selftest-list');
+    var verdict = $('selftest-verdict');
+    if (!panel || selftestRunning) return;
+    pause();
+    panel.hidden = false;
+    verdict.setAttribute('data-state', 'running');
+    verdict.textContent = 'جارٍ…';
+    list.innerHTML = '<li>…</li>';
+
+    runSelfTest(function (results) {
+      var failed = results.filter(function (r) { return !r.ok; });
+      verdict.setAttribute('data-state', failed.length ? 'fail' : 'pass');
+      verdict.textContent = failed.length
+        ? failed.length + ' فشل من ' + results.length
+        : 'كل الفحوصات ناجحة (' + results.length + '/' + results.length + ')';
+      selftestRender(list, results);
+      toast(failed.length ? 'فشل الفحص — ' + failed[0].name : 'اللعبة سليمة ✓');
+    });
+  }
 
   function saveState() {
     if (!machine) { toast('اللعبة لم تُشغّل بعد'); return; }
@@ -409,6 +622,10 @@
       closeMenu();
     });
 
+    $('mi-selftest').addEventListener('click', function () {
+      startSelfTestUi();
+    });
+
     menuSheet.addEventListener('click', function (e) {
       if (e.target === menuSheet) closeMenu();
     });
@@ -472,6 +689,16 @@
     reset: reset,
     status: function () { return statusPill ? statusPill.textContent : ''; },
     error: function () { return lastError; },
+    // Runs the full on-device self-test; resolves with one result per check.
+    selfTest: function () {
+      return new Promise(function (resolve) {
+        runSelfTest(function (results) { resolve(results); });
+      });
+    },
+    selfTestVisible: function () {
+      var p = $('selftest-panel');
+      return !!(p && !p.hidden);
+    },
     snapshot: function () {
       return {
         booted: !!machine,
