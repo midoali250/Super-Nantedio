@@ -93,8 +93,8 @@ and the *UI* to be tested in a DOM.
 
 ## 4. How it is proven
 
-`node tests/run.js` — 53 tests, 191 assertions, ~60 s, no dependencies except
-`jsdom` for the UI suite:
+`node tests/run.js` — 63 tests, 289 assertions, ~60 s. Needs Node 22 and `jsdom`
+(30.x requires Node ≥ 20.19 / ≥ 22.12) for the two DOM-based suites:
 
 | Suite | What it proves |
 |---|---|
@@ -108,6 +108,28 @@ and the *UI* to be tested in a DOM.
 
 Screenshots in `docs/screenshots/` are rendered by `tools/capture_screens.js`
 from the same core, so they can never drift from the build.
+
+### The built APK is verified too
+
+After Gradle produces `app-release.apk`, CI runs `tools/verify_apk.js`:
+
+1. it unpacks the APK and compares **every** web asset with `emulator/www`
+   (a mismatch fails the build),
+2. it checks the binary manifest and `classes.dex` really contain
+   `com.bitvaultengine.nes.MainActivity`,
+3. it boots the app **from the APK's own assets** in jsdom, plays through the
+   on-screen pad to World 1-1 and runs the built-in 13-check self-test.
+
+So the file on the release page is byte-for-byte the thing that was executed,
+not just the thing that was built.
+
+### The built-in self-test
+
+The app ships the same checks: menu → «🧪 فحص اللعبة» runs
+`SNESApp.selfTest()`, which loads a *second*, independent console from the
+bundled bytes (so a broken boot path cannot hide) and reports 13 pass/fail lines
+inside the app: cartridge parse, WASM, picture, APU, World 1-1, Mario on screen,
+RIGHT, A-jump, save, restore and Duck Hunt on the same cart.
 
 ## 5. The black-screen bug the rewrite fixed
 

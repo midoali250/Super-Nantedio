@@ -198,18 +198,27 @@ jobs:
           set -euo pipefail
           # run_number is monotonic, so "latest" is always the newest build
           TAG="apk-${{ github.run_number }}-${{ github.run_attempt }}"
+          SUMMARY=$(grep -a 'ALL PASSED' tests-log.txt 2>/dev/null | tail -1 | sed 's/\x1b\[[0-9;]*m//g' || true)
+          cat > notes.md <<EOF
+          **Super Mario Bros. + Duck Hunt (E)** — the 3-in-1 cart (Mario, Duck Hunt,
+          World Class Track Meet) running on the SEN NES core (WASM).
+
+          * built from commit \`${{ github.sha }}\`
+          * tests: ${SUMMARY:-see the CI run}
+          * the APK itself was unpacked, byte-compared with the tested sources and
+            booted from its own assets before this release (\`tools/verify_apk.js\`)
+
+          **التثبيت على الهاتف:** نزّل \`bitvaultengine.apk\` وثبّته مباشرة — لا حاجة لفك
+          الضغط. إن ظهر تحذير «مصادر غير معروفة» اسمح به لتطبيق المتصفح فقط.
+          EOF
           gh release create "$TAG" bitvaultengine.apk \
             --title "bitvaultengine $TAG" \
-            --notes "Super Mario Bros. + Duck Hunt (E) for Android.
-
-          * built from commit ${{ github.sha }}
-          * the whole test-suite (53 tests) passed before this build
-          * download: bitvaultengine.apk (install directly on the phone)
-
-          فك الضغط غير مطلوب: نزّل الملف وثبّته على الهاتف مباشرة." \
+            --notes-file notes.md \
             --latest
-          echo "### Download" >> $GITHUB_STEP_SUMMARY
-          echo "https://github.com/${{ github.repository }}/releases/latest/download/bitvaultengine.apk" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Download"
+            echo "<https://github.com/${{ github.repository }}/releases/latest/download/bitvaultengine.apk>"
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Summary
         run: |
