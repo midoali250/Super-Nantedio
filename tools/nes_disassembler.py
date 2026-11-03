@@ -120,20 +120,31 @@ OPCODES = {
     0xFD: ('SBC', 'ABX', 3, 4), 0xFE: ('INC', 'ABX', 3, 6),
 }
 
+def _byte(data, offset):
+    """Read one byte of the PRG ROM, tolerating the last few bytes of the bank."""
+    return data[offset] if 0 <= offset < len(data) else 0
+
+
+# The lambdas take (pc address, PRG-ROM offset, prg bytes) so that the operand
+# reads can never run off the end of the last bank (that used to raise an
+# IndexError on the very last instruction of a 128 KB PRG).
 ADDRESS_MODES = {
-    'IMP': lambda pc, data: ('', 0),
-    'ACC': lambda pc, data: ('A', 0),
-    'IMM': lambda pc, data: (f'#${data[pc+1]:02X}', 1),
-    'ZPG': lambda pc, data: (f'${data[pc+1]:02X}', 1),
-    'ZPX': lambda pc, data: (f'${data[pc+1]:02X},X', 1),
-    'ZPY': lambda pc, data: (f'${data[pc+1]:02X},Y', 1),
-    'ABS': lambda pc, data: (f'${data[pc+2]:02X}{data[pc+1]:02X}', 2),
-    'ABX': lambda pc, data: (f'${data[pc+2]:02X}{data[pc+1]:02X},X', 2),
-    'ABY': lambda pc, data: (f'${data[pc+2]:02X}{data[pc+1]:02X},Y', 2),
-    'IZX': lambda pc, data: (f'(${data[pc+1]:02X},X)', 1),
-    'IZY': lambda pc, data: (f'(${data[pc+1]:02X}),Y', 1),
-    'IND': lambda pc, data: (f'(${data[pc+2]:02X}{data[pc+1]:02X})', 2),
-    'REL': lambda pc, data: (f'${pc + 2 + (data[pc+1] if data[pc+1] < 128 else data[pc+1] - 256):04X}', 1),
+    'IMP': lambda pc, off, data: ('', 0),
+    'ACC': lambda pc, off, data: ('A', 0),
+    'IMM': lambda pc, off, data: (f'#${_byte(data, off + 1):02X}', 1),
+    'ZPG': lambda pc, off, data: (f'${_byte(data, off + 1):02X}', 1),
+    'ZPX': lambda pc, off, data: (f'${_byte(data, off + 1):02X},X', 1),
+    'ZPY': lambda pc, off, data: (f'${_byte(data, off + 1):02X},Y', 1),
+    'ABS': lambda pc, off, data: (f'${_byte(data, off + 2):02X}{_byte(data, off + 1):02X}', 2),
+    'ABX': lambda pc, off, data: (f'${_byte(data, off + 2):02X}{_byte(data, off + 1):02X},X', 2),
+    'ABY': lambda pc, off, data: (f'${_byte(data, off + 2):02X}{_byte(data, off + 1):02X},Y', 2),
+    'IZX': lambda pc, off, data: (f'(${_byte(data, off + 1):02X},X)', 1),
+    'IZY': lambda pc, off, data: (f'(${_byte(data, off + 1):02X}),Y', 1),
+    'IND': lambda pc, off, data: (f'(${_byte(data, off + 2):02X}{_byte(data, off + 1):02X})', 2),
+    'REL': lambda pc, off, data: (
+        f'${(pc + 2 + (_byte(data, off + 1) if _byte(data, off + 1) < 128 else _byte(data, off + 1) - 256)) & 0xFFFF:04X}',
+        1,
+    ),
 }
 
 
@@ -158,7 +169,7 @@ def disassemble(rom, start_addr=0x8000, end_addr=None, output_file=None):
         opcode = prg[offset]
         if opcode in OPCODES:
             mnemonic, mode, size, cycles = OPCODES[opcode]
-            operand_str, operand_len = ADDRESS_MODES[mode](pc, prg)
+            operand_str, operand_len = ADDRESS_MODES[mode](pc, offset, prg)
             # بناء 사طر التفكيك
             hex_bytes = ' '.join(f'{prg[offset + i]:02X}' for i in range(min(size, len(prg) - offset)))
             line = f"${pc:04X}: {hex_bytes:<8} {mnemonic:4} {operand_str}"
@@ -200,18 +211,19 @@ def main():
     try:
         rom = NESROM(args.rom)
     except Exception as e:
-        print(f"[-] خطأ في فتح الملف: {e}")
-        sys.exit(1)
+        print(f"[-] خطأ في فتح الملف: {e}", file=sys.stderr)
+        return 2
 
     if args.summary:
         info = rom.summary()
         print("=== ملخص ملف NES ROM ===")
         for k, v in info.items():
             print(f"  {k}: {v}")
-        return
+        return 0
 
     disassemble(rom, args.start, args.end, args.output)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

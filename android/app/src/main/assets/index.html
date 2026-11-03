@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f1a">
+<meta name="mobile-web-app-capable" content="yes">
+<title>bitvaultengine — NES</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<div id="app" class="app">
+
+  <!-- ============ TOP BAR ============ -->
+  <header id="topbar" class="topbar">
+    <button id="btn-menu" class="icon-btn" aria-label="القائمة" title="القائمة">
+      <span class="bars"></span>
+    </button>
+
+    <div class="titles">
+      <span id="game-title" class="game-title">Super Mario Bros. + Duck Hunt</span>
+      <span id="status-pill" class="status-pill" data-state="idle">جاهز</span>
+    </div>
+
+    <button id="btn-playpause" class="icon-btn" aria-label="تشغيل / إيقاف" title="تشغيل / إيقاف">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path d="M8 5v14l11-7z" fill="currentColor"/>
+      </svg>
+    </button>
+  </header>
+
+  <!-- ============ SCREEN ============ -->
+  <main id="stage" class="stage">
+    <div id="screen-wrap" class="screen-wrap">
+      <canvas id="canvas" width="256" height="240" aria-label="شاشة اللعبة"></canvas>
+
+      <div id="overlay" class="overlay">
+        <div class="boot-card">
+          <div class="logo">Mario <span>+ Duck Hunt</span></div>
+          <p class="boot-sub">محاكي نينتندو (NES) للأندرويد</p>
+          <button id="btn-boot" class="primary-btn">▶ ابدأ اللعب</button>
+          <p class="boot-hint">سوبر ماريو بروس + داك هانت + ورلد كلاس تراك ميت</p>
+        </div>
+      </div>
+
+      <div id="toast" class="toast" hidden></div>
+    </div>
+  </main>
+
+  <!-- ============ CONTROLS ============ -->
+  <section id="controls" class="controls" aria-label="أزرار التحكم">
+
+    <!-- D-Pad (right side in RTL layout order, visually placed left) -->
+    <div class="pad-zone">
+      <div id="dpad" class="dpad" role="group" aria-label="اتجاهات">
+        <button class="dpad-btn up"    data-btn="UP"    aria-label="أعلى"><span></span></button>
+        <button class="dpad-btn left"  data-btn="LEFT"  aria-label="يسار"><span></span></button>
+        <button class="dpad-btn center" disabled aria-hidden="true"><span></span></button>
+        <button class="dpad-btn right" data-btn="RIGHT" aria-label="يمين"><span></span></button>
+        <button class="dpad-btn down"  data-btn="DOWN"  aria-label="أسفل"><span></span></button>
+      </div>
+    </div>
+
+    <div class="mid-zone">
+      <button id="btn-select" class="pill-btn" data-btn="SELECT">SELECT</button>
+      <button id="btn-start"  class="pill-btn start" data-btn="START">START</button>
+    </div>
+
+    <div class="action-zone">
+      <button id="btn-b" class="round-btn b" data-btn="B" aria-label="زر B">B</button>
+      <button id="btn-a" class="round-btn a" data-btn="A" aria-label="زر A">A</button>
+    </div>
+  </section>
+
+  <!-- ============ MENU SHEET ============ -->
+  <div id="menu-sheet" class="sheet" hidden>
+    <div class="sheet-panel">
+      <h2>القائمة</h2>
+      <div class="sheet-grid">
+        <button class="sheet-btn" id="mi-play">▶ تشغيل</button>
+        <button class="sheet-btn" id="mi-pause">⏸ إيقاف مؤقت</button>
+        <button class="sheet-btn" id="mi-reset">⟲ إعادة تشغيل</button>
+        <button class="sheet-btn" id="mi-save">💾 حفظ الحالة</button>
+        <button class="sheet-btn" id="mi-load">📂 استرجاع الحالة</button>
+        <button class="sheet-btn" id="mi-shot">🖼️ لقطة شاشة</button>
+        <button class="sheet-btn" id="mi-sound">🔊 الصوت: مفعّل</button>
+        <button class="sheet-btn" id="mi-fullscreen">⛶ ملء الشاشة</button>
+        <button class="sheet-btn" id="mi-help">❓ طريقة اللعب</button>
+      </div>
+      <div class="sheet-foot">
+        <span id="fps-readout">60 FPS</span>
+        <button class="sheet-btn ghost" id="mi-close">إغلاق</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="js/vendor/sen.global.js"></script>
+<script src="js/nescore.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
