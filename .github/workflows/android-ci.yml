@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Required so the build job can publish the APK as a release asset.
+permissions:
+  contents: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
