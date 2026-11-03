@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>bitvaultengine NES Emulator</title>
+    <script src="https://cdn.jsdelivr.net/npm/jsnes@latest"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a2e;
+            color: #fff;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        #screen-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            padding: 20px;
+        }
+        #canvas {
+            background: #000;
+            border: 4px solid #333;
+            border-radius: 8px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            max-width: 100%;
+            max-height: 70vh;
+            touch-action: none;
+        }
+        #status-bar {
+            padding: 10px;
+            background: #16213e;
+            text-align: center;
+            font-size: 14px;
+            color: #03dac5;
+        }
+        .controls-overlay {
+            position: absolute;
+            bottom: 100px;
+            left: 0;
+            right: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 15px;
+        }
+        .d-pad, .buttons {
+            display: grid;
+            gap: 8px;
+        }
+        .d-pad {
+            grid-template-columns: 60px 60px 60px;
+            grid-template-rows: 60px 60px 60px;
+        }
+        .buttons {
+            grid-template-columns: 60px 60px;
+            grid-template-rows: 60px 60px;
+        }
+        .btn {
+            width: 60px;
+            height: 60px;
+            background: #03dac5;
+            border: none;
+            border-radius: 12px;
+            color: #000;
+            font-weight: bold;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            active: background: #018786;
+        }
+        .btn:active {
+            background: #018786;
+            transform: scale(0.95);
+        }
+        .btn-up { grid-column: 2; grid-row: 1; }
+        .btn-left { grid-column: 1; grid-row: 2; }
+        .btn-down { grid-column: 2; grid-row: 3; }
+        .btn-right { grid-column: 3; grid-row: 2; }
+        .btn-a { grid-column: 2; grid-row: 2; background: #ff6b6b; color: #fff; }
+        .btn-b { grid-column: 1; grid-row: 2; background: #4ecdc4; color: #000; }
+        .btn-select { grid-column: 1; grid-row: 3; font-size: 12px; }
+        .btn-start { grid-column: 2; grid-row: 3; font-size: 12px; }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            display: none;
+        }
+        #loading.spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid #333;
+            border-top: 4px solid #03dac5;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        @keyframes spin { 0% { transform: translate(-50%, -50%) rotate(0deg); } 100% { transform: translate(-50%, -50%) rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+    <div id="screen-container">
+        <div id="loading" class="spinner"></div>
+        <div id="loading">جاري تحميل الروم...</div>
+        <canvas id="canvas" width="256" height="240"></canvas>
+        <div id="status-bar">المحاكي جاهز - منتظر تحميل الروم</div>
+    </div>
+
+    <div class="controls-overlay">
+        <div class="d-pad">
+            <button class="btn btn-up" ontouchstart="e.preventDefault(); nesPress('up')" ontouchend="e.preventDefault(); nesRelease('up')" onmousedown="nesPress('up')" onmouseup="nesRelease('up')">▲</button>
+            <button class="btn btn-left" ontouchstart="e.preventDefault(); nesPress('left')" ontouchend="e.preventDefault(); nesRelease('left')" onmousedown="nesPress('left')" onmouseup="nesRelease('left')">◀</button>
+            <button class="btn btn-down" ontouchstart="e.preventDefault(); nesPress('down')" ontouchend="e.preventDefault(); nesRelease('down')" onmousedown="nesPress('down')" onmouseup="nesRelease('down')">▼</button>
+            <button class="btn btn-right" ontouchstart="e.preventDefault(); nesPress('right')" ontouchend="e.preventDefault(); nesRelease('right')" onmousedown="nesPress('right')" onmouseup="nesRelease('right')">▶</button>
+        </div>
+        <div class="buttons">
+            <button class="btn btn-b" ontouchstart="e.preventDefault(); nesPress('B')" ontouchend="e.preventDefault(); nesRelease('B')" onmousedown="nesPress('B')" onmouseup="nesRelease('B')">B</button>
+            <button class="btn btn-a" ontouchstart="e.preventDefault(); nesPress('A')" ontouchend="e.preventDefault(); nesRelease('A')" onmousedown="nesPress('A')" onmouseup="nesRelease('A')">A</button>
+            <button class="btn btn-select" ontouchstart="e.preventDefault(); nesPress('SELECT')" ontouchend="e.preventDefault(); nesRelease('SELECT')" onmousedown="nesPress('SELECT')" onmouseup="nesRelease('SELECT')">SELECT</button>
+            <button class="btn btn-start" ontouchstart="e.preventDefault(); nesPress('START')" ontouchend="e.preventDefault(); nesRelease('START')" onmousedown="nesPress('START')" onmouseup="nesRelease('START')">START</button>
+        </div>
+    </div>
+
+<script>
+    var nes = null;
+    var canvas = document.getElementById('canvas');
+    var ctx = canvas.getContext('2d');
+    var imageData = null;
+    var statusBar = document.getElementById('status-bar');
+    var loadingDiv = document.getElementById('loading');
+
+    function setStatus(msg) {
+        statusBar.textContent = msg;
+        if (window.NES) window.NES.onStatus(msg);
+    }
+
+    function initNES() {
+        nes = new JSNES({
+            onFrame: function(frameBuffer) {
+                if (!imageData) {
+                    imageData = ctx.createImageData(256, 240);
+                }
+                for (var i = 0; i < 256 * 240; i++) {
+                    imageData.data[i * 4 + 0] = frameBuffer[i * 3 + 0];
+                    imageData.data[i * 4 + 1] = frameBuffer[i * 3 + 1];
+                    imageData.data[i * 4 + 2] = frameBuffer[i * 3 + 2];
+                    imageData.data[i * 4 + 3] = 255;
+                }
+                ctx.putImageData(imageData, 0, 0);
+            }
+        });
+        setStatus('المحاكي تم initializing بنجاح');
+    }
+
+    function nesLoadROM() {
+        loadingDiv.style.display = 'block';
+        setStatus('جاري تحميل الروم من الأصول...');
+
+        // Fetch the embedded ROM from assets
+        fetch('file:///android_asset/Super%20Mario%20Bros.%20%2B%20Duck%20Hunt%20%2B%20World%20Class%20Track%20Meet%20(U)%20(PRG0)%20[!].nes')
+            .then(response => {
+                if (!response.ok) throw new Error('HTTP error! status: ' + response.status);
+                return response.arrayBuffer();
+            })
+            .then(buffer => {
+                var romData = new Uint8Array(buffer);
+                nes.loadROM(romData);
+                loadingDiv.style.display = 'none';
+                setStatus('تم تحميل الروم بنجاح - Super Mario Bros.');
+                if (window.NES) window.NES.onROMLoaded(true);
+                nesPlay();
+            })
+            .catch(error => {
+                console.error('Error loading ROM:', error);
+                loadingDiv.style.display = 'none';
+                setStatus('فشل تحميل الروم: ' + error.message);
+                if (window.NES) window.NES.onROMLoaded(false);
+            });
+    }
+
+    function nesPlay() {
+        if (nes) {
+            nes.play();
+            setStatus('التشغيل جاري...');
+        }
+    }
+
+    function nesPause() {
+        if (nes) {
+            nes.pause();
+            setStatus('متوقف مؤقتاً');
+        }
+    }
+
+    function nesReset() {
+        if (nes) {
+            nes.reset();
+            setStatus('تم إعادة التشغيل');
+        }
+    }
+
+    var keyMap = {
+        'up': JSNES.KEY_UP,
+        'down': JSNES.KEY_DOWN,
+        'left': JSNES.KEY_LEFT,
+        'right': JSNES.KEY_RIGHT,
+        'A': JSNES.KEY_A,
+        'B': JSNES.KEY_B,
+        'SELECT': JSNES.KEY_SELECT,
+        'START': JSNES.KEY_START
+    };
+
+    function nesPress(key) {
+        if (nes) nes.pressKey(keyMap[key]);
+    }
+
+    function nesRelease(key) {
+        if (nes) nes.releaseKey(keyMap[key]);
+    }
+
+    // Initialize on load
+    window.addEventListener('DOMContentLoaded', function() {
+        initNES();
+        // Auto-load ROM
+        setTimeout(nesLoadROM, 500);
+    });
+</script>
+
+</body>
+</html>

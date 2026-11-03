@@ -1,0 +1,4 @@
+#!/bin/sh
+# Gradle wrapper stub - in CI this is replaced by the real wrapper
+echo "Gradle wrapper placeholder. Use 'gradle' command directly or install the full wrapper."
+exit 0
