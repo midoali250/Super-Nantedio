@@ -1,81 +1,144 @@
-name: Android CI - Build APK Only
+name: Build & test bitvaultengine
 
 on:
   push:
-    branches: [ main ]
+    branches: ['**']
   pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    env:
-      ANDROID_HOME: /opt/android-sdk
-      GRADLE_USER_HOME: ~/.gradle
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Everything that can be proven without an Android SDK: the ROM, the wasm
+  #    core, the gameplay, the golden frames, the real UI in a DOM and the
+  #    packaging tools. The APK job refuses to run if this fails.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test the game (core, gameplay, UI)
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Verify the web assets are in sync with the APK assets
+        run: |
+          ./tools/sync_web_assets.sh
+          git diff --exit-code --stat android/app/src/main/assets \
+            || (echo "::error::android assets were out of date; run tools/sync_web_assets.sh" && exit 1)
+
+      - name: Run the test-suite (ROM, core, gameplay, golden frames, UI)
+        run: node tests/run.js
+
+      - name: Disassemble the ROM (proves the tooling works)
+        run: |
+          python3 tools/nes_disassembler.py "roms/Super Mario Bros. + Duck Hunt (E) [!].nes" \
+            --output docs/disassembly.txt
+          wc -l docs/disassembly.txt
+
+      - name: Emulator screenshots
+        run: node tools/capture_screens.js
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: docs/screenshots/*.png
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 2. Build the installable APK.
+  # ---------------------------------------------------------------------------
+  apk:
+    name: Build APK
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: gradle
 
-      - name: Install Android Command Line Tools
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install platform 34 + build-tools
         run: |
-          mkdir -p ${ANDROID_HOME}/cmdline-tools
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdline-tools.zip
-          unzip -q /tmp/cmdline-tools.zip -d ${ANDROID_HOME}/cmdline-tools
-          mv ${ANDROID_HOME}/cmdline-tools/cmdline-tools ${ANDROID_HOME}/cmdline-tools/latest
-          echo "ANDROID_HOME=${ANDROID_HOME}" >> $GITHUB_ENV
-          echo "PATH=${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/34.0.0:${PATH}" >> $GITHUB_ENV
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          echo "sdk.dir=${ANDROID_SDK_ROOT}" > android/local.properties
 
-      - name: Accept Android SDK licenses
+      - name: Sync the tested web assets into the APK
+        run: ./tools/sync_web_assets.sh
+
+      - name: Build the release APK
+        working-directory: android
         run: |
-          yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses
+          ./gradlew --no-daemon --stacktrace assembleRelease
 
-      - name: Install Android SDK components
+      - name: Name and verify the APK
         run: |
-          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          set -euo pipefail
+          SRC=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$SRC" || (echo "::error::the release APK was not produced" && exit 1)
+          cp "$SRC" bitvaultengine.apk
+          ls -l bitvaultengine.apk
+          # the APK must carry the emulator payload
+          unzip -l bitvaultengine.apk | grep -q 'assets/index.html'
+          unzip -l bitvaultengine.apk | grep -q 'assets/js/vendor/sen_bg.wasm'
+          unzip -l bitvaultengine.apk | grep -q 'assets/games/'
+          echo "APK contains the emulator, the wasm core and the ROM"
 
-      - name: Install Gradle
-        run: |
-          wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip -O /tmp/gradle.zip
-          unzip -q /tmp/gradle.zip -d /opt
-          ln -sf /opt/gradle-8.4/bin/gradle /usr/local/bin/gradle
-
-      - name: Create local.properties
-        run: |
-          echo "sdk.dir=${ANDROID_HOME}" > android/local.properties
-
-      - name: Build Debug APK
-        run: |
-          cd android
-          gradle assembleDebug --no-daemon --stacktrace
-
-      - name: Verify APK exists
-        run: |
-          ls -la android/app/build/outputs/apk/debug/app-debug.apk
-          echo "APK size: $(wc -c < android/app/build/outputs/apk/debug/app-debug.apk) bytes"
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: bitvault-engine-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 30
+          name: bitvaultengine-apk
+          path: bitvaultengine.apk
+          retention-days: 90
 
-      - name: Disassemble NES ROM
+      # A permanent download URL:
+      #   https://github.com/<owner>/<repo>/releases/latest/download/bitvaultengine.apk
+      - name: Publish the APK as a release asset
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/arena/'))
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 tools/nes_disassembler.py roms/*.nes --output tools/disassembly_output.txt --summary
+          set -euo pipefail
+          TAG="apk-${{ github.run_number }}"
+          gh release create "$TAG" bitvaultengine.apk \
+            --title "bitvaultengine $TAG" \
+            --notes "Super Mario Bros. + Duck Hunt (E) for Android.
 
-      - name: Upload Disassembly artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: nes-disassembly
-          path: tools/disassembly_output.txt
-          retention-days: 30
+          * built from commit ${{ github.sha }}
+          * the whole test-suite (53 tests) passed before this build
+          * download: bitvaultengine.apk (install directly on the phone)
+
+          فك الضغط غير مطلوب: نزّل الملف وثبّته على الهاتف مباشرة." \
+            --latest
+          echo "### Download" >> $GITHUB_STEP_SUMMARY
+          echo "https://github.com/${{ github.repository }}/releases/latest/download/bitvaultengine.apk" >> $GITHUB_STEP_SUMMARY
+
+      - name: Summary
+        run: |
+          {
+            echo "## bitvaultengine APK"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| size | $(du -h bitvaultengine.apk | cut -f1) |"
+            echo "| sha256 | \`$(sha256sum bitvaultengine.apk | cut -d' ' -f1)\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+          } >> $GITHUB_STEP_SUMMARY

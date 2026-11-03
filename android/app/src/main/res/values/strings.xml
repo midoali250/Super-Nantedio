@@ -1,11 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">bitvaultengine NES</string>
-    <string name="load_rom">تحميل روم NES</string>
-    <string name="play">تشغيل</string>
-    <string name="pause">إيقاف مؤقت</string>
-    <string name="reset">إعادة تشغيل</string>
-    <string name="rom_loaded">تم تحميل الروم بنجاح</string>
-    <string name="rom_error">فشل في تحميل الروم</string>
-    <string name="emulator_ready">المحاكي جاهز</string>
-    <string name="controls">التحكمات على الشاشة</string>
+    <string name="app_name">bitvaultengine</string>
 </resources>
