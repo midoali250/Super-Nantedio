@@ -193,7 +193,15 @@ jobs:
 
       # Unpacks the finished APK and plays the game from *its own* assets.
       - name: Verify the packaged APK (boots the app from inside it)
-        run: node tools/verify_apk.js bitvaultengine.apk
+        run: |
+          set -o pipefail
+          node tools/verify_apk.js bitvaultengine.apk 2>&1 | tee apk-verification.txt | tee /tmp/apk-verify-report.txt
+          {
+            echo "### Packaged APK verification"
+            echo '```'
+            cat apk-verification.txt
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v5
         with:
@@ -233,6 +241,23 @@ jobs:
             echo "### Download"
             echo "<https://github.com/${{ github.repository }}/releases/latest/download/bitvaultengine.apk>"
           } >> $GITHUB_STEP_SUMMARY
+
+      # Debug channel: the APK verification report on the scratch branch.
+      - name: Publish the verification report
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          cp apk-verification.txt report.txt 2>/dev/null
+          test -s report.txt || echo "verification did not run" > report.txt
+          git stash -u -q 2>/dev/null
+          git checkout -q -B ci-logs origin/ci-logs
+          git config user.name "ci-bot"
+          git config user.email "ci@users.noreply.github.com"
+          cp /tmp/apk-verify-report.txt apk-verification.txt 2>/dev/null || true
+          git add -f apk-verification.txt
+          git commit -qm "ci: APK verification for ${GITHUB_SHA}" || true
+          git push -q -f origin ci-logs
 
       - name: Summary
         run: |
