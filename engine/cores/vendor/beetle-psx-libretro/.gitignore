@@ -1,0 +1,55 @@
+*.o
+*.d
+*.so
+*.a
+*.dll
+*.dylib
+*.lib
+*.pdb
+*.exp
+*.manifest
+nul
+/old
+
+/msvc/Debug
+/msvc/Release
+/msvc/*.suo
+/msvc/*.user
+/msvc/*.sdf
+/msvc/*.db
+/msvc/x64
+/msvc/.vs/msvc-2010/v14/*.suo
+/msvc/.vs/msvc-2015/v14/*.suo
+/msvc/msvc-2015.VC.VC.opendb
+
+# analog verification harness build output (tools/analog)
+tools/analog/runner
+tools/analog/*.spv
+tools/pgxp_color/oracle
+tools/pgxp_color/range
+tools/pgxp_color/transport
+
+# vkhost harness build output (tools/vkhost)
+tools/vkhost/vkhost
+
+# CDC FIFO lane build output (tools/cdc_fifo)
+tools/cdc_fifo/cdc_fifo_test
+tools/cdc_fifo/cdc_fifo_test.exe
+
+# deinterlace lane build output (tools/deinterlace)
+tools/deinterlace/deint_test
+tools/deinterlace/deint_test.exe
+
+# crop window lane build output (tools/crop_window)
+tools/crop_window/crop_window_test
+tools/crop_window/crop_window_test.exe
+
+# Python bytecode from the VCD authoring script (tools/vcd)
+__pycache__/
+*.pyc
+tools/tt_replace/tt_dir_mode_test
+tools/tt_replace/tt_dir_mode_test.exe
+tools/tt_replace/tt_dir_mode_test_asan
+tools/tt_replace/tt_dir_mode_test_asan.exe
+tools/tt_replace/tt_dir_mode_test_tsan
+tools/tt_replace/tt_dir_mode_test_tsan.exe

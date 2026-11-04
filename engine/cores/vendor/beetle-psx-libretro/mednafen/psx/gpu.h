@@ -1,0 +1,390 @@
+// WARNING WARNING WARNING:  ONLY use CanRead() method of BlitterFIFO, and NOT CanWrite(), since the FIFO is larger than the actual PS1 GPU FIFO to accommodate
+// our lack of fancy superscalarish command sequencer.
+
+#ifndef __MDFN_PSX_GPU_H
+#define __MDFN_PSX_GPU_H
+
+#include <stdint.h>
+#include <boolean.h>
+#include <math.h>
+
+#include "../git.h"
+
+#define INCMD_NONE     0
+#define INCMD_PLINE    1
+#define INCMD_QUAD     2
+#define INCMD_FBWRITE  4
+#define INCMD_FBREAD   8
+
+#define DISP_VERT480    0x04
+#define DISP_PAL        0x08
+#define DISP_RGB24      0x10
+#define DISP_INTERLACED 0x20
+
+enum dither_mode
+{
+   DITHER_NATIVE   = 0,
+   DITHER_UPSCALED,
+   DITHER_OFF
+};
+
+struct tri_vertex
+{
+   int32_t x, y;
+   int32_t u, v;
+   int32_t r, g, b;
+   // Precise x, y, and w coordinates using PGXP (if available)
+   float precise[3];
+   /* Precise colour in 1.0 == 0xFF scale: the GTE's pre-saturation value
+    * when the PGXP shadow was accepted (may exceed 1.0), else r/g/b / 255.
+    * Only consulted by the hardware renderers when the precise-colour
+    * option is on. */
+   float cf[3];
+};
+typedef struct tri_vertex tri_vertex;
+
+struct i_group;
+struct i_deltas;
+
+struct line_point
+{
+   int32_t x, y;
+   uint8_t r, g, b;
+};
+typedef struct line_point line_point;
+
+#define vertex_swap(_type, _a, _b) \
+{                           \
+   _type tmp = _a;          \
+   _a = _b;                 \
+   _b = tmp;                \
+}                           \
+
+struct PS_GPU
+{
+   uint16_t CLUT_Cache[256];
+
+   uint32_t CLUT_Cache_VB;   // Don't try to be clever and reduce it to 16 bits... ~0U is value for invalidated state.
+
+   struct   // Speedup-cache varibles, derived from other variables; shouldn't be saved in save states.
+   {
+      // TW*_* variables derived from tww, twh, twx, twy, TexPageX, TexPageY
+      uint32_t TWX_AND;
+      uint32_t TWX_ADD;
+
+      uint32_t TWY_AND;
+      uint32_t TWY_ADD;
+   } SUCV;
+
+   /* Pad so TexCache below starts on a 16-byte boundary relative to the
+    * struct (CLUT_Cache 512 + CLUT_Cache_VB 4 + SUCV 16 = 532; +12 = 544).
+    * Together with the 64-byte alignment of the GPU global this keeps
+    * every 16-byte TexCache entry inside a single host cache line. */
+   uint32_t TexCacheAlignPad_[3];
+
+   struct TexCache_t
+   {
+      uint16_t Data[4];
+      uint32_t Tag;
+      /* Entry padded from 12 to 16 bytes: 4 entries per 64-byte host
+       * cache line with no entry straddling a line boundary, and the
+       * entry index scales by a power of two.  Not serialised - the
+       * savestate path marshals Tag/Data element-wise. */
+      uint32_t EntryPad_;
+   } TexCache[256];
+
+   /* Same-cache-line fast path for the textured-span inner loop: when a
+    * pixel maps to the same texel cache line as the previous one (the common
+    * case along a span), reuse the resolved cache pointer and skip the index
+    * shuffle + tag compare. last_tex_c is void* to avoid the nested-struct
+    * type in the header; reset (line=~0, c=NULL) before each draw command. */
+   uint32_t last_tex_line;
+   void    *last_tex_c;
+
+   uint32_t DMAControl;
+
+   /* Beetle-psx upscaling vars */
+   uint8_t upscale_shift;
+   uint8_t dither_upscale_shift;
+
+   // Drawing stuff
+   int32_t ClipX0;
+   int32_t ClipY0;
+   int32_t ClipX1;
+   int32_t ClipY1;
+
+   int32_t OffsX;
+   int32_t OffsY;
+
+   bool dtd;            // Dithering enable 
+   bool dfe;
+
+   uint32_t MaskSetOR;
+   uint32_t MaskEvalAND;
+
+   bool TexDisable;
+   bool TexDisableAllowChange;
+
+   uint8_t tww, twh, twx, twy;
+   struct
+   {
+      uint8_t TexWindowXLUT_Pre[16];
+      uint8_t TexWindowXLUT[256];
+      uint8_t TexWindowXLUT_Post[16];
+   };
+
+   struct
+   {
+      uint8_t TexWindowYLUT_Pre[16];
+      uint8_t TexWindowYLUT[256];
+      uint8_t TexWindowYLUT_Post[16];
+   };
+
+   uint32_t TexPageX; // 0, 64, 128, 192, etc up to 960
+   uint32_t TexPageY; // 0 or 256
+
+   uint32_t SpriteFlip;
+
+   uint32_t abr;        // Semi-transparency mode(0~3)
+   uint32_t TexMode;
+
+   struct
+   {
+      uint8_t RGB8SAT_Under[256];
+      uint8_t RGB8SAT[256];
+      uint8_t RGB8SAT_Over[256];
+   };
+
+   uint32_t DataReadBuffer;
+   uint32_t DataReadBufferEx;
+
+   bool IRQPending;
+
+   // Powers of 2 for faster multiple equality testing(just for multi-testing; InCmd itself will only contain 0, or a power of 2).
+   uint8_t InCmd;
+   uint8_t InCmd_CC;
+
+   tri_vertex InQuad_F3Vertices[3];
+   uint32_t InQuad_clut;
+   bool InQuad_invalidW;
+   uint32_t killQuadPart;	// bit flags for tris in quad that are to be culled
+
+   // primitive UV offsets (used to correct flipped sprites)
+   uint16_t off_u, off_v;
+   // primitive UV limits (used to clamp texture sampling)
+   uint16_t min_u, min_v, max_u, max_v;
+   bool may_be_2d;
+
+   line_point InPLine_PrevPoint;
+
+   uint32_t FBRW_X;
+   uint32_t FBRW_Y;
+   uint32_t FBRW_W;
+   uint32_t FBRW_H;
+   uint32_t FBRW_CurY;
+   uint32_t FBRW_CurX;
+
+   //
+   // Display Parameters
+   //
+   uint32_t DisplayMode;
+
+   bool DisplayOff;
+   uint32_t DisplayFB_XStart;
+   uint32_t DisplayFB_YStart;
+
+   bool display_possibly_dirty;
+   unsigned display_change_count;
+
+   uint32_t HorizStart;
+   uint32_t HorizEnd;
+   /* The overscan crop window for the frame being scanned out, latched
+    * at its first visible line (rhi_common_crop_window) */
+   uint32_t crop_window;
+
+   uint32_t VertStart;
+   uint32_t VertEnd;
+
+   //
+   // Display work vars
+   //
+   uint32_t DisplayFB_CurYOffset;
+   uint32_t DisplayFB_CurLineYReadout;
+
+   bool InVBlank;
+
+   //
+   //
+   //
+   uint32_t LinesPerField;
+   uint32_t scanline;
+   bool field;
+   bool field_ram_readout;
+   bool PhaseChange;
+
+   uint32_t DotClockCounter;
+
+   uint64_t GPUClockCounter;
+   int32_t GPUClockRatio;
+   int32_t LineClockCounter;
+   int32_t LinePhase;
+
+   int32_t DrawTimeAvail;
+
+   int32_t lastts;
+
+   /* Idle scheduling. While the GPU has nothing to draw its event is
+    * virtual: it stays in the event list and the handler advances it
+    * through the regular EventCycles grid points without an update
+    * and without stopping the CPU for them, until the end of the line
+    * where it turns real again. idle_last is the last grid point the
+    * handler advanced through; idle_line_end is where the event turns
+    * real. A GPU write wakes the GPU: the grid points up to the CPU's
+    * last event check are advanced through as the regular cadence
+    * would have run them, the state is brought to the last of them,
+    * and the event turns real on the next one. Not saved: a loaded
+    * state re-phases the grid, exactly as the ForceEventUpdates()
+    * after every load always did. */
+   bool idle_virtual;
+   int32_t idle_last;
+   int32_t idle_line_end;
+   /* Hysteresis: the event only goes virtual after whole grid
+    * intervals with no GP0/GP1 or DMA write, so a stream of small
+    * draws does not pay a wake for every one. */
+   bool idle_write_seen;
+   uint8_t idle_streak;
+
+   bool sl_zero_reached;
+
+   EmulateSpecStruct *espec;
+   MDFN_Surface *surface;
+   MDFN_Rect *DisplayRect;
+   int32_t *LineWidths;
+   bool HardwarePALType;
+   int LineVisFirst, LineVisLast;
+
+   /* Y, 8-bit source value (256 extra for saturation), X.
+    * X is innermost so the four x-phases of one source value share a
+    * host cache line: as a span cycles x&3, gouraud-continuous colour
+    * values re-hit the same lines instead of hopping between four
+    * 512-byte tables.  "dither offset" pointers used with ModTexel are
+    * &DitherLUT[y][0][x] and index values at stride 4 (free scaled
+    * addressing); direct sites index [y][value][x]. */
+   uint8_t DitherLUT[4][512][4];
+
+   /*
+   VRAM has to be a ptr type or else we have to rely on smartcode void* shenanigans to
+   wrestle a variable-sized struct.
+   */
+   uint16_t *vram;
+};
+typedef struct PS_GPU PS_GPU;
+
+#ifdef PSX_MEASURE_MODULATE
+/* Texture-modulation saturation counters; see ModTexel in gpu_common.h.
+ * Built only under -DPSX_MEASURE_MODULATE. */
+void GPU_GetModulateStats(uint64_t *pixels, uint64_t *sat_pixels,
+      uint64_t *sat_channels, uint32_t *peak);
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void     GPU_WriteDMA(uint32_t V, uint32_t addr);
+uint32_t GPU_ReadDMA(void);
+bool     GPU_DMACanWrite(void);
+int32_t  GPU_Update(const int32_t sys_timestamp);
+
+/* Puts the GPU back on its regular update cadence before something
+ * changes the state its idle schedule relied on. from_cpu: the caller is
+ * the running CPU core (a GP0/GP1 write, a timer 0 mode write), so the
+ * grid points up to its last event check are processed first; false
+ * from an event handler (a DMA transfer), where the event list has
+ * already processed exactly what the regular cadence would have. */
+void GPU_WakeFromIdle(bool from_cpu);
+
+/* The GPU's update as called by another device's event (DMA): the state
+ * advances, the idle schedule is untouched. */
+void GPU_UpdatePassive(const int32_t sys_timestamp);
+
+/* The event handler's path for the virtual GPU event. */
+int32_t GPU_VirtualAdvance(const int32_t event_time);
+
+/* Bring the GPU's state to the last grid point its cadence ran and make
+ * its event real (PSX_WakeVirtual's second half). */
+void GPU_WakeVirtual(void);
+
+/* True while the GPU's event is virtual. */
+bool GPU_EventVirtual(void);
+int32_t  GPU_GetScanlineNum(void);
+
+/* Used by rhi_lib_gl.c to access the VRAM contents and
+ * to drive state restore points. */
+uint16_t *GPU_get_vram(void);
+void     GPU_RestoreStateP1(bool load, bool sizing);
+void     GPU_RestoreStateP2(bool load);
+void     GPU_RestoreStateP3(void);
+
+void GPU_set_dither_upscale_shift(uint8_t factor);
+
+uint8_t GPU_get_upscale_shift(void);
+
+/* Lines spanned by the programmed vertical display range (GP1(07)),
+ * before any scanline cropping and before interlace doubling. */
+uint32_t GPU_get_vertical_range_lines(void);
+uint32_t GPU_get_crop_window(void);
+
+bool GPU_get_display_possibly_dirty(void);
+
+void GPU_set_display_possibly_dirty(bool dirty);
+
+void GPU_set_display_change_count(unsigned a);
+
+unsigned GPU_get_display_change_count(void);
+
+bool GPU_Init(bool pal_clock_and_tv,
+      int sls, int sle, uint8_t upscale_shift);
+
+void GPU_RecalcClockRatio(void);
+
+void GPU_Destroy(void);
+
+bool GPU_Rescale(uint8_t ushift);
+
+void GPU_Power(void);
+
+void GPU_ResetTS(void);
+
+void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V);
+
+uint32_t GPU_Read(const int32_t timestamp, uint32_t A);
+
+void GPU_StartFrame(EmulateSpecStruct *espec_arg);
+/* Whether the deferred 480i scanout fills rows [0, lines) at one line
+ * width, *dmw: the whole picture. */
+bool GPU_DeferredScanoutWhole(int32_t lines, int32_t *dmw);
+/* Scans the deferred records out into target (a frontend buffer cut to
+ * the picture, by its x0 and w) or, NULL, into the core's surface. */
+void GPU_FlushDeferredScanout(MDFN_Surface *target);
+
+/* Resets the per-dest_line cache that lets the SW renderer skip
+ * re-zeroing margin pixels each frame when geometry is unchanged.
+ * Must be called whenever the surface storage has been replaced
+ * (alloc_surface, GPU_Rescale) or when external code may have
+ * dirtied the margin pixels (Deinterlacer_Process in WEAVE mode). */
+void GPU_InvalidateScanoutCache(void);
+
+/* Whether every line in [0, lines) of this frame was scanned out
+ * across the whole of the loan. */
+bool GPU_LoanComplete(int32_t lines);
+
+int GPU_StateAction(StateMem *sm, int load, int data_only);
+
+void GPU_set_visible_scanlines(int sls, int sle); // Beetle PSX addition
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

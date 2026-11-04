@@ -1,0 +1,10549 @@
+#include "rhi_lib_gl.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h> /* exit() */
+#include <stddef.h> /* offsetof() */
+#include <assert.h>
+#include <math.h>
+
+#include <glsym/glsym.h>
+
+#include <boolean.h>
+
+#include "mednafen/mednafen.h"
+#include "mednafen/psx/gpu.h"
+#include "libretro.h"
+#include "libretro_options.h"
+
+#include "rhi_intf.h" /* enums */
+#include "rhi_interpolation.h"
+#include "rhi_tt.h"  /* shared HD texture replacement/tracking engine */
+#include "rhi_defer.h"
+#include "tt_trace.h"
+#include "beetle_psx_globals.h"
+
+/* HDR output state, owned by libretro.c (same contract as the Vulkan
+ * renderer's extern block). psx_hdr_active is true only once the frontend
+ * accepted SET_PIXEL_FORMAT(HDR10_2101010) or (SCRGB_RGBA16F), so both the
+ * internal target and display encode gate on it; psx_hdr_scrgb says which. */
+extern bool  psx_hdr_active;
+extern int   psx_hdr_scrgb;
+extern int   psx_video_cable;   /* 0 off, 1 S-Video, 2 composite, 3 RF, 4 RGB */
+extern float psx_phase_error;   /* receiver hue detune, in cycles */
+extern int   psx_black_setup;   /* NTSC pedestal mismatch: 0 none, 1 lifted, 2 crushed */
+extern float psx_hdr_paper_white_nits;
+extern float psx_hdr_max_nits;
+extern float psx_hdr_black_pq;
+extern float psx_hdr_to_panel[9];
+extern int   psx_hdr_expand_gamut;
+extern int   psx_hdr_shoulder;
+extern uint16_t psx_hdr_panel_xy[8];
+extern int   psx_hdr_sdr_eotf;
+extern int   psx_hdr_overbright_hot;
+extern unsigned int psx_pgxp_mode;
+extern int   psx_pgxp_color;   /* PGXP precise colour: vertex colour may exceed 1.0 on fp16 */
+extern int   psx_src_primaries;
+
+/* fp16 render targets are core on desktop GL 3.0+; GLES3 needs an
+ * extension to make them color-renderable. When unavailable, fb_out
+ * uses RGBA8: the PQ display encode still runs if the
+ * frontend engaged HDR10 (the signal contract requires it), but
+ * over-white content clamps at reference white. */
+static bool gl_fp16_renderable(void)
+{
+#ifdef HAVE_OPENGLES3
+   const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+   if (!ext)
+      return false;
+   return strstr(ext, "GL_EXT_color_buffer_float") != NULL ||
+          strstr(ext, "GL_EXT_color_buffer_half_float") != NULL;
+#else
+   return true;
+#endif
+}
+
+#define gl_draw_buffer_is_empty(x)           ((x)->map_index == 0)
+#define gl_draw_buffer_remaining_capacity(x) ((x)->capacity - (x)->map_index)
+#define gl_draw_buffer_next_index(x)         ((x)->map_start + (x)->map_index)
+
+#ifndef GL_MAP_INVALIDATE_RANGE_BIT
+#define GL_MAP_INVALIDATE_RANGE_BIT       0x0004
+#endif
+#ifndef GL_PIXEL_PACK_BUFFER
+#define GL_PIXEL_PACK_BUFFER              0x88EB
+#endif
+#ifndef GL_PIXEL_UNPACK_BUFFER
+#define GL_PIXEL_UNPACK_BUFFER            0x88EC
+#endif
+#ifndef GL_UNPACK_SKIP_ROWS
+#define GL_UNPACK_SKIP_ROWS               0x0CF3
+#endif
+#ifndef GL_UNPACK_SKIP_PIXELS
+#define GL_UNPACK_SKIP_PIXELS             0x0CF4
+#endif
+#ifndef GL_PACK_SKIP_ROWS
+#define GL_PACK_SKIP_ROWS                 0x0D03
+#endif
+#ifndef GL_PACK_SKIP_PIXELS
+#define GL_PACK_SKIP_PIXELS               0x0D04
+#endif
+#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
+#define GL_MAP_INVALIDATE_BUFFER_BIT      0x0008
+#endif
+
+/* Field diagnostics, enabled by setting BEETLE_GL_DIAG in the
+ * environment. Zero-cost when unset (one getenv on first use). Exists
+ * because a class of report - GL-only, NVIDIA-only, runahead-triggered
+ * corruption - reproduces on end-user machines but not on Mesa, where
+ * every map is serviced synchronously; when that happens the user's
+ * log, not our rig, is the instrument. */
+bool rhi_gl_read_vram(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                      uint16_t *vram);
+
+static int gl_diag_state = -1;
+static int gl_diag_nested;
+static unsigned gl_diag_logged;
+static unsigned gl_diag_wraps;
+/* Consecutive glMapBufferRange failures on the command buffer. The
+ * push path retries the map once per primitive while it is unmapped,
+ * so the report is throttled to keep a persistently failing driver
+ * from writing a log line per triangle. */
+static unsigned gl_map_failures;
+#define GL_DIAG_ON() (gl_diag_state >= 0 ? gl_diag_state : \
+      (gl_diag_state = (getenv("BEETLE_GL_DIAG") ? 1 : 0)))
+/* Compare a full-VRAM diagnostic re-read against a reference copy and
+ * report the first divergence. The two probes below split the
+ * savestate cycle into its stages so a field log can say WHICH stage
+ * corrupts: a serialize-time double-read that differs means the GPU
+ * readback itself is nondeterministic; a restore-time roundtrip that
+ * differs means the upload/redraw side altered the data. Both are
+ * bit-exact on a correct stack: the restore draw expands 5-bit
+ * channels to float and the readback rounds them straight back. */
+static void gl_diag_compare_vram(const char *stage,
+      const uint16_t *ref, const uint16_t *got)
+{
+   size_t   n     = (size_t)1024 * 512; /* VRAM_WIDTH_PIXELS x VRAM_HEIGHT; defined below this helper */
+   size_t   k;
+   size_t   first = n;
+   unsigned diffs = 0;
+   for (k = 0; k < n; k++)
+   {
+      if (ref[k] != got[k])
+      {
+         if (first == n)
+            first = k;
+         diffs++;
+      }
+   }
+   if (diffs && getenv("BEETLE_GL_DIAG_DUMP"))
+   {
+      /* One-shot: write ref and readback as PPMs for eyeball analysis. */
+      static int dumped;
+      if (!dumped)
+      {
+         FILE *f; size_t i2; const uint16_t *src; int which;
+         char path[512];
+         dumped = 1;
+         for (which = 0; which < 2; which++)
+         {
+            src = which ? got : ref;
+            snprintf(path, sizeof(path), "%s.%s.ppm",
+                  getenv("BEETLE_GL_DIAG_DUMP"), which ? "got" : "ref");
+            f = fopen(path, "wb");
+            if (f)
+            {
+               fprintf(f, "P6\n1024 512\n255\n");
+               for (i2 = 0; i2 < n; i2++)
+               {
+                  uint16_t v = src[i2];
+                  fputc(((v      ) & 31) << 3, f);
+                  fputc(((v >>  5) & 31) << 3, f);
+                  fputc(((v >> 10) & 31) << 3, f);
+               }
+               fclose(f);
+            }
+         }
+      }
+   }
+   if (!log_cb)
+      return;
+   if (diffs)
+   {
+      if (gl_diag_logged < 128)
+      {
+         gl_diag_logged++;
+         log_cb(RETRO_LOG_ERROR,
+               "[gl_diag] %s MISMATCH: %u/%u pixels differ, first at "
+               "x=%u y=%u: 0x%04x vs 0x%04x\n",
+               stage, diffs, (unsigned)n,
+               (unsigned)(first % 1024u),
+               (unsigned)(first / 1024u),
+               (unsigned)ref[first], (unsigned)got[first]);
+      }
+   }
+   else if (gl_diag_logged < 8)
+   {
+      /* A few explicit clean reports early on, so an all-quiet log is
+       * distinguishable from probes that never ran. */
+      gl_diag_logged++;
+      log_cb(RETRO_LOG_INFO, "[gl_diag] %s clean\n", stage);
+   }
+}
+
+static void gl_diag_errors(const char *site)
+{
+   GLenum e;
+   if (!GL_DIAG_ON())
+      return;
+   while ((e = glGetError()) != GL_NO_ERROR)
+   {
+      if (gl_diag_logged < 128 && log_cb)
+      {
+         gl_diag_logged++;
+         log_cb(RETRO_LOG_ERROR,
+               "[gl_diag] GL error 0x%04X at %s (report #%u)\n",
+               (unsigned)e, site, gl_diag_logged);
+      }
+   }
+}
+
+
+#include "shaders_gl/command_vertex.glsl.h"
+#include "shaders_gl/command_fragment.glsl.h"
+#define FILTER_XBR
+#include "shaders_gl/command_fragment.glsl.h"
+#include "shaders_gl/command_vertex.glsl.h"
+#undef FILTER_XBR
+#define FILTER_SABR
+#include "shaders_gl/command_fragment.glsl.h"
+#undef FILTER_SABR
+#define FILTER_BILINEAR
+#include "shaders_gl/command_fragment.glsl.h"
+#undef FILTER_BILINEAR
+#define FILTER_3POINT
+#include "shaders_gl/command_fragment.glsl.h"
+#undef FILTER_3POINT
+#define FILTER_JINC2
+#include "shaders_gl/command_fragment.glsl.h"
+#undef FILTER_JINC2
+#include "shaders_gl/output_vertex.glsl.h"
+#include "shaders_gl/output_fragment.glsl.h"
+#include "shaders_gl/hdr_splice.h"
+#include "shaders_gl/image_load_vertex.glsl.h"
+#include "shaders_gl/image_load_fragment.glsl.h"
+#include "shaders_gl/vram_copy.glsl.h"
+#include "shaders_gl/vram_pack.glsl.h"
+#include "shaders_gl/hdr_transform.glsl.h"
+#include "hdr_transform.h"
+
+#include "libretro.h"
+#include "libretro_options.h"
+
+/* Quad triangulation order.
+ *
+ * A PSX quad is rendered as two triangles sharing one diagonal.
+ * The choice of which diagonal-vertex pair to duplicate produced
+ * visible seams along the shared edge on Apple desktop GL and
+ * some GLES3 drivers when "{0,1,2,1,2,3}" was used; "{0,1,2,2,1,3}"
+ * was reported to fix it.  Backface culling is disabled for the
+ * PSX renderer so the winding direction does not affect
+ * visibility, only rasteriser fill convention along the diagonal.
+ *
+ * This is unrelated to the runtime gl_caps detection introduced
+ * below; it stays a build-time choice because the difference is
+ * driver-rasteriser-specific and not safe to consolidate without
+ * cross-platform visual testing. */
+#if defined(__APPLE__) || defined(HAVE_OPENGLES3)
+static const GLushort indices[6] = {0, 1, 2, 2, 1, 3};
+#else
+static const GLushort indices[6] = {0, 1, 2, 1, 2, 3};
+#endif
+
+/* === GL capability bookkeeping ============================
+ *
+ * Populated once at context_reset by gl_caps_init().  Call sites
+ * that want a feature beyond the GL/GLES baseline of their
+ * compile profile consult this struct rather than relying on
+ * compile-time #ifdefs - the build-time GLES2/GLES3/desktop
+ * split decides only which header bundle is available; what the
+ * driver actually exposes at runtime is a separate question.
+ *
+ * Version-cap reminders for future contributors:
+ *
+ *   - Apple desktop OpenGL is permanently capped at GL 4.1 Core.
+ *     macOS shipped 4.1 in 10.9 (2013) and never advanced before
+ *     deprecating the API in 10.14.  Anything from 4.2+ -
+ *     including glCopyImageSubData (4.3), compute shaders (4.3),
+ *     and the core glDebugMessageCallback (4.3) - will never be
+ *     available on Apple desktop builds.
+ *
+ *   - Apple iOS / iPadOS are capped at GLES 3.0.  GLES 3.1 / 3.2
+ *     features are not available there.
+ *
+ *   - Linux/Windows desktop drivers commonly expose 4.6 today,
+ *     but the floor for a libretro frontend can be as low as 2.1
+ *     (legacy compat).
+ *
+ *   - Android GLES drivers are commonly 3.0/3.1/3.2; very old
+ *     devices may report only GLES 2.0.
+ *
+ * Function pointers are resolved via the libretro frontend's
+ * get_proc_address callback (hw_render.get_proc_address, set
+ * by the frontend during SET_HW_RENDER).  This works regardless
+ * of whether the function is declared in the static GL/GLES
+ * header for the current build profile, so call sites never
+ * reference symbols their headers might lack.
+ *
+ * Pattern at every call site:
+ *
+ *   if (gl_caps.fp_glCopyImageSubData)
+ *      gl_caps.fp_glCopyImageSubData(...);
+ *   else if (gl_caps.fp_glBlitFramebuffer)
+ *      gl_caps.fp_glBlitFramebuffer(...);
+ *   else
+ *      <portable readback fallback>
+ */
+
+/* Function-pointer typedef calling convention.  Different
+ * profiles spell this differently:
+ *   - Desktop GL  defines APIENTRY (via <GL/gl.h>) and via the
+ *     glsym layer also gets APIENTRYP.
+ *   - GLES        defines GL_APIENTRY (via <GLES{2,3}/gl{2,3}.h>)
+ *     and GL_APIENTRYP, but does not necessarily provide the
+ *     non-prefixed APIENTRY/APIENTRYP.
+ *
+ * Pick whichever the build's GL header bundle actually provides;
+ * it's just a calling-convention attribute so an empty
+ * definition is correct on profiles that have no special
+ * convention. */
+#if defined(APIENTRYP)
+#  define BEETLE_GL_APIENTRYP APIENTRYP
+#elif defined(GL_APIENTRYP)
+#  define BEETLE_GL_APIENTRYP GL_APIENTRYP
+#elif defined(APIENTRY)
+#  define BEETLE_GL_APIENTRYP APIENTRY *
+#elif defined(GL_APIENTRY)
+#  define BEETLE_GL_APIENTRYP GL_APIENTRY *
+#else
+#  define BEETLE_GL_APIENTRYP *
+#endif
+
+typedef enum gl_api_family
+{
+   GL_API_UNKNOWN = 0,
+   GL_API_DESKTOP,
+   GL_API_GLES
+} gl_api_family;
+
+typedef enum gl_profile
+{
+   GL_PROFILE_UNKNOWN = 0,
+   GL_PROFILE_LEGACY, /* desktop pre-3.0, or 3.0+ compat profile */
+   GL_PROFILE_CORE,   /* desktop 3.2+ core profile */
+   GL_PROFILE_ES      /* GLES (no profile distinction) */
+} gl_profile;
+
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_BLITFRAMEBUFFER)(
+      GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+      GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+      GLbitfield mask, GLenum filter);
+
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_PROVOKINGVERTEX)(GLenum mode);
+
+#ifndef GL_LAST_VERTEX_CONVENTION
+#define GL_LAST_VERTEX_CONVENTION 0x8E4E
+#endif
+
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_COPYIMAGESUBDATA)(
+      GLuint srcName, GLenum srcTarget, GLint srcLevel,
+      GLint srcX, GLint srcY, GLint srcZ,
+      GLuint dstName, GLenum dstTarget, GLint dstLevel,
+      GLint dstX, GLint dstY, GLint dstZ,
+      GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth);
+
+typedef struct gl_caps
+{
+   /* Identity */
+   gl_api_family api;
+   gl_profile    profile;
+   int           version_major;
+   int           version_minor;
+   /* Composite version for easy ordered comparisons:
+    *   GL  3.3 -> 0x0303,  GL  4.5 -> 0x0405
+    *   GLES 3.0 -> 0x0300, GLES 3.2 -> 0x0302 */
+   int           version_packed;
+
+   /* Driver identification (logging only).  Pointers into
+    * GL-owned static memory; valid for the lifetime of the
+    * context. */
+   const char *vendor;
+   const char *renderer;
+   const char *version_string;
+
+   /* Resolved entry points.  NULL when not available. */
+   PFN_BEETLE_GL_BLITFRAMEBUFFER  fp_glBlitFramebuffer;
+   PFN_BEETLE_GL_COPYIMAGESUBDATA fp_glCopyImageSubData;
+   /* Desktop GL 3.2+. Without it the provoking vertex is always the last
+    * one, which is the convention the native planes rely on. */
+   PFN_BEETLE_GL_PROVOKINGVERTEX  fp_glProvokingVertex;
+
+   /* Set to 1 when the detected version is below the floor
+    * beetle's GL renderer needs to function (GL/GLES 3.0).
+    * gl_context_reset checks this and refuses to activate the
+    * renderer when set. */
+   int unsupported;
+
+   /* Compute shaders with shared memory and image stores: GL 4.3 or
+    * GLES 3.1. Well above the renderer's floor, so this is optional
+    * and nothing else in the renderer depends on it. The analog
+    * chain's IIR chroma trap needs it; without it the encoded cable
+    * tiers run the trap's own bypass path and show hanging dots
+    * rather than losing the cable simulation entirely. */
+   int has_compute;
+} gl_caps_t;
+
+static gl_caps_t gl_caps;
+
+/* Normalise the pixel-transfer state this renderer inherits from the
+ * frontend. The glsm shim used to reset all of this around every core
+ * entry; the rhi port dropped the shim for its unused state mirror and
+ * with it, silently, the incoming-state normalisation that was doing
+ * real work. RetroArch legitimately uploads its own UI textures between
+ * retro_run calls (the statistics overlay does so every frame) and can
+ * leave GL_UNPACK_* skips/lengths set and a pixel buffer bound. A bound
+ * GL_PIXEL_UNPACK_BUFFER turns every client-pointer glTexSubImage into
+ * an offset into the frontend's buffer - out of bounds, the whole
+ * upload is dropped with GL_INVALID_OPERATION; in bounds, it uploads
+ * the frontend's bytes. Under Preemptive Frames runahead the savestate
+ * restore replays the full 1MiB VRAM image through exactly that path
+ * every frame, which turned this latent inheritance into constant
+ * whole-VRAM corruption on the GL renderer, while Vulkan - with no
+ * shared mutable transfer state - was immune. Called at every entry
+ * point that touches the context after the frontend may have. */
+static void gl_normalize_inherited_state(void)
+{
+   /* PS1 dithering is applied in the draw shader. Driver dithering would
+    * also alter exact VRAM uploads and copies into the RGB5_A1 target. */
+   glDisable(GL_DITHER);
+   /* Per-triangle flat attributes use the last vertex, as ES always does. */
+   if (gl_caps.fp_glProvokingVertex)
+      gl_caps.fp_glProvokingVertex(GL_LAST_VERTEX_CONVENTION);
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   glPixelStorei(GL_UNPACK_ALIGNMENT,   4);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH,  0);
+   glPixelStorei(GL_UNPACK_SKIP_ROWS,   0);
+   glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+   glPixelStorei(GL_PACK_ALIGNMENT,     4);
+#ifdef GL_PACK_ROW_LENGTH
+   glPixelStorei(GL_PACK_ROW_LENGTH,    0);
+#endif
+   glPixelStorei(GL_PACK_SKIP_ROWS,     0);
+   glPixelStorei(GL_PACK_SKIP_PIXELS,   0);
+   glActiveTexture(GL_TEXTURE0);
+}
+
+/* === GLES 2.x compile-time bridges ============================
+ *
+ * Beetle-PSX targets GL 3.3 Core / GLES 3.x.  The GLES 2.x build
+ * (HAVE_OPENGLES + HAVE_OPENGLES2) does not currently produce a
+ * working renderer and there are pre-existing compile errors in
+ * the file unrelated to glsm folding.  These bridges narrow the
+ * scope of "what's missing for GLES 2.x" so a future contributor
+ * who wants to make GLES 2.x actually work can replace them with
+ * proper runtime branches at the call sites that still need them
+ * (per the gl_caps pattern).
+ *
+ * Two flavours:
+ *
+ *   - Macro-aliases to OES/EXT extension entry points: for
+ *     functions GLES 2.x does not have in core but commonly has
+ *     via a vendor extension.  rglgen resolves the OES/EXT
+ *     symbol for us at context_reset time; if the running driver
+ *     does not expose the extension the function pointer is NULL
+ *     and any call crashes loudly (preferable to silent no-ops
+ *     that paint over real bugs).
+ *
+ *   - Empty / harmless stubs: for functions that have no GLES 2.x
+ *     equivalent at all (typed integer uniforms, polygon mode,
+ *     etc.).  These should never be reached at runtime because
+ *     gl_caps_init refuses to mark the renderer valid below
+ *     GL/GLES 3.0 (see "version_packed >= 0x0300" gate); they
+ *     exist only so the compile graph stays connected.
+ *
+ * Once a real GLES 2.x rendering path is implemented these
+ * bridges should disappear, replaced by gl_caps-style runtime
+ * branches at each call site. */
+#if defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES2)
+
+/* Aliases to extension entry points.  rglgen resolves the
+ * OES/EXT-suffixed symbol; the call goes through that runtime
+ * pointer when reachable. */
+#define glBindVertexArray         glBindVertexArrayOES
+#define glDeleteVertexArrays      glDeleteVertexArraysOES
+#define glDrawBuffers             glDrawBuffersEXT
+#define glFramebufferTexture      glFramebufferTextureOES
+#define glGenVertexArrays         glGenVertexArraysOES
+#define glMapBufferRange          glMapBufferRangeEXT
+#define glTexStorage2D            glTexStorage2DEXT
+#define glUnmapBuffer             glUnmapBufferOES
+
+/* Stubs for functions with no GLES 2.x equivalent.  Unreachable
+ * at runtime because gl_caps_init refuses the renderer below
+ * GL/GLES 3.0; present only to keep the file compile-clean. */
+static INLINE void glUniform1ui(GLint location, GLuint v0)
+{
+   (void)location; (void)v0;
+}
+static INLINE void glUniform2ui(GLint location, GLuint v0, GLuint v1)
+{
+   (void)location; (void)v0; (void)v1;
+}
+static INLINE void glVertexAttribIPointer(
+      GLuint index, GLint size, GLenum type,
+      GLsizei stride, const void *pointer)
+{
+   (void)index; (void)size; (void)type;
+   (void)stride; (void)pointer;
+}
+static INLINE void glVertexAttribLPointer(
+      GLuint index, GLint size, GLenum type,
+      GLsizei stride, const void *pointer)
+{
+   (void)index; (void)size; (void)type;
+   (void)stride; (void)pointer;
+}
+
+#endif /* HAVE_OPENGLES && HAVE_OPENGLES2 */
+
+#define VRAM_WIDTH_PIXELS 1024
+#define VRAM_HEIGHT 512
+#define VRAM_PIXELS (VRAM_WIDTH_PIXELS * VRAM_HEIGHT)
+
+extern enum rhi_renderer_type rhi_type;
+extern retro_log_printf_t log_cb;
+
+/* === GL hardware-render plumbing ============================
+ *
+ * Beetle-PSX previously used libretro-common's glsm shim for
+ * registering its GL context with the frontend (via
+ * RETRO_ENVIRONMENT_SET_HW_RENDER), looking up the
+ * frontend-provided default framebuffer object, and resolving
+ * GL function symbols.  glsm also exposed a ~150-function
+ * gl* -> rgl* macro layer that maintained an extensive
+ * gl_state mirror for save / restore between shader passes.
+ *
+ * Beetle never used the save / restore part: it never called
+ * GLSM_CTL_STATE_BIND or GLSM_CTL_STATE_UNBIND, and never used
+ * the glsm_state_setup VAO (it allocates its own VAOs per
+ * gl_draw_buffer).  All the rgl* wrappers were therefore
+ * passthrough-plus-bookkeeping-nobody-read, and all the gl_state
+ * fields were write-only.
+ *
+ * The remaining glsm functionality - SET_HW_RENDER plumbing,
+ * default-framebuffer lookup, and GL-symbol resolution - is a
+ * few-dozen lines that lives directly here now, so the GL state
+ * surface beetle actually exercises is visible at this file's
+ * level. */
+static struct retro_hw_render_callback hw_render;
+
+static GLuint beetle_gl_get_current_framebuffer(void)
+{
+   /* libretro frontend hands us the default FBO id each frame.
+    * Used by bind_libretro_framebuffer() when finalising a frame. */
+   if (hw_render.get_current_framebuffer)
+      return (GLuint)hw_render.get_current_framebuffer();
+   return 0;
+}
+
+/* How many vertices we buffer before forcing a draw. Since the
+ * indexes are stored on 16bits we need to make sure that the length
+ * multiplied by 3 (for triple buffering) doesn't overflow 0xffff. */
+#define VERTEX_BUFFER_LEN 0x4000
+
+/* Maximum number of indices for a vertex buffer. Since quads have
+ * two duplicated vertices it can be up to 3/2 the vertex buffer
+ * length */
+#define INDEX_BUFFER_LEN  ((VERTEX_BUFFER_LEN * 3 + 1) / 2)
+/* The index buffer object is a ring of this many indices: each flush
+ * writes its indices past the previous flush's, through an unsynchronized
+ * map of a range no draw in flight reads, and only the wrap orphans the
+ * storage - instead of every flush. */
+#define INDEX_RING_LEN    (INDEX_BUFFER_LEN * 16)
+/* Byte offset of index `first` of the current flush in the ring. */
+#define GL_INDEX_OFFSET(r, first) \
+   ((GLvoid*)(((size_t)(r)->index_base + (size_t)(first)) * sizeof(GLushort)))
+
+/* Maximum uniform name length (matches the buffer size used in
+ * load_program_uniforms when querying glGetActiveUniform). */
+#define UNIFORM_NAME_MAX 64
+
+/* Maximum uniforms per program. The command program can expose 17 active
+ * uniforms, the optional analog programs at most 12; the HDR outputs also
+ * count the 16 members of the Display Transform block, which are listed
+ * as active but never stored. Fixed storage, with headroom to grow. */
+#define UNIFORM_MAX_ENTRIES 64
+
+struct gl_uniform_entry
+{
+   char name[UNIFORM_NAME_MAX];
+   GLint location;
+};
+typedef struct gl_uniform_entry gl_uniform_entry;
+
+
+struct gl_uniform_map
+{
+   struct gl_uniform_entry items[UNIFORM_MAX_ENTRIES];
+   size_t count;
+};
+
+/* Linear-scan replacement for std::map<std::string,GLint>::operator[].
+ * Beetle's per-program uniform count is small, so a straight memcmp loop is
+ * fine and avoids the std::map allocation overhead. */
+static GLint gl_uniform_map_get(const struct gl_uniform_map *m, const char *name)
+{
+   size_t i;
+   for (i = 0; i < m->count; i++)
+   {
+      if (strcmp(m->items[i].name, name) == 0)
+         return m->items[i].location;
+   }
+   /* Sentinel matches glGetUniformLocation's "no such uniform"
+    * convention - calls into glUniform* with location -1 are
+    * silently ignored by GL. */
+   return -1;
+}
+
+static bool gl_uniform_map_set(struct gl_uniform_map *m, const char *name, GLint location)
+{
+   size_t name_len;
+   if (m->count >= UNIFORM_MAX_ENTRIES)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[gl_uniform_map] capacity exceeded for uniform \"%s\"\n",
+            name);
+      return false;
+   }
+   name_len = strlen(name);
+   if (name_len >= UNIFORM_NAME_MAX)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[gl_uniform_map] name \"%s\" exceeds %d-byte limit\n",
+            name, UNIFORM_NAME_MAX);
+      return false;
+   }
+   memcpy(m->items[m->count].name, name, name_len + 1);
+   m->items[m->count].location = location;
+   m->count++;
+   return true;
+}
+
+typedef struct gl_uniform_map gl_uniform_map;
+
+enum gl_video_clock {
+   VIDEO_CLOCK_NTSC,
+   VIDEO_CLOCK_PAL
+};
+typedef enum gl_video_clock gl_video_clock;
+
+
+enum gl_filter_mode {
+   FILTER_MODE_NEAREST,
+   FILTER_MODE_SABR,
+   FILTER_MODE_XBR,
+   FILTER_MODE_BILINEAR,
+   FILTER_MODE_3POINT,
+   FILTER_MODE_JINC2
+};
+typedef enum gl_filter_mode gl_filter_mode;
+
+
+/* State machine dealing with OpenGL context
+ * destruction/reconstruction */
+enum gl_state
+{
+   /* OpenGL context is ready */
+   GL_STATE_VALID,
+   /* OpenGL context has been destroyed (or is not created yet) */
+   GL_STATE_INVALID
+};
+typedef enum gl_state gl_state;
+
+
+enum gl_semi_transparency_mode {
+   /* Source / 2 + destination / 2 */
+   SEMI_TRANSPARENCY_MODE_AVERAGE = 0,
+   /* Source + destination */
+   SEMI_TRANSPARENCY_MODE_ADD = 1,
+   /* Destination - source */
+   SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE = 2,
+   /* Destination + source / 4 */
+   SEMI_TRANSPARENCY_MODE_ADD_QUARTER_SOURCE = 3,
+};
+typedef enum gl_semi_transparency_mode gl_semi_transparency_mode;
+
+
+struct gl_program
+{
+   GLuint id;
+   /* Hash map of all the active uniforms in this program */
+   gl_uniform_map uniforms;
+   char *info_log;
+};
+typedef struct gl_program gl_program;
+
+/* ---- Display Transform (hdr_transform.c) for the HDR output programs ----
+ * Its constants travel as a uniform block, its tables on texture units
+ * 8-10. GLES has no 16-bit unorm textures, so it gets half floats. */
+#define GL_DT_UBO_BINDING 0
+#define GL_DT_UNIT_ACES2  8
+#define GL_DT_UNIT_FILM   9
+#define GL_DT_UNIT_DESAT  10
+#define GL_DT_UNIT_CUBE   11
+
+static GLuint   gl_dt_ubo;
+/* What gl_dt_ubo holds: re-specified only when a draw needs other
+ * contents, which is when the settings, the peak or the cube change. */
+static struct hdr_dt_block gl_dt_ubo_block;
+static GLuint   gl_dt_tex[3];
+static GLuint   gl_dt_dummy;
+static GLuint   gl_dt_cube;
+static GLuint   gl_dt_dummy_3d;
+
+/* A Display Transform cube: half RGBA, n^3 texels, red fastest; NULL data
+ * makes the 1x1x1 stand-in the sampler needs before the cube exists. */
+static GLuint gl_dt_cube_texture(const uint16_t *half, unsigned n)
+{
+   static const uint16_t zero[4] = { 0, 0, 0, 0 };
+   GLuint tex = 0;
+   glGenTextures(1, &tex);
+   glBindTexture(GL_TEXTURE_3D, tex);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+   glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA16F, (GLsizei)n, (GLsizei)n, (GLsizei)n, 0,
+         GL_RGBA, GL_HALF_FLOAT, half ? (const void*)half : (const void*)zero);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+   return tex;
+}
+static unsigned gl_dt_generation;
+
+static GLuint gl_dt_texture(const uint16_t *unorm, unsigned w, unsigned h,
+      unsigned channels, GLenum wrap)
+{
+   GLuint    tex  = 0;
+   uint16_t *rgba = (uint16_t*)malloc(sizeof(uint16_t) * 4 * w * h);
+   unsigned  i, c;
+   if (!rgba)
+      return 0;
+   for (i = 0; i < w * h; i++)
+      for (c = 0; c < 4; c++)
+      {
+         uint16_t v = unorm ? unorm[i * channels + (c < channels ? c : 0)] : 0;
+#ifdef HAVE_OPENGLES3
+         v = hdr_dt_unorm16_to_half(v);
+#endif
+         rgba[i * 4 + c] = v;
+      }
+   glGenTextures(1, &tex);
+   glBindTexture(GL_TEXTURE_2D, tex);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+#ifdef HAVE_OPENGLES3
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, (GLsizei)w, (GLsizei)h, 0,
+         GL_RGBA, GL_HALF_FLOAT, rgba);
+#else
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16, (GLsizei)w, (GLsizei)h, 0,
+         GL_RGBA, GL_UNSIGNED_SHORT, rgba);
+#endif
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, (GLint)wrap);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   free(rgba);
+   return tex;
+}
+
+static void gl_dt_free(void)
+{
+   unsigned i;
+   for (i = 0; i < 3; i++)
+   {
+      if (gl_dt_tex[i])
+         glDeleteTextures(1, &gl_dt_tex[i]);
+      gl_dt_tex[i] = 0;
+   }
+   if (gl_dt_dummy)
+      glDeleteTextures(1, &gl_dt_dummy);
+   if (gl_dt_cube)
+      glDeleteTextures(1, &gl_dt_cube);
+   if (gl_dt_dummy_3d)
+      glDeleteTextures(1, &gl_dt_dummy_3d);
+   gl_dt_cube       = 0;
+   gl_dt_dummy_3d   = 0;
+   if (gl_dt_ubo)
+      glDeleteBuffers(1, &gl_dt_ubo);
+   gl_dt_dummy      = 0;
+   gl_dt_ubo        = 0;
+   gl_dt_generation = 0;
+}
+
+static void gl_dt_bind_unit(unsigned unit, GLuint tex)
+{
+   glActiveTexture(GL_TEXTURE0 + unit);
+   glBindTexture(GL_TEXTURE_2D, tex ? tex : gl_dt_dummy);
+}
+
+/* Call with the program in use, after its other HDR uniforms. A program
+ * that declares the block always gets one bound; outside HDR it is the
+ * zero block, which selects no curve and builds no tables. */
+static void gl_bind_display_transform(const struct gl_program *p)
+{
+   struct hdr_dt_block b;
+   GLuint   block;
+   unsigned gen;
+
+   if (psx_hdr_active)
+      hdr_dt_fill(&b, psx_hdr_paper_white_nits, psx_hdr_max_nits, 0.0f,
+            psx_hdr_panel_xy);
+   else
+      memset(&b, 0, sizeof(b));
+   gen = hdr_dt_generation();
+   if (!gl_dt_dummy)
+      gl_dt_dummy = gl_dt_texture(NULL, 1, 1, 4, GL_CLAMP_TO_EDGE);
+   if (!gl_dt_dummy_3d)
+   {
+      glActiveTexture(GL_TEXTURE0 + GL_DT_UNIT_CUBE);
+      gl_dt_dummy_3d = gl_dt_cube_texture(NULL, 1);
+   }
+   if (gen != gl_dt_generation)
+   {
+      const uint16_t *cube  = hdr_dt_aces2_cube();
+      const uint16_t *aces2 = hdr_dt_aces2_lut();
+      const uint16_t *film  = hdr_dt_film_lut();
+      const uint16_t *desat = hdr_dt_film_desat();
+      unsigned i;
+      for (i = 0; i < 3; i++)
+      {
+         if (gl_dt_tex[i])
+            glDeleteTextures(1, &gl_dt_tex[i]);
+         gl_dt_tex[i] = 0;
+      }
+      if (gl_dt_cube)
+         glDeleteTextures(1, &gl_dt_cube);
+      gl_dt_cube = 0;
+      glActiveTexture(GL_TEXTURE0 + GL_DT_UNIT_CUBE);
+      if (cube)
+         gl_dt_cube = gl_dt_cube_texture(cube, HDR_DT_ACES2_CUBE);
+      glActiveTexture(GL_TEXTURE0 + GL_DT_UNIT_ACES2);
+      if (aces2)
+         gl_dt_tex[0] = gl_dt_texture(aces2, HDR_DT_ACES2_LUT_WIDTH, 1, 4, GL_REPEAT);
+      if (film)
+         gl_dt_tex[1] = gl_dt_texture(film, HDR_DT_FILM_LUT_WIDTH, 1, 1, GL_CLAMP_TO_EDGE);
+      if (desat)
+         gl_dt_tex[2] = gl_dt_texture(desat, HDR_DT_DESAT_WIDTH, HDR_DT_DESAT_HEIGHT,
+               4, GL_CLAMP_TO_EDGE);
+      gl_dt_generation = gen;
+   }
+   /* The cube only once this context holds it, whatever the block says. */
+   if (!gl_dt_cube)
+      b.gm[2] = 0.0f;
+   if (!gl_dt_ubo)
+   {
+      glGenBuffers(1, &gl_dt_ubo);
+      glBindBuffer(GL_UNIFORM_BUFFER, gl_dt_ubo);
+      glBufferData(GL_UNIFORM_BUFFER, sizeof(b), &b, GL_STATIC_DRAW);
+      gl_dt_ubo_block = b;
+   }
+   else if (memcmp(&b, &gl_dt_ubo_block, sizeof(b)))
+   {
+      /* Draws in flight may still read the old contents: fresh storage
+       * rather than a wait. */
+      glBindBuffer(GL_UNIFORM_BUFFER, gl_dt_ubo);
+      glBufferData(GL_UNIFORM_BUFFER, sizeof(b), &b, GL_STATIC_DRAW);
+      gl_dt_ubo_block = b;
+   }
+   glBindBufferBase(GL_UNIFORM_BUFFER, GL_DT_UBO_BINDING, gl_dt_ubo);
+   block = glGetUniformBlockIndex(p->id, "DisplayTransform");
+   if (block != GL_INVALID_INDEX)
+      glUniformBlockBinding(p->id, block, GL_DT_UBO_BINDING);
+
+   gl_dt_bind_unit(GL_DT_UNIT_ACES2, gl_dt_tex[0]);
+   gl_dt_bind_unit(GL_DT_UNIT_FILM,  gl_dt_tex[1]);
+   gl_dt_bind_unit(GL_DT_UNIT_DESAT, gl_dt_tex[2]);
+   glActiveTexture(GL_TEXTURE0 + GL_DT_UNIT_CUBE);
+   glBindTexture(GL_TEXTURE_3D, gl_dt_cube ? gl_dt_cube : gl_dt_dummy_3d);
+   glActiveTexture(GL_TEXTURE0);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "uDtAces2Lut"), GL_DT_UNIT_ACES2);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "uDtFilmLut"),  GL_DT_UNIT_FILM);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "uDtFilmDesat"), GL_DT_UNIT_DESAT);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "uDtAces2Cube"), GL_DT_UNIT_CUBE);
+}
+
+/* output_fragment with the Display Transform spliced in; caller frees. */
+static char *gl_output_fragment_source(void)
+{
+   return gl_hdr_splice_output_fragment(output_fragment, hdr_transform_glsl);
+}
+
+
+
+struct gl_shader
+{
+   GLuint id;
+   char *info_log;
+};
+typedef struct gl_shader gl_shader;
+
+
+struct gl_attribute
+{
+   char name[32];
+   size_t offset;
+   /* gl_attribute type (BYTE, UNSIGNED_SHORT, FLOAT etc...) */
+   GLenum type;
+   GLint components;
+};
+typedef struct gl_attribute gl_attribute;
+
+
+struct gl_command_vertex {
+   /* Position in PlayStation VRAM coordinates. With native_flags & 2,
+    * X holds packed signed XY and Y/W hold UV coefficients. CPU readers
+    * after packing must use gl_command_vertex_get_xy(), not float lanes. */
+   float position[4];
+   /* RGB colour, 1.0 == 0xFF. Float rather than bytes so the PGXP
+    * precise-colour path can carry the GTE's pre-saturation value, which
+    * exceeds 1.0 for over-range lighting. Without precise colour the values
+    * here are exactly byte/255, so the shader sees bit-identical inputs. */
+   float color[3];
+   /* gl_texture coordinates within the page */
+   uint16_t texture_coord[2];
+   /* gl_texture page (base offset in VRAM used for texture lookup) */
+   uint16_t texture_page[2];
+   /* Color Look-Up Table (palette) coordinates in VRAM */
+   uint16_t clut[2];
+   /* Blending mode: 0: no texture, 1: raw-texture, 2: texture-blended */
+   uint8_t texture_blend_mode;
+   /* Right shift from 16bits: 0 for 16bpp textures, 1 for 8bpp, 2
+    * for 4bpp */
+   uint8_t depth_shift;
+   /* True if dithering is enabled for this primitive */
+   uint8_t dither;
+   /* 0: primitive is opaque, 1: primitive is semi-transparent */
+   uint8_t semi_transparent;
+   /* gl_texture limits of primtive */
+   uint16_t texture_limits[4];
+   /* gl_texture window mask/OR values */
+   uint8_t texture_window[4];
+   /* The primitive samples VRAM content produced by GPU rendering rather
+    * than only game-uploaded texture data. */
+   uint8_t framebuffer_feedback;
+   /* Read indexed colors from the retained CLUT instead of live VRAM. */
+   uint8_t palette_cached;
+   /* Native payload flags: 1 RGB plane, 2 UV plane, 4 line coverage,
+    * 8 integer pixel origin, 16 enhanced polygon UV rounding.
+    * This byte occupies existing padding before fog. */
+   uint8_t native_flags;
+   /* Native colour planes and the packed flat colour (see
+    * gl_set_native_color_plane). Positional initializers omit these trailing
+    * fields and zero-fill them. Append new payloads rather than shifting
+    * existing initializer fields. */
+   float fog[4];
+   /* Native UV planes, or endpoints for native line coverage. */
+   uint32_t native_uv[2];
+};
+typedef struct gl_command_vertex gl_command_vertex;
+
+/* C89-compatible layout check for the shared float/uint shader payload. */
+typedef char gl_command_vertex_layout_check[
+      (sizeof(float) == sizeof(uint32_t) &&
+       sizeof(gl_command_vertex) == 84 &&
+       offsetof(gl_command_vertex, position) == 0 &&
+       offsetof(gl_command_vertex, color) == 16 &&
+       offsetof(gl_command_vertex, fog) == 60 &&
+       offsetof(gl_command_vertex, native_uv) == 76) ? 1 : -1];
+
+static INLINE void gl_command_vertex_get_xy(const gl_command_vertex *v,
+      float *x, float *y)
+{
+   if (v->native_flags & 2)
+   {
+      uint32_t xy;
+      memcpy(&xy, v->position, sizeof(xy));
+      *x = (float)(int16_t)(xy & 0xffffu);
+      *y = (float)(int16_t)(xy >> 16);
+   }
+   else
+   {
+      *x = v->position[0];
+      *y = v->position[1];
+   }
+}
+
+
+struct gl_output_vertex {
+   /* Vertex position on the screen */
+   float position[2];
+   /* Corresponding coordinate in the framebuffer */
+   uint16_t fb_coord[2];
+};
+typedef struct gl_output_vertex gl_output_vertex;
+
+
+/* Forward declarations for vertex-attribute accessor functions.
+ * The arrays and bodies live further down (after push_primitive)
+ * but gl_renderer_new calls them when constructing each
+ * gl_draw_buffer, well before that point. */
+static const struct gl_attribute *gl_command_vertex_attributes(size_t *count);
+static const struct gl_attribute *gl_output_vertex_attributes(size_t *count);
+
+struct gl_display_rect
+{
+   /* Analogous to DisplayRect in the Vulkan
+    * renderer,but specified in native unscaled
+    * glViewport coordinates. */
+   int32_t x;
+   int32_t y;
+   uint32_t width;
+   uint32_t height;
+};
+typedef struct gl_display_rect gl_display_rect;
+
+
+struct gl_draw_config
+{
+   uint16_t display_top_left[2];
+   uint16_t display_resolution[2];
+   bool     display_24bpp;
+   bool     display_off;
+   int16_t  draw_offset[2];
+   uint16_t draw_area_top_left[2];
+   uint16_t draw_area_bot_right[2];
+   uint16_t display_area_hrange[2];
+   uint16_t display_area_vrange[2];
+   bool     is_pal;
+   bool     is_480i;
+};
+typedef struct gl_draw_config gl_draw_config;
+
+
+struct gl_texture
+{
+   GLuint id;
+   uint32_t width;
+   uint32_t height;
+   GLenum internal_format;
+};
+typedef struct gl_texture gl_texture;
+
+
+struct gl_primitive_batch {
+   gl_semi_transparency_mode transparency_mode;
+   /* GL_TRIANGLES or GL_LINES */
+   GLenum draw_mode;
+   /* First index */
+   unsigned first;
+   /* Count of indices */
+   unsigned count;
+   /* Destination snapshot rect of a color-blend batch, in upscaled pixels. */
+   int blend_rect[4];
+   /* HD texture replacement bound for this batch (none = SD only).
+    * Batches split whenever the handle changes so the flush loop can
+    * bind one replacement texture + uniform set per batch. */
+   HdTextureHandle hd;
+   bool opaque;
+   /* Drives the stencil write value for this batch.  Note that
+    * vertex_add_blended_pass() forces this true for the second pass of a
+    * textured semi-transparent primitive, so it is NOT a faithful copy of
+    * the PS1's MaskSetOR - use `force_mask` for that. */
+   bool set_mask;
+   /* GP0(E6h).0 (MaskSetOR) as the GPU saw it, propagated to the shader's
+    * `force_mask_bit` uniform so the mask bit stored in VRAM matches
+    * hardware. */
+   bool force_mask;
+   bool mask_test;
+   bool color_blend;
+};
+typedef struct gl_primitive_batch gl_primitive_batch;
+
+
+/* Replaces std::vector<gl_primitive_batch>.  Heap-backed dynamic array
+ * with explicit init/free; capacity grows by doubling.  Used for
+ * the per-frame batch list which can grow to thousands of entries
+ * on heavy frames, so fixed-size storage isn't viable. */
+struct gl_primitive_batch_vec {
+   struct gl_primitive_batch *items;
+   size_t count;
+   size_t capacity;
+};
+typedef struct gl_primitive_batch_vec gl_primitive_batch_vec;
+
+
+static void gl_primitive_batch_vec_init(struct gl_primitive_batch_vec *v)
+{
+   v->items    = NULL;
+   v->count    = 0;
+   v->capacity = 0;
+}
+
+static void gl_primitive_batch_vec_free(struct gl_primitive_batch_vec *v)
+{
+   if (!v)
+      return;
+   if (v->items)
+   {
+      free(v->items);
+      v->items = NULL;
+   }
+   v->count    = 0;
+   v->capacity = 0;
+}
+
+static void gl_primitive_batch_vec_clear(struct gl_primitive_batch_vec *v)
+{
+   /* Keep the allocated buffer; just reset count.  Preserves
+    * std::vector::clear() semantics: subsequent push_back stays
+    * in the same backing storage until a grow is needed. */
+   v->count = 0;
+}
+
+static bool gl_primitive_batch_vec_push(struct gl_primitive_batch_vec *v,
+      const struct gl_primitive_batch *b)
+{
+   if (v->count >= v->capacity)
+   {
+      size_t new_cap = v->capacity ? v->capacity * 2 : 64;
+      struct gl_primitive_batch *new_items =
+         (struct gl_primitive_batch *)realloc(v->items,
+               new_cap * sizeof(struct gl_primitive_batch));
+      if (!new_items)
+         return false;
+      v->items    = new_items;
+      v->capacity = new_cap;
+   }
+   v->items[v->count++] = *b;
+   return true;
+}
+
+/* gl_draw_buffer holds a typed-but-not-templated vertex buffer.  T was
+ * the vertex type in the original C++ code; the template only
+ * affected how 'map' was typed and how 'element_size' was computed
+ * (sizeof(T)).  Both are stored explicitly now so a single
+ * non-templated struct works for all three vertex types. */
+struct gl_draw_buffer
+{
+   /* OpenGL name for this buffer */
+   GLuint id;
+   /* Vertex Array Object containing the bindings for this
+    * buffer. I'm assuming that each VAO will only use a single
+    * buffer for simplicity. */
+   GLuint vao;
+   /* gl_program used to draw this buffer */
+   gl_program *program;
+   /* Currently mapped buffer range (write-only).  void* because
+    * the actual element type is one of gl_command_vertex /
+    * gl_output_vertex; element_size below tells
+    * us the stride. */
+   void *map;
+   /* sizeof(vertex_type), stored at construction */
+   size_t element_size;
+   /* Number of elements mapped at once in 'map' */
+   size_t capacity;
+   /* Index one-past the last element stored in 'map', relative
+    * to the first element in 'map' */
+   size_t map_index;
+   /* Absolute offset of the 1st mapped element in the current
+    * buffer relative to the beginning of the GL storage. */
+   size_t map_start;
+};
+typedef struct gl_draw_buffer gl_draw_buffer;
+
+#define GL_VRAM_SYNC_TILE_SIZE 8u
+#define GL_VRAM_SYNC_TILES_X (VRAM_WIDTH_PIXELS / GL_VRAM_SYNC_TILE_SIZE)
+#define GL_VRAM_SYNC_TILES_Y (VRAM_HEIGHT / GL_VRAM_SYNC_TILE_SIZE)
+#define GL_VRAM_SYNC_WRITERS_PER_TILE 8u
+
+struct gl_vram_sync_writer
+{
+   uint64_t sequence;
+   uint64_t pixel_mask;
+   uint16_t x;
+   uint16_t y;
+   uint16_t w;
+   uint16_t h;
+};
+
+struct gl_vram_sync_tile
+{
+   struct gl_vram_sync_writer writers[GL_VRAM_SYNC_WRITERS_PER_TILE];
+   /* Pixels whose current contents originated from GPU rendering. Unlike
+    * pending writers, this provenance survives synchronization and frames. */
+   uint64_t gpu_written_mask;
+   uint64_t scaled_dirty_mask;
+   /* Written since the last end-of-frame resolve: on vram_sync.pending. */
+   bool pending;
+};
+
+
+struct gl_analog;
+struct gl_post;
+
+struct gl_renderer {
+   /* Buffer used to handle PlayStation GPU draw commands */
+   gl_draw_buffer *command_buffer;
+   /* Buffer used to draw to the frontend's framebuffer */
+   gl_draw_buffer *output_buffer;
+   /* Draws a VRAM rect from a texture into the bound framebuffer: CPU
+    * uploads into fb_out, resolves back into fb_texture. */
+   gl_program *image_load_program;
+   GLint image_load_loc[5];
+   /* The command program's per-flush and per-batch uniforms (GL_CMD_LOC_*),
+    * resolved when the program is built. */
+   GLint cmd_loc[12];
+   /* Unit quad that rect programs place with their "rect" uniform. */
+   GLuint quad_vao;
+   GLuint quad_vbo;
+
+   GLushort vertex_indices[INDEX_BUFFER_LEN];
+   /* GPU buffer for vertex_indices (required for core profile), a ring
+    * of INDEX_RING_LEN: index_base is where this flush's indices start,
+    * index_ring_pos where the next flush's go. */
+   GLuint index_buffer;
+   unsigned index_base;
+   unsigned index_ring_pos;
+   /* Primitive type for the vertices in the command buffers
+    * (TRIANGLES or LINES) */
+   GLenum command_draw_mode;
+   unsigned vertex_index_pos;
+   gl_primitive_batch_vec batches;
+   /* Whether we're currently pushing opaque primitives or not */
+   bool opaque;
+   /* Current semi-transparency mode */
+   gl_semi_transparency_mode semi_transparency_mode;
+   /* gl_texture used to store the VRAM for texture mapping */
+   gl_draw_config config;
+   /* gl_framebuffer used as a shader input for texturing draw commands */
+   gl_texture fb_texture;
+   /* Retained copy of the selected CLUT when VRAM overwrites it. */
+   gl_texture palette_texture;
+   /* Resolution-matched copy for scaled framebuffer feedback. */
+   gl_texture fb_feedback_texture;
+   bool fb_feedback_texture_failed;
+   /* GP0(80h) copies drawn in the hardware's order: one copy step's
+    * source, the program drawing it back and its unit quad. */
+   gl_texture copy_snapshot;
+   gl_program *copy_program;
+   GLint copy_loc[6];
+   bool copy_failed;
+   /* gl_framebuffer used as an output when running draw commands */
+   gl_texture fb_out;
+   /* Exact internal format selected when fb_out was allocated. */
+   GLenum fb_out_internal_format;
+
+   /* Analog cable chain. NULL until the option is first switched on; the
+    * chain owns a dozen programs and six render targets, so a session that
+    * never enables it never pays for it. Freed with the renderer. */
+   struct gl_analog *analog;
+
+   /* HDR post effects (bloom, halation, chromatic aberration). NULL until
+    * one is first switched on; freed with the renderer. */
+   struct gl_post *post;
+
+   /* rhi_gl_read_vram's objects, kept across reads rather than created
+    * and deleted per FBRead: the read and downsample framebuffers, a
+    * VRAM-sized downsample target in the format last needed, and one
+    * CPU scratch block for the packed and converted pixels. */
+   GLuint   rb_read_fbo;
+   GLuint   rb_scratch_fbo;
+   GLuint   rb_scratch_tex;
+   GLenum   rb_scratch_format;
+   void    *rb_cpu;
+   size_t   rb_cpu_len;
+   /* Float and byte targets are read through vram_pack into an R16UI
+    * target, VRAM-sized, as PlayStation words. */
+   gl_program *rb_pack_program;
+   GLint    rb_pack_loc[5];
+   GLuint   rb_pack_tex;
+   GLuint   rb_pack_fbo;
+   bool     rb_pack_failed;
+
+   /* Subcarrier phase carried in from every field before this one, in
+    * cycles. Advanced once per displayed field; wrapped to [0,1) so a long
+    * session cannot grind the mantissa away. */
+   double analog_phase;
+   /* Depth buffer for fb_out */
+   gl_texture fb_out_depth;
+   /* Current resolution of the frontend's framebuffer */
+   uint32_t frontend_resolution[2];
+   /* Current internal resolution upscaling factor */
+   uint32_t internal_upscaling;
+   /* Current internal color depth */
+   uint8_t internal_color_depth;
+   enum psx_internal_color_mode_e color_mode;
+   /* SDR byte storage uses full-range colors in 32 bpp and q*8 in enhanced
+    * 16 bpp. Ordinary nearest 16-bpp drawing keeps fast RGB5 storage. */
+   bool byte_color_storage;
+   /* The last framebuffer rebuild failed; the old target stays in use. */
+   bool fb_rebuild_failed;
+   gl_texture blend_texture;
+   /* fb_out is GL_RGBA16F: 30-bit/HDR color format requested and fp16 is
+    * color-renderable. Drives the explicit source clamp, the subtractive
+    * zero-floor pass, dither force-off, and readback quantisation. */
+   bool fb_out_fp16;
+   /* Counter for preserving primitive draw order in the z-buffer
+    * since we draw semi-transparent primitives out-of-order. */
+   int16_t primitive_ordering;
+   /* gl_texture window mask/OR values */
+   uint8_t tex_x_mask;
+   uint8_t tex_x_or;
+   uint8_t tex_y_mask;
+   uint8_t tex_y_or;
+
+   bool set_mask;
+   bool force_mask;
+   bool mask_test;
+
+   uint8_t filter_type;
+
+   /* When true we display the entire VRAM buffer instead of just
+    * the visible area */
+   bool display_vram;
+   bool scaled_uv_offset;
+
+   /* Display Mode - GP1(08h) */
+   enum width_modes curr_width_mode;
+
+   /* When set we perform no horizontal padding */
+   int crop_overscan;
+
+   /* Experimental offset feature */
+   int32_t image_offset_cycles;
+
+   /* Image Crop option */
+   unsigned image_crop;
+
+   /* Scanline core options */
+   int32_t initial_scanline;
+   int32_t initial_scanline_pal;
+   int32_t last_scanline;
+   int32_t last_scanline_pal;
+
+   /* ---- Shared HD texture replacement/tracking (rhi_tt.c) ---- */
+   TextureTracker *tracker;
+   bool texture_tracking_enabled;
+   /* HD handle of the batch currently being built (splits on change) */
+   HdTextureHandle hd_handle;
+   /* Scratch FBOs for fused-page compositing blits */
+   GLuint tt_read_fbo;
+   GLuint tt_draw_fbo;
+   /* Persistent FBOs for fb_out -> fb_texture dependency resolves. */
+   GLuint vram_sync_read_fbo;
+   GLuint vram_sync_draw_fbo;
+   /* Renderer-owned draw targets; attachments follow current textures. */
+   GLuint fb_out_fbo;
+   GLuint fb_texture_fbo;
+
+   /* fb_out receives primitive rendering while fb_texture supplies texels.
+    * Remember native VRAM regions that are newer in fb_out so a later draw
+    * can resolve only the texture page or CLUT data it actually depends on. */
+   struct
+   {
+      uint64_t sequence;
+      /* Dependency snapshots can consume writer records without updating the
+       * native mirror. The tiles written since the frame's final resolve
+       * are kept separately, as indices ty * GL_VRAM_SYNC_TILES_X + tx: the
+       * resolve covers them and the clear touches only them. */
+      uint16_t pending[GL_VRAM_SYNC_TILES_Y * GL_VRAM_SYNC_TILES_X];
+      unsigned pending_count;
+      struct gl_vram_sync_tile tiles
+            [GL_VRAM_SYNC_TILES_Y][GL_VRAM_SYNC_TILES_X];
+   } vram_sync;
+
+   uint16_t palette_cache_x;
+   uint16_t palette_cache_y;
+   uint8_t palette_cache_depth;
+   bool palette_cache_gpu_written;
+   bool palette_cache_valid;
+   bool palette_cache_saved;
+};
+typedef struct gl_renderer gl_renderer;
+
+
+struct retro_gl
+{
+   gl_renderer *state_data;
+   gl_state state;
+   gl_video_clock video_clock;
+   bool inited;
+};
+typedef struct retro_gl retro_gl;
+
+
+static gl_draw_config persistent_config = {
+   {0, 0},         /* display_top_left */
+   {MEDNAFEN_CORE_GEOMETRY_MAX_W, MEDNAFEN_CORE_GEOMETRY_MAX_H}, /* display_resolution */
+   false,          /* display_24bpp */
+   true,           /* display_off */
+   {0, 0},         /* draw_area_top_left */
+   {0, 0},         /* draw_area_dimensions */
+   {0, 0},         /* draw_offset */
+   {0x200, 0xC00}, /* display_area_hrange (hardware reset values)*/
+   {0x10, 0x100},  /* display_area_vrange (hardware reset values)*/ 
+   false,          /* is_pal */
+   false,          /* is_480i */
+};
+
+static retro_gl static_renderer;
+
+/*
+ * Queue for rhi_gl_* operations that arrive between the libretro
+ * frontend's RETRO_ENVIRONMENT_SET_HW_RENDER acceptance (in rhi_gl_open)
+ * and the frontend actually calling our gl_context_reset to bring the
+ * GL renderer up. Drained at the end of gl_context_reset so the buffered
+ * state and VRAM uploads land on a live renderer. See rhi/rhi_defer.h
+ * for the policy on which ops are deferred and which are dropped.
+ */
+static rhi_defer_queue_t gl_defer_queue;
+
+/* Forward declarations for the rhi_gl_* entry points the dispatcher
+ * replays into. They are defined further down in this file; the
+ * dispatcher itself is static so no header touch is needed. */
+static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op);
+
+static bool has_software_fb = false;
+
+static void gl_renderer_draw(gl_renderer *renderer);
+#ifdef GL_READ_FRAMEBUFFER
+static bool gl_mirror_fb_out_to_fb_texture(gl_renderer *renderer,
+      uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+      bool allow_with_software_fb);
+static bool gl_ensure_fb_feedback_texture(gl_renderer *renderer);
+#ifdef GL_READ_FRAMEBUFFER
+static void gl_copy_free(gl_renderer *renderer);
+#endif
+static bool gl_snapshot_fb_out(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h);
+#endif
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+   extern retro_environment_t environ_cb;
+   extern retro_video_refresh_t video_cb;
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef DEBUG
+static void get_error(const char *msg)
+{
+   GLenum error = glGetError();
+   switch (error)
+   {
+      case GL_NO_ERROR:
+         log_cb(RETRO_LOG_INFO, "GL error flag: GL_NO_ERROR [%s]\n", msg);
+         return;
+      case GL_INVALID_ENUM:
+         log_cb(RETRO_LOG_ERROR, "GL error flag: GL_INVALID_ENUM [%s]\n", msg);
+         break;
+      case GL_INVALID_VALUE:
+         log_cb(RETRO_LOG_ERROR, "GL error flag: GL_INVALID_VALUE [%s]\n", msg);
+         break;
+      case GL_INVALID_FRAMEBUFFER_OPERATION:
+         log_cb(RETRO_LOG_ERROR, "GL error flag: GL_INVALID_FRAMEBUFFER_OPERATION [%s]\n", msg);
+         break;
+      case GL_OUT_OF_MEMORY:
+         log_cb(RETRO_LOG_ERROR, "GL error flag: GL_OUT_OF_MEMORY [%s]\n", msg);
+         break;
+#ifndef __APPLE__
+      case GL_STACK_UNDERFLOW:
+         log_cb(RETRO_LOG_ERROR, "GL error flag: GL_STACK_UNDERFLOW [%s]\n", msg);
+         break;
+      case GL_STACK_OVERFLOW:
+         log_cb(RETRO_LOG_ERROR, "GL error flag: GL_STACK_OVERFLOW [%s]\n", msg);
+         break;
+#endif
+      case GL_INVALID_OPERATION:
+         log_cb(RETRO_LOG_ERROR, "GL error flag: GL_INVALID_OPERATION [%s]\n", msg);
+         break;
+      default:
+         log_cb(RETRO_LOG_ERROR, "GL error flag: %d [%s]\n", (int) error, msg);
+         break;
+   }
+
+   /* glGetError should always be called in a loop, until
+    * it returns GL_NO_ERROR, if all error flags are to be reset. */
+   while (error != GL_NO_ERROR)
+      error = glGetError();
+}
+#endif
+
+static bool gl_shader_init(
+      struct gl_shader *shader,
+      const char* source,
+      GLenum shader_type)
+{
+   GLint status;
+   GLint log_len = 0;
+   GLuint id;
+
+   shader->info_log = NULL;
+   id               = glCreateShader(shader_type);
+
+   if (id == 0)
+      return false;
+
+   glShaderSource( id,
+         1,
+         &source,
+         NULL);
+   glCompileShader(id);
+
+   status = (GLint) GL_FALSE;
+   glGetShaderiv(id, GL_COMPILE_STATUS, &status);
+   glGetShaderiv(id, GL_INFO_LOG_LENGTH, &log_len);
+
+   if (log_len > 0)
+   {
+      GLsizei len;
+
+      shader->info_log = (char*)malloc(log_len);
+      len              = (GLsizei) log_len;
+
+      glGetShaderInfoLog(id,
+            len,
+            &log_len,
+            (char*)shader->info_log);
+
+      if (log_len > 0)
+         shader->info_log[log_len - 1] = '\0';
+   }
+
+   if (status == GL_FALSE)
+   {
+      log_cb(RETRO_LOG_ERROR, "gl_shader_init() - gl_shader compilation failed:\n%s\n", source);
+      log_cb(RETRO_LOG_DEBUG, "gl_shader info log:\n%s\n", shader->info_log);
+
+      return false;
+   }
+
+   shader->id = id;
+
+   return true;
+}
+
+static void get_program_info_log(gl_program *pg, GLuint id)
+{
+   GLsizei len;
+   GLint log_len = 0;
+
+   glGetProgramiv(id, GL_INFO_LOG_LENGTH, &log_len);
+
+   if (log_len <= 0)
+      return;
+
+   pg->info_log = (char*)malloc(log_len);
+   len          = (GLsizei) log_len;
+
+   glGetProgramInfoLog(id,
+         len,
+         &log_len,
+         (char*)pg->info_log);
+
+   if (log_len <= 0)
+      return;
+
+   pg->info_log[log_len - 1] = '\0';
+}
+
+static bool load_program_uniforms(GLuint program, gl_uniform_map *uniforms)
+{
+   GLint u;
+   GLint n_uniforms = 0;
+
+   memset(uniforms, 0, sizeof(*uniforms));
+
+   glGetProgramiv( program,
+         GL_ACTIVE_UNIFORMS,
+         &n_uniforms );
+
+   if (n_uniforms < 0 || n_uniforms > UNIFORM_MAX_ENTRIES)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "Program %u exposes %d uniforms; capacity is %d\n",
+            program, n_uniforms, UNIFORM_MAX_ENTRIES);
+      return false;
+   }
+
+   /* GL_ACTIVE_UNIFORM_MAX_LENGTH is not consulted: drivers are known to
+    * over-report it, and the names actually returned are what matter.
+    * The buffer holds one byte more than the map accepts, so a name that
+    * would be truncated is rejected by gl_uniform_map_set instead of being
+    * stored under a shortened key. */
+   for (u = 0; u < n_uniforms; ++u)
+   {
+      char name[UNIFORM_NAME_MAX + 1];
+      GLsizei len     = 0;
+      GLint size      = 0;
+      GLenum ty       = 0;
+      GLint location;
+
+      glGetActiveUniform( program,
+            (GLuint) u,
+            (GLsizei) sizeof(name),
+            &len,
+            &size,
+            &ty,
+            (char*) name);
+
+      if (len <= 0)
+      {
+         log_cb(RETRO_LOG_ERROR,
+               "Program %u returned an invalid uniform name length %d\n",
+               program, len);
+         return false;
+      }
+
+      /* Retrieve the location of this uniform */
+      location = glGetUniformLocation(program, (const char*) name);
+
+      /* Nothing looks such a uniform up, so skipping it is harmless;
+       * failing the whole program here would turn a driver quirk into
+       * no renderer at all. */
+      /* Uniform block members are active but have no location. */
+      if (location < 0 && strchr(name, '.'))
+         continue;
+      if (location < 0)
+      {
+         log_cb(RETRO_LOG_WARN,
+               "Active uniform \"%s\" in program %u has no location, skipping\n",
+               name, program);
+         continue;
+      }
+
+      if (!gl_uniform_map_set(uniforms, name, location))
+         return false;
+   }
+
+   return true;
+}
+
+
+static bool gl_program_init(
+      gl_program *program,
+      gl_shader* vertex_shader,
+      gl_shader* fragment_shader)
+{
+   GLint status;
+   GLuint id;
+   gl_uniform_map uniforms;
+
+   program->id       = 0;
+   program->info_log = NULL;
+   memset(&program->uniforms, 0, sizeof(program->uniforms));
+
+   id                = glCreateProgram();
+
+   if (id == 0)
+   {
+      log_cb(RETRO_LOG_ERROR, "gl_program_init() - glCreateProgram() returned 0\n");
+      return false;
+   }
+
+   glAttachShader(id, vertex_shader->id);
+   glAttachShader(id, fragment_shader->id);
+
+   glLinkProgram(id);
+
+   glDetachShader(id, vertex_shader->id);
+   glDetachShader(id, fragment_shader->id);
+
+   /* Check if the program linking was successful */
+   status = GL_FALSE;
+   glGetProgramiv(id, GL_LINK_STATUS, &status);
+   get_program_info_log(program, id);
+
+   if (status == GL_FALSE)
+   {
+      log_cb(RETRO_LOG_ERROR, "gl_program_init() - glLinkProgram() returned GL_FALSE\n");
+      log_cb(RETRO_LOG_ERROR, "gl_program info log:\n%s\n",
+            program->info_log ? program->info_log : "(none)");
+      goto fail;
+   }
+
+   if (!load_program_uniforms(id, &uniforms))
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "gl_program_init() - failed to map active uniforms\n");
+      goto fail;
+   }
+
+   program->id       = id;
+   program->uniforms = uniforms;
+
+   log_cb(RETRO_LOG_DEBUG, "Binding program for first time: %d\n", id);
+
+   glUseProgram(id);
+
+   log_cb(RETRO_LOG_DEBUG, "Unbinding program for first time: %d\n", id);
+
+   glUseProgram(0);
+
+   return true;
+
+fail:
+   glDeleteProgram(id);
+   if (program->info_log)
+   {
+      free(program->info_log);
+      program->info_log = NULL;
+   }
+   return false;
+}
+
+static void gl_program_free(gl_program *program)
+{
+   if (!program)
+      return;
+
+   if (glIsProgram(program->id))
+      glDeleteProgram(program->id);
+   if (program->info_log)
+      free(program->info_log);
+}
+
+/* Forward declaration: gl_draw_buffer_draw and gl_draw_buffer_new both
+ * call gl_draw_buffer_map_no_bind, but it appears below them. */
+static void gl_draw_buffer_map_no_bind(gl_draw_buffer *drawbuffer);
+
+static void gl_draw_buffer_enable_attribute(gl_draw_buffer *drawbuffer, const char *attr)
+{
+   GLint index = glGetAttribLocation(drawbuffer->program->id, attr);
+
+   if (index < 0)
+      return;
+
+   glBindVertexArray(drawbuffer->vao);
+#ifdef EMSCRIPTEN
+   glVertexAttribI4ui(index, 1, 1, 1, 1);
+#else
+   glEnableVertexAttribArray(index);
+#endif
+}
+
+static void gl_draw_buffer_disable_attribute(gl_draw_buffer *drawbuffer, const char *attr)
+{
+   GLint index = glGetAttribLocation(drawbuffer->program->id, attr);
+
+   if (index < 0)
+      return;
+
+   glBindVertexArray(drawbuffer->vao);
+#ifdef EMSCRIPTEN
+   glVertexAttribI4ui(index, 0, 0, 0, 0);
+#else
+   glDisableVertexAttribArray(index);
+#endif
+}
+
+/* gl_draw_buffer_push_slice copies n elements of size 'len' bytes
+ * each from 'slice' into the mapped buffer.  The map is typed
+ * void* (was T* in the templated version) so we cast to char*
+ * for byte arithmetic. */
+/* The NULL-map guard pairs with the release-build map-failure handling
+ * in gl_draw_buffer_map_no_bind: a failed map logs loudly once, and
+ * every push until the next successful map becomes a no-op instead of
+ * a memcpy through NULL. */
+#ifdef DEBUG
+#define gl_draw_buffer_push_slice(drawbuffer, slice, n, len) \
+   do { \
+      assert((n) <= gl_draw_buffer_remaining_capacity(drawbuffer)); \
+      assert((drawbuffer)->map != NULL); \
+      if ((drawbuffer)->map) \
+      { \
+         memcpy((char *)(drawbuffer)->map + (drawbuffer)->map_index * (len), (slice), (n) * (len)); \
+         (drawbuffer)->map_index += (n); \
+      } \
+   } while (0)
+#else
+#define gl_draw_buffer_push_slice(drawbuffer, slice, n, len) \
+   do { \
+      if ((drawbuffer)->map) \
+      { \
+         memcpy((char *)(drawbuffer)->map + (drawbuffer)->map_index * (len), (slice), (n) * (len)); \
+         (drawbuffer)->map_index += (n); \
+      } \
+   } while (0)
+#endif
+
+static void gl_draw_buffer_draw(gl_draw_buffer *drawbuffer, GLenum mode)
+{
+   if (!drawbuffer->map)
+   {
+      /* A previous map failed; nothing was pushed. Reset and retry the
+       * map rather than unmapping a buffer that is not mapped. */
+      drawbuffer->map_index = 0;
+      gl_draw_buffer_map_no_bind(drawbuffer);
+      return;
+   }
+   glBindBuffer(GL_ARRAY_BUFFER, drawbuffer->id);
+   /* Unmap the active buffer */
+   glUnmapBuffer(GL_ARRAY_BUFFER);
+
+   drawbuffer->map = NULL;
+
+   /* The VAO needs to be bound now or else glDrawArrays
+    * errors out on some systems */
+   glBindVertexArray(drawbuffer->vao);
+   glUseProgram(drawbuffer->program->id);
+
+   /* Length in number of vertices */
+   glDrawArrays(mode, drawbuffer->map_start, drawbuffer->map_index);
+
+   drawbuffer->map_start += drawbuffer->map_index;
+   drawbuffer->map_index  = 0;
+
+   gl_draw_buffer_map_no_bind(drawbuffer);
+}
+
+/* Map the buffer for write-only access */
+static void gl_draw_buffer_map_no_bind(gl_draw_buffer *drawbuffer)
+{
+   GLintptr offset_bytes;
+   void *m                = NULL;
+   size_t element_size    = drawbuffer->element_size;
+   size_t map_start       = drawbuffer->map_start;
+   GLsizeiptr buffer_size = drawbuffer->capacity * element_size;
+   /* Before wrap, previously submitted vertices end at map_start: map
+    * the unused window without waiting on in-flight draws. Only the
+    * wrap below reuses submitted storage, and it orphans the buffer. */
+#ifdef HAVE_OPENGLES3
+   GLbitfield map_flags   = GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT;
+#else
+   GLbitfield map_flags   = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT
+         | GL_MAP_UNSYNCHRONIZED_BIT;
+#endif
+
+   glBindBuffer(GL_ARRAY_BUFFER, drawbuffer->id);
+
+   /* If we're already mapped something's wrong */
+   assert(drawbuffer->map == NULL);
+
+   /* We don't have enough room left to remap 'capacity',
+    * start back from the beginning of the buffer. */
+   if (map_start > 2 * drawbuffer->capacity)
+   {
+      map_start = 0;
+      /* At the wrap the mapped window lands back on vertex data whose
+       * draws may still be in flight on a deeply pipelined driver. A
+       * non-UNSYNCHRONIZED map is required to be safe there - the
+       * implementation must either wait for the pending reads or
+       * rename the range - so on a conforming driver this is a stall,
+       * not a hazard. Request whole-buffer invalidation so the driver
+       * can supply fresh storage while pending draws keep the old one.
+       * Invalidation is only a hint; omitting UNSYNCHRONIZED also makes
+       * the map safe when the driver reuses storage and must wait. */
+      map_flags = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT;
+      if (GL_DIAG_ON())
+      {
+         gl_diag_wraps++;
+         if (log_cb && (gl_diag_wraps <= 4 || (gl_diag_wraps & 0x3FFu) == 0))
+            log_cb(RETRO_LOG_INFO,
+                  "[gl_diag] draw buffer wrap #%u (capacity %u, esz %u): orphaning\n",
+                  gl_diag_wraps, (unsigned)drawbuffer->capacity,
+                  (unsigned)element_size);
+      }
+   }
+
+   offset_bytes = map_start * element_size;
+
+   m = glMapBufferRange(GL_ARRAY_BUFFER,
+         offset_bytes,
+         buffer_size,
+         map_flags);
+
+   /* assert() vanishes under NDEBUG, and a NULL map used to flow
+    * straight into the push-slice memcpy - a release-build crash on
+    * any driver that fails the map. Fail loudly and leave the buffer
+    * unmapped; the push and draw paths check for that now. */
+   if (!m)
+   {
+      gl_map_failures++;
+      if (gl_map_failures <= 4 || (gl_map_failures & 0x3FFu) == 0)
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_ERROR,
+                  "[gl_draw_buffer_map_no_bind] glMapBufferRange failed "
+                  "(offset %ld, size %ld, flags 0x%X, failure #%u)\n",
+                  (long)offset_bytes, (long)buffer_size,
+                  (unsigned)map_flags, gl_map_failures);
+         gl_diag_errors("map_no_bind/map-failed");
+      }
+   }
+   else
+   {
+      /* Commit a wrap only after mapping succeeds. A failed wrap must
+       * retry whole-buffer invalidation, not an unsynchronized old range. */
+      drawbuffer->map_start = map_start;
+      gl_map_failures = 0;
+   }
+
+   drawbuffer->map = m;
+}
+
+static void gl_draw_buffer_free(gl_draw_buffer *drawbuffer)
+{
+   if (!drawbuffer)
+      return;
+
+   if (drawbuffer->id != 0)
+   {
+      /* Unmap if currently mapped */
+      glBindBuffer(GL_ARRAY_BUFFER, drawbuffer->id);
+      if (drawbuffer->map)
+         glUnmapBuffer(GL_ARRAY_BUFFER);
+   }
+
+   if (drawbuffer->program)
+   {
+      gl_program_free(drawbuffer->program);
+      free(drawbuffer->program);
+      drawbuffer->program = NULL;
+   }
+
+   if (drawbuffer->id != 0)
+   {
+      glDeleteBuffers(1, &drawbuffer->id);
+      drawbuffer->id = 0;
+   }
+
+   if (drawbuffer->vao != 0)
+   {
+      glDeleteVertexArrays(1, &drawbuffer->vao);
+      drawbuffer->vao = 0;
+   }
+
+   drawbuffer->map       = NULL;
+   drawbuffer->capacity  = 0;
+   drawbuffer->map_index = 0;
+   drawbuffer->map_start = 0;
+}
+
+static void gl_draw_buffer_bind_attributes(gl_draw_buffer *drawbuffer,
+      const gl_attribute *attrs, size_t n_attrs)
+{
+   unsigned i;
+   GLint nVertexAttribs;
+   GLint element_size;
+   size_t a;
+
+   glBindVertexArray(drawbuffer->vao);
+
+   /* ARRAY_BUFFER is captured by VertexAttribPointer */
+   glBindBuffer(GL_ARRAY_BUFFER, drawbuffer->id);
+
+   element_size = (GLint) drawbuffer->element_size;
+
+   /* speculative: attribs enabled on VAO=0 (disabled) get applied
+    * to the VAO when created initially.  As a core, we don't
+    * control the state entirely at this point: frontend may have
+    * enabled attribs.  We need to make sure they're all disabled
+    * before then re-enabling the attribs we want (solves crashes
+    * on some drivers/compilers due to accidentally enabled
+    * attribs). */
+   glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &nVertexAttribs);
+
+   for (i = 0; i < (unsigned)nVertexAttribs; i++)
+      glDisableVertexAttribArray(i);
+
+   for (a = 0; a < n_attrs; a++)
+   {
+      const gl_attribute *attr = &attrs[a];
+      GLint index = glGetAttribLocation(drawbuffer->program->id, attr->name);
+
+      /* Don't error out if the shader doesn't use this attribute,
+       * it could be caused by shader optimization if the attribute
+       * is unused for some reason. */
+      if (index < 0)
+         continue;
+
+      glEnableVertexAttribArray((GLuint) index);
+
+      /* This captures the buffer so that we don't have to bind it
+       * when we draw later on, we'll just have to bind the vao */
+      switch (attr->type)
+      {
+         case GL_BYTE:
+         case GL_UNSIGNED_BYTE:
+         case GL_SHORT:
+         case GL_UNSIGNED_SHORT:
+         case GL_INT:
+         case GL_UNSIGNED_INT:
+            glVertexAttribIPointer( index,
+                  attr->components,
+                  attr->type,
+                  element_size,
+                  (GLvoid*)attr->offset);
+            break;
+         case GL_FLOAT:
+            glVertexAttribPointer(  index,
+                  attr->components,
+                  attr->type,
+                  GL_FALSE,
+                  element_size,
+                  (GLvoid*)attr->offset);
+            break;
+#ifndef HAVE_OPENGLES3
+         case GL_DOUBLE:
+            glVertexAttribLPointer( index,
+                  attr->components,
+                  attr->type,
+                  element_size,
+                  (GLvoid*)attr->offset);
+            break;
+#endif
+      }
+   }
+}
+
+/* Initialise a gl_draw_buffer in-place.  Returns true on success.  On
+ * failure, releases all resources acquired up to the failure point
+ * (no shader leak, no gl_program leak, no GL object leak) and leaves
+ * 'drawbuffer' zeroed.  This is stricter than the original C++
+ * code, which silently left a half-initialised gl_draw_buffer behind
+ * if gl_program_init failed and leaked the two compiled shader
+ * objects + their info logs. */
+static bool gl_draw_buffer_new(gl_draw_buffer *drawbuffer,
+      const char *vertex_shader_src,
+      const char *fragment_shader_src,
+      size_t capacity,
+      size_t element_size,
+      const gl_attribute *attrs,
+      size_t n_attrs)
+{
+   gl_shader vs, fs;
+   gl_program *program;
+   GLsizeiptr storage_size;
+   bool vs_ok = false;
+   bool fs_ok = false;
+   bool program_ok = false;
+
+   memset(drawbuffer, 0, sizeof(*drawbuffer));
+   memset(&vs, 0, sizeof(vs));
+   memset(&fs, 0, sizeof(fs));
+
+   program = (gl_program *)calloc(1, sizeof(*program));
+   if (!program)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[gl_draw_buffer_new] OOM allocating gl_program\n");
+      return false;
+   }
+
+   if (!gl_shader_init(&vs, vertex_shader_src, GL_VERTEX_SHADER))
+      goto fail;
+   vs_ok = true;
+   if (!gl_shader_init(&fs, fragment_shader_src, GL_FRAGMENT_SHADER))
+      goto fail;
+   fs_ok = true;
+   if (!gl_program_init(program, &vs, &fs))
+      goto fail;
+   program_ok = true;
+
+   /* gl_program now owns the linked binary; the shader objects can
+    * be detached and the info-log strings released. */
+   glDeleteShader(vs.id);
+   glDeleteShader(fs.id);
+   if (vs.info_log) { free(vs.info_log); vs.info_log = NULL; }
+   if (fs.info_log) { free(fs.info_log); fs.info_log = NULL; }
+   vs_ok = false;
+   fs_ok = false;
+
+   /* From here on every failure must drop the linked program too. */
+   glGenVertexArrays(1, &drawbuffer->vao);
+   if (drawbuffer->vao == 0)
+      goto fail;
+
+   glGenBuffers(1, &drawbuffer->id);
+   if (drawbuffer->id == 0)
+      goto fail;
+
+   drawbuffer->program      = program;
+   drawbuffer->capacity     = capacity;
+   drawbuffer->element_size = element_size;
+   drawbuffer->map_index    = 0;
+   drawbuffer->map_start    = 0;
+   drawbuffer->map          = NULL;
+
+   /* Create and size the GL buffer.  We allocate enough space for
+    * 3 times the requested capacity and only remap one third of
+    * it at a time. */
+   glBindBuffer(GL_ARRAY_BUFFER, drawbuffer->id);
+   storage_size = drawbuffer->capacity * element_size * 3;
+
+   /* Since we store indexes in unsigned shorts we want to make
+    * sure the entire buffer is indexable. */
+   assert(drawbuffer->capacity * 3 <= 0xffff);
+
+   glBufferData(GL_ARRAY_BUFFER, storage_size, NULL, GL_DYNAMIC_DRAW);
+
+   gl_draw_buffer_bind_attributes(drawbuffer, attrs, n_attrs);
+   gl_draw_buffer_map_no_bind(drawbuffer);
+
+   return true;
+
+fail:
+   /* Unwind in reverse order of acquisition. */
+   if (drawbuffer->id != 0)
+   {
+      glDeleteBuffers(1, &drawbuffer->id);
+      drawbuffer->id = 0;
+   }
+   if (drawbuffer->vao != 0)
+   {
+      glDeleteVertexArrays(1, &drawbuffer->vao);
+      drawbuffer->vao = 0;
+   }
+   if (program_ok)
+   {
+      gl_program_free(program);
+   }
+   if (fs_ok)
+   {
+      glDeleteShader(fs.id);
+   }
+   if (vs_ok)
+   {
+      glDeleteShader(vs.id);
+   }
+   if (fs.info_log) free(fs.info_log);
+   if (vs.info_log) free(vs.info_log);
+   free(program);
+   memset(drawbuffer, 0, sizeof(*drawbuffer));
+   return false;
+}
+
+/* Attach only when the owning textures are created or replaced. A failed
+ * replacement allocation leaves the working textures and FBO unchanged. */
+static void gl_framebuffer_configure(GLuint id,
+      const struct gl_texture *color_texture,
+      const struct gl_texture *depth_texture)
+{
+   GLenum col_attach_0 = GL_COLOR_ATTACHMENT0;
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, id);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, color_texture->id, 0);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+         GL_TEXTURE_2D, depth_texture ? depth_texture->id : 0, 0);
+   glDrawBuffers(1, &col_attach_0);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+}
+
+static void gl_framebuffer_bind(GLuint id,
+      const struct gl_texture *color_texture)
+{
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, id);
+   glViewport(0, 0, (GLsizei)color_texture->width,
+         (GLsizei)color_texture->height);
+}
+
+static bool gl_texture_init(
+      struct gl_texture *tex,
+      uint32_t width,
+      uint32_t height,
+      GLenum internal_format)
+{
+   GLuint id = 0;
+   GLint allocated = GL_FALSE;
+
+   glGenTextures(1, &id);
+   glBindTexture(GL_TEXTURE_2D, id);
+   glTexStorage2D(GL_TEXTURE_2D,
+                  1,
+                  internal_format,
+                  (GLsizei) width,
+                  (GLsizei) height);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+   tex->id     = id;
+   tex->width  = width;
+   tex->height = height;
+   tex->internal_format = internal_format;
+   glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_IMMUTABLE_FORMAT, &allocated);
+   return id != 0 && allocated == GL_TRUE;
+}
+
+#ifdef HAVE_OPENGLES3
+/* GLES upload conversion scratch, kept across uploads: MDEC streams
+ * hundreds of block uploads per frame. */
+static uint16_t *gl_upload_scratch;
+static size_t    gl_upload_scratch_len;
+
+static uint16_t *gl_upload_scratch_get(size_t len)
+{
+   if (len > gl_upload_scratch_len)
+   {
+      uint16_t *p = (uint16_t*)realloc(gl_upload_scratch,
+            len * sizeof(uint16_t));
+      if (!p)
+         return NULL;
+      gl_upload_scratch     = p;
+      gl_upload_scratch_len = len;
+   }
+   return gl_upload_scratch;
+}
+
+static void gl_upload_scratch_free(void)
+{
+   free(gl_upload_scratch);
+   gl_upload_scratch     = NULL;
+   gl_upload_scratch_len = 0;
+}
+#endif
+
+static void gl_texture_set_sub_image_window(
+      struct gl_texture *tex,
+      uint16_t top_left[2],
+      uint16_t resolution[2],
+      size_t row_len,
+      GLenum format,
+      GLenum ty,
+      uint16_t* data)
+{
+   uint16_t x         = top_left[0];
+   uint16_t y         = top_left[1];
+
+   /* Callers split wrap-around VRAM transfers at the 1024x512 seams,
+    * so this function always receives a contiguous source and a
+    * destination rectangle contained within the texture. */
+   size_t index       = ((size_t) y) * row_len + ((size_t) x);
+   uint16_t* sub_data = &( data[index] );
+
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint) row_len);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   glBindTexture(GL_TEXTURE_2D, tex->id);
+
+#ifdef HAVE_OPENGLES3
+   /*
+    * PS1 VRAM stores 16-bit ABGR1555 words. OpenGL ES lacks
+    * GL_UNSIGNED_SHORT_1_5_5_5_REV, so convert them to the RGBA5551
+    * layout required by GL_UNSIGNED_SHORT_5_5_5_1. Display mode
+    * affects scanout interpretation, not the underlying VRAM layout.
+    */
+   if (ty == GL_UNSIGNED_SHORT_5_5_5_1)
+   {
+      size_t sub_w = (size_t) resolution[0];
+      size_t sub_h = (size_t) resolution[1];
+      size_t line, px;
+      uint16_t *converted = gl_upload_scratch_get(sub_w * sub_h);
+
+      if (!converted)
+      {
+         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+         return;
+      }
+      for (line = 0; line < sub_h; line++)
+      {
+         const uint16_t *src_row = sub_data + line * row_len;
+         uint16_t *dst_row = converted + line * sub_w;
+         for (px = 0; px < sub_w; px++)
+         {
+            uint16_t val = src_row[px];
+            uint16_t r = val & 31u;
+            uint16_t g = (val >> 5) & 31u;
+            uint16_t b = (val >> 10) & 31u;
+            uint16_t a = (val >> 15) & 1u;
+            dst_row[px] = (r << 11) | (g << 6) | (b << 1) | a;
+         }
+      }
+      /* Submit prior framebuffer writes before replacing their texture
+       * data. Adreno can otherwise lose this upload despite correct client
+       * bytes. Submission after the update is too late; this does not wait
+       * for the GPU or change the packed VRAM representation. */
+      glFlush();
+      glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+      glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, resolution[0], resolution[1],
+            format, ty, converted);
+      return;
+   }
+#endif
+
+   glTexSubImage2D(  GL_TEXTURE_2D,
+                     0,
+                     (GLint) top_left[0],
+                     (GLint) top_left[1],
+                     (GLsizei) resolution[0],
+                     (GLsizei) resolution[1],
+                     format,
+                     ty,
+                     (void*)sub_data);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+}
+
+/* Allocate, initialise, and return a heap gl_draw_buffer.  Returns
+ * NULL on any failure (allocation, shader compile, program link,
+ * GL object creation).  The caller is responsible for calling
+ * gl_draw_buffer_free + free() to release a non-NULL return. */
+/* ============================================================
+ * GL TTGpuBackend - the GPU services the shared HD-texture
+ * tracker (rhi_tt.c) needs, over plain GL objects. TTGpuImage*
+ * is a small refcounted wrapper around a GL texture name with an
+ * explicit mip chain. Everything here runs on the libretro
+ * thread with the core GL context current (all tracker entry
+ * points are driven from the rsx calls / retro_run).
+ *
+ * Fused-page compositing mirrors the Vulkan backend contract:
+ * page_begin returns a cleared (0,0,0,1-sentinel) target, reusing
+ * a dimension-matched page (same handle, no ref change) or
+ * creating a fresh one (+1 ref, caller releases the stale one);
+ * page_blit replays one level-0 rect across the page's mip chain
+ * with glBlitFramebuffer; page_end is a no-op in GL (no layout
+ * transitions).
+ * ============================================================ */
+
+struct gl_tt_image {
+   GLuint tex;
+   unsigned width;   /* level 0 */
+   unsigned height;  /* level 0 */
+   int levels;
+   int refcount;
+};
+
+static struct gl_tt_image *gl_tt_image_new(unsigned width, unsigned height, int levels)
+{
+   struct gl_tt_image *img =
+      (struct gl_tt_image *)calloc(1, sizeof(*img));
+   GLint prev_tex = 0;
+   int l;
+   unsigned w;
+   unsigned h;
+   if (!img)
+      return NULL;
+   glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+   glGenTextures(1, &img->tex);
+   glBindTexture(GL_TEXTURE_2D, img->tex);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+         levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, levels - 1);
+   w = width;
+   h = height;
+   for (l = 0; l < levels; l++)
+   {
+      glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8,
+            (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+      w = (w > 1u) ? (w >> 1) : 1u;
+      h = (h > 1u) ? (h >> 1) : 1u;
+   }
+   glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+   img->width    = width;
+   img->height   = height;
+   img->levels   = levels;
+   img->refcount = 1;
+   return img;
+}
+
+static TTGpuImage *gl_tt_upload_levels(void *ctx, const LoadedLevels *levels)
+{
+   struct gl_tt_image *img;
+   GLint prev_tex = 0;
+   GLint prev_unpack = 4;
+   int l;
+   (void)ctx;
+   if (!levels || levels->count <= 0 || !levels->levels[0].owned_data)
+      return NULL;
+   img = gl_tt_image_new((unsigned)levels->levels[0].width,
+         (unsigned)levels->levels[0].height, levels->count);
+   if (!img)
+      return NULL;
+   glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+   glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_unpack);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4); /* tightly packed RGBA8 */
+   glBindTexture(GL_TEXTURE_2D, img->tex);
+   for (l = 0; l < levels->count; l++)
+   {
+      const LoadedImage *lvl = &levels->levels[l];
+      glTexSubImage2D(GL_TEXTURE_2D, l, 0, 0,
+            (GLsizei)lvl->width, (GLsizei)lvl->height,
+            GL_RGBA, GL_UNSIGNED_BYTE, lvl->owned_data);
+   }
+   glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack);
+   glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+   return (TTGpuImage *)img;
+}
+
+static void gl_tt_image_addref(void *ctx, TTGpuImage *img_in)
+{
+   struct gl_tt_image *img = (struct gl_tt_image *)img_in;
+   (void)ctx;
+   if (img)
+      img->refcount++;
+}
+
+static void gl_tt_image_release(void *ctx, TTGpuImage *img_in)
+{
+   struct gl_tt_image *img = (struct gl_tt_image *)img_in;
+   (void)ctx;
+   if (!img)
+      return;
+   if (--img->refcount == 0)
+   {
+      glDeleteTextures(1, &img->tex);
+      free(img);
+   }
+}
+
+static unsigned gl_tt_image_width(void *ctx, TTGpuImage *img)
+{
+   (void)ctx;
+   return img ? ((struct gl_tt_image *)img)->width : 0;
+}
+
+static unsigned gl_tt_image_height(void *ctx, TTGpuImage *img)
+{
+   (void)ctx;
+   return img ? ((struct gl_tt_image *)img)->height : 0;
+}
+
+static size_t gl_tt_image_vram_bytes(void *ctx, TTGpuImage *img_in)
+{
+   /* RGBA8 mip chain: level 0 + ~1/3 for the tail. */
+   struct gl_tt_image *img = (struct gl_tt_image *)img_in;
+   size_t base;
+   (void)ctx;
+   if (!img)
+      return 0;
+   base = (size_t)img->width * (size_t)img->height * 4u;
+   return base + base / 3u;
+}
+
+/* Clear every mip level of a page texture to the (0,0,0,1) fall-through
+ * sentinel. The sentinel will not bleed into neighbors in the mipmaps
+ * because the mipmaps are only used down to the original resolution, and
+ * hd textures are aligned to that resolution's texels. */
+static void gl_tt_page_clear(gl_renderer *r, struct gl_tt_image *page)
+{
+   static const GLfloat sentinel[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+   GLint prev_draw_fbo = 0;
+   GLboolean scissor_was_enabled;
+   int l;
+   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+   scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+   if (scissor_was_enabled)
+      glDisable(GL_SCISSOR_TEST);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, r->tt_draw_fbo);
+   for (l = 0; l < page->levels; l++)
+   {
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, page->tex, l);
+      glClearBufferfv(GL_COLOR, 0, sentinel);
+   }
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, 0, 0);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
+   if (scissor_was_enabled)
+      glEnable(GL_SCISSOR_TEST);
+}
+
+static TTGpuImage *gl_tt_page_begin(void *ctx, TTGpuImage *reuse_in,
+      int width, int height, int mip_levels)
+{
+   gl_renderer *r = (gl_renderer *)ctx;
+   struct gl_tt_image *reuse = (struct gl_tt_image *)reuse_in;
+   struct gl_tt_image *page;
+   if (reuse && reuse->width == (unsigned)width &&
+         reuse->height == (unsigned)height)
+      page = reuse; /* same handle back, no reference change */
+   else
+   {
+      page = gl_tt_image_new((unsigned)width, (unsigned)height, mip_levels);
+      if (!page)
+         return NULL;
+   }
+   gl_tt_page_clear(r, page);
+   return (TTGpuImage *)page;
+}
+
+static void gl_tt_page_blit(void *ctx, TTGpuImage *page_in, TTGpuImage *src_in,
+      const TTPageBlit *b)
+{
+   gl_renderer *r = (gl_renderer *)ctx;
+   struct gl_tt_image *page = (struct gl_tt_image *)page_in;
+   struct gl_tt_image *src  = (struct gl_tt_image *)src_in;
+   GLint prev_read_fbo = 0;
+   GLint prev_draw_fbo = 0;
+   GLboolean scissor_was_enabled;
+   int dst_x = b->dst_x;
+   int dst_y = b->dst_y;
+   int dst_w = b->dst_w;
+   int dst_h = b->dst_h;
+   int dstLevel;
+
+   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+   scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+   if (scissor_was_enabled)
+      glDisable(GL_SCISSOR_TEST);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, r->tt_read_fbo);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, r->tt_draw_fbo);
+
+   for (dstLevel = 0; dstLevel < page->levels; dstLevel++)
+   {
+      int srcLevel = dstLevel - b->full_res_levels;
+      int sx0, sy0, sx1, sy1;
+      if (srcLevel < 0)
+         srcLevel = 0;
+      if (srcLevel >= src->levels)
+         srcLevel = src->levels - 1;
+      sx0 = b->src_x >> srcLevel;
+      sy0 = b->src_y >> srcLevel;
+      sx1 = sx0 + (b->src_w >> srcLevel);
+      sy1 = sy0 + (b->src_h >> srcLevel);
+      glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, src->tex, srcLevel);
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, page->tex, dstLevel);
+      glBlitFramebuffer(sx0, sy0, sx1, sy1,
+            dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
+            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+      dst_x >>= 1;
+      dst_y >>= 1;
+      dst_w = (dst_w >> 1) > 1 ? (dst_w >> 1) : 1;
+      dst_h = (dst_h >> 1) > 1 ? (dst_h >> 1) : 1;
+   }
+
+   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, 0, 0);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, 0, 0);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
+   if (scissor_was_enabled)
+      glEnable(GL_SCISSOR_TEST);
+}
+
+static void gl_tt_page_end(void *ctx, TTGpuImage *page)
+{
+   /* No layout transitions in GL. */
+   (void)ctx;
+   (void)page;
+}
+
+static TTGpuBackend gl_tt_make_backend(gl_renderer *r)
+{
+   TTGpuBackend vt;
+   vt.ctx              = r;
+   vt.upload_levels    = gl_tt_upload_levels;
+   vt.image_addref     = gl_tt_image_addref;
+   vt.image_release    = gl_tt_image_release;
+   vt.image_width      = gl_tt_image_width;
+   vt.image_height     = gl_tt_image_height;
+   vt.image_vram_bytes = gl_tt_image_vram_bytes;
+   vt.page_begin       = gl_tt_page_begin;
+   vt.page_blit        = gl_tt_page_blit;
+   vt.page_end         = gl_tt_page_end;
+   vt.staging_alloc    = NULL;
+   vt.staging_release  = NULL;
+   return vt;
+}
+
+/* VRAM rect a textured primitive samples from. The HD replacement bounds
+ * keep the texture tracker's boundary convention: the right edge rounds up
+ * to a whole word and the span omits the final column. */
+static TTRect gl_tt_texture_vram_rect(gl_renderer *r,
+      unsigned texpage_x, unsigned texpage_y,
+      unsigned min_u, unsigned min_v,
+      unsigned max_u, unsigned max_v,
+      unsigned shift, bool hd_texture)
+{
+   TTRect out = rhi_sampled_vram_rect(texpage_x, texpage_y,
+         min_u, min_v, max_u, max_v,
+         r->tex_x_mask, r->tex_y_mask, r->tex_x_or, r->tex_y_or, shift);
+   if (hd_texture && r->tex_x_mask == 0xffu && r->tex_y_mask == 0xffu &&
+       max_u <= 255 && max_v <= 255)
+      out.width = ((max_u + (1u << shift) - 1) >> shift) - (min_u >> shift);
+   return out;
+}
+
+static void gl_draw_rect(gl_renderer *renderer, GLint rect,
+      unsigned x0, unsigned y0, unsigned x1, unsigned y1);
+
+static void gl_vram_sync_clear(gl_renderer *renderer)
+{
+   unsigned i;
+
+   /* Synchronization makes pending writers current, but does not change
+    * where the pixels originated. Preserve GPU-written provenance. Only
+    * tiles on the pending list can hold writers. */
+   for (i = 0; i < renderer->vram_sync.pending_count; i++)
+   {
+      unsigned t = renderer->vram_sync.pending[i];
+      struct gl_vram_sync_tile *tile = &renderer->vram_sync.tiles
+            [t / GL_VRAM_SYNC_TILES_X][t % GL_VRAM_SYNC_TILES_X];
+      memset(tile->writers, 0, sizeof(tile->writers));
+      tile->pending = false;
+   }
+   renderer->vram_sync.pending_count = 0;
+}
+
+/* More rects than this and the resolve draws the pending tiles' bounds. */
+#define GL_VRAM_SYNC_RESOLVE_RECTS 32u
+
+/* Draw `rect` over the tiles on the pending list, in native VRAM units:
+ * each run of pending tiles in a tile row, a run repeated in the rows
+ * below joining it, as one rect. Many rects become one rect around them
+ * all, which still lies within what the tiles span. */
+static void gl_vram_sync_draw_pending(gl_renderer *renderer, GLint rect)
+{
+   /* Row bitmaps, GL_VRAM_SYNC_TILES_X bits each. */
+   uint64_t rows[GL_VRAM_SYNC_TILES_Y][GL_VRAM_SYNC_TILES_X / 64];
+   unsigned tx0 = GL_VRAM_SYNC_TILES_X, tx1 = 0;
+   unsigned ty0 = GL_VRAM_SYNC_TILES_Y, ty1 = 0;
+   unsigned i, ty, pass, rects = 0;
+
+   memset(rows, 0, sizeof(rows));
+   for (i = 0; i < renderer->vram_sync.pending_count; i++)
+   {
+      unsigned t  = renderer->vram_sync.pending[i];
+      unsigned tx = t % GL_VRAM_SYNC_TILES_X;
+      ty          = t / GL_VRAM_SYNC_TILES_X;
+      rows[ty][tx >> 6] |= (uint64_t)1 << (tx & 63);
+      if (tx < tx0)      tx0 = tx;
+      if (tx + 1 > tx1)  tx1 = tx + 1;
+      if (ty < ty0)      ty0 = ty;
+      if (ty + 1 > ty1)  ty1 = ty + 1;
+   }
+   if (tx1 <= tx0)
+      return;
+
+   /* Pass 0 counts the rects, pass 1 draws them. */
+   for (pass = 0; pass < 2; pass++)
+   {
+      unsigned top = ty0;
+      for (ty = ty0; ty < ty1; ty++)
+      {
+         unsigned x;
+         /* A band of identical rows ends before the next row that differs. */
+         if (ty + 1 < ty1 &&
+               !memcmp(rows[ty], rows[ty + 1], sizeof(rows[ty])))
+            continue;
+         for (x = tx0; x < tx1; )
+         {
+            unsigned end;
+            if (!((rows[ty][x >> 6] >> (x & 63)) & 1))
+            {
+               x++;
+               continue;
+            }
+            for (end = x + 1; end < tx1 &&
+                  ((rows[ty][end >> 6] >> (end & 63)) & 1); end++) ;
+            if (pass)
+               gl_draw_rect(renderer, rect,
+                     x * GL_VRAM_SYNC_TILE_SIZE, top * GL_VRAM_SYNC_TILE_SIZE,
+                     end * GL_VRAM_SYNC_TILE_SIZE, (ty + 1) * GL_VRAM_SYNC_TILE_SIZE);
+            else
+               rects++;
+            x = end;
+         }
+         top = ty + 1;
+      }
+      if (!pass && rects > GL_VRAM_SYNC_RESOLVE_RECTS)
+      {
+         gl_draw_rect(renderer, rect,
+               tx0 * GL_VRAM_SYNC_TILE_SIZE, ty0 * GL_VRAM_SYNC_TILE_SIZE,
+               tx1 * GL_VRAM_SYNC_TILE_SIZE, ty1 * GL_VRAM_SYNC_TILE_SIZE);
+         return;
+      }
+   }
+}
+
+/* Return the bits covered by a native VRAM rectangle inside one 8x8 tile.
+ * raw_tx/raw_ty may address a wrapped tile; the caller folds the resulting
+ * tile index back into the 1024x512 VRAM array. */
+static uint64_t gl_vram_sync_tile_mask(unsigned x, unsigned y,
+      unsigned w, unsigned h, unsigned raw_tx, unsigned raw_ty)
+{
+   unsigned tile_x = raw_tx * GL_VRAM_SYNC_TILE_SIZE;
+   unsigned tile_y = raw_ty * GL_VRAM_SYNC_TILE_SIZE;
+   unsigned x0 = x > tile_x ? x : tile_x;
+   unsigned y0 = y > tile_y ? y : tile_y;
+   unsigned x1 = x + w < tile_x + GL_VRAM_SYNC_TILE_SIZE ?
+         x + w : tile_x + GL_VRAM_SYNC_TILE_SIZE;
+   unsigned y1 = y + h < tile_y + GL_VRAM_SYNC_TILE_SIZE ?
+         y + h : tile_y + GL_VRAM_SYNC_TILE_SIZE;
+   unsigned local_x = x0 - tile_x;
+   unsigned row_width = x1 - x0;
+   uint64_t row_mask = ((1u << row_width) - 1u) << local_x;
+   uint64_t mask = 0;
+   unsigned py;
+
+   for (py = y0; py < y1; py++)
+      mask |= row_mask << ((py - tile_y) * GL_VRAM_SYNC_TILE_SIZE);
+
+   return mask;
+}
+
+static bool gl_vram_sync_rect_is_dirty(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned tx0;
+   unsigned tx1;
+   unsigned ty0;
+   unsigned ty1;
+   unsigned raw_tx;
+   unsigned raw_ty;
+
+   if (!w || !h)
+      return false;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   tx0 = x / GL_VRAM_SYNC_TILE_SIZE;
+   tx1 = (x + w - 1) / GL_VRAM_SYNC_TILE_SIZE;
+   ty0 = y / GL_VRAM_SYNC_TILE_SIZE;
+   ty1 = (y + h - 1) / GL_VRAM_SYNC_TILE_SIZE;
+
+   for (raw_ty = ty0; raw_ty <= ty1; raw_ty++)
+   {
+      unsigned ty = raw_ty % GL_VRAM_SYNC_TILES_Y;
+      for (raw_tx = tx0; raw_tx <= tx1; raw_tx++)
+      {
+         unsigned tx = raw_tx % GL_VRAM_SYNC_TILES_X;
+         uint64_t read_mask = gl_vram_sync_tile_mask(
+               x, y, w, h, raw_tx, raw_ty);
+         unsigned wi;
+
+         for (wi = 0; wi < GL_VRAM_SYNC_WRITERS_PER_TILE; wi++)
+            if (read_mask & renderer->vram_sync.tiles[ty][tx]
+                  .writers[wi].pixel_mask)
+               return true;
+      }
+   }
+
+   return false;
+}
+
+static bool gl_vram_sync_rect_has_mask(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h, bool scaled_dirty)
+{
+   unsigned tx0;
+   unsigned tx1;
+   unsigned ty0;
+   unsigned ty1;
+   unsigned raw_tx;
+   unsigned raw_ty;
+
+   if (!w || !h)
+      return false;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   tx0 = x / GL_VRAM_SYNC_TILE_SIZE;
+   tx1 = (x + w - 1) / GL_VRAM_SYNC_TILE_SIZE;
+   ty0 = y / GL_VRAM_SYNC_TILE_SIZE;
+   ty1 = (y + h - 1) / GL_VRAM_SYNC_TILE_SIZE;
+
+   for (raw_ty = ty0; raw_ty <= ty1; raw_ty++)
+   {
+      unsigned ty = raw_ty % GL_VRAM_SYNC_TILES_Y;
+      for (raw_tx = tx0; raw_tx <= tx1; raw_tx++)
+      {
+         unsigned tx = raw_tx % GL_VRAM_SYNC_TILES_X;
+         uint64_t read_mask = gl_vram_sync_tile_mask(
+               x, y, w, h, raw_tx, raw_ty);
+
+         uint64_t mask = scaled_dirty ?
+               renderer->vram_sync.tiles[ty][tx].scaled_dirty_mask :
+               renderer->vram_sync.tiles[ty][tx].gpu_written_mask;
+
+         if (read_mask & mask)
+            return true;
+      }
+   }
+
+   return false;
+}
+
+static void gl_vram_sync_update_gpu_written_rect(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h, bool gpu_written)
+{
+   unsigned tx0;
+   unsigned tx1;
+   unsigned ty0;
+   unsigned ty1;
+   unsigned raw_tx;
+   unsigned raw_ty;
+
+   if (!w || !h)
+      return;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   tx0 = x / GL_VRAM_SYNC_TILE_SIZE;
+   tx1 = (x + w - 1) / GL_VRAM_SYNC_TILE_SIZE;
+   ty0 = y / GL_VRAM_SYNC_TILE_SIZE;
+   ty1 = (y + h - 1) / GL_VRAM_SYNC_TILE_SIZE;
+
+   for (raw_ty = ty0; raw_ty <= ty1; raw_ty++)
+   {
+      unsigned ty = raw_ty % GL_VRAM_SYNC_TILES_Y;
+      for (raw_tx = tx0; raw_tx <= tx1; raw_tx++)
+      {
+         unsigned tx = raw_tx % GL_VRAM_SYNC_TILES_X;
+         uint64_t mask = gl_vram_sync_tile_mask(
+               x, y, w, h, raw_tx, raw_ty);
+
+         renderer->vram_sync.tiles[ty][tx].scaled_dirty_mask |= mask;
+         if (gpu_written)
+            renderer->vram_sync.tiles[ty][tx].gpu_written_mask |= mask;
+         else
+            renderer->vram_sync.tiles[ty][tx].gpu_written_mask &= ~mask;
+      }
+   }
+}
+
+static void gl_vram_sync_clean_scaled_rect(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned tx0;
+   unsigned tx1;
+   unsigned ty0;
+   unsigned ty1;
+   unsigned raw_tx;
+   unsigned raw_ty;
+
+   if (!w || !h)
+      return;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   tx0 = x / GL_VRAM_SYNC_TILE_SIZE;
+   tx1 = (x + w - 1) / GL_VRAM_SYNC_TILE_SIZE;
+   ty0 = y / GL_VRAM_SYNC_TILE_SIZE;
+   ty1 = (y + h - 1) / GL_VRAM_SYNC_TILE_SIZE;
+
+   for (raw_ty = ty0; raw_ty <= ty1; raw_ty++)
+   {
+      unsigned ty = raw_ty % GL_VRAM_SYNC_TILES_Y;
+      for (raw_tx = tx0; raw_tx <= tx1; raw_tx++)
+      {
+         unsigned tx = raw_tx % GL_VRAM_SYNC_TILES_X;
+         uint64_t mask = gl_vram_sync_tile_mask(
+               x, y, w, h, raw_tx, raw_ty);
+
+         renderer->vram_sync.tiles[ty][tx].scaled_dirty_mask &= ~mask;
+      }
+   }
+}
+
+static void gl_vram_sync_invalidate_scaled(gl_renderer *renderer)
+{
+   unsigned ty;
+   unsigned tx;
+
+   /* A newly allocated feedback texture has no valid pixels. Make that
+    * explicit instead of relying on an earlier full-VRAM upload to have
+    * dirtied every tile before lazy allocation. */
+   for (ty = 0; ty < GL_VRAM_SYNC_TILES_Y; ty++)
+      for (tx = 0; tx < GL_VRAM_SYNC_TILES_X; tx++)
+         renderer->vram_sync.tiles[ty][tx].scaled_dirty_mask = UINT64_MAX;
+}
+
+static void gl_vram_sync_clean_rect(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned tx0;
+   unsigned tx1;
+   unsigned ty0;
+   unsigned ty1;
+   unsigned raw_tx;
+   unsigned raw_ty;
+
+   if (!w || !h)
+      return;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   tx0 = x / GL_VRAM_SYNC_TILE_SIZE;
+   tx1 = (x + w - 1) / GL_VRAM_SYNC_TILE_SIZE;
+   ty0 = y / GL_VRAM_SYNC_TILE_SIZE;
+   ty1 = (y + h - 1) / GL_VRAM_SYNC_TILE_SIZE;
+
+   for (raw_ty = ty0; raw_ty <= ty1; raw_ty++)
+   {
+      unsigned ty = raw_ty % GL_VRAM_SYNC_TILES_Y;
+      for (raw_tx = tx0; raw_tx <= tx1; raw_tx++)
+      {
+         unsigned tx = raw_tx % GL_VRAM_SYNC_TILES_X;
+         uint64_t mask = gl_vram_sync_tile_mask(
+               x, y, w, h, raw_tx, raw_ty);
+         unsigned wi;
+
+         for (wi = 0; wi < GL_VRAM_SYNC_WRITERS_PER_TILE; wi++)
+            renderer->vram_sync.tiles[ty][tx]
+                  .writers[wi].pixel_mask &= ~mask;
+      }
+   }
+}
+
+static void gl_vram_sync_mark_rect(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned tx0;
+   unsigned tx1;
+   unsigned ty0;
+   unsigned ty1;
+   unsigned raw_tx;
+   unsigned raw_ty;
+   uint64_t sequence;
+
+   if (!w || !h)
+      return;
+
+   sequence = ++renderer->vram_sync.sequence;
+   gl_vram_sync_update_gpu_written_rect(renderer, x, y, w, h, true);
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   tx0 = x / GL_VRAM_SYNC_TILE_SIZE;
+   tx1 = (x + w - 1) / GL_VRAM_SYNC_TILE_SIZE;
+   ty0 = y / GL_VRAM_SYNC_TILE_SIZE;
+   ty1 = (y + h - 1) / GL_VRAM_SYNC_TILE_SIZE;
+
+   for (raw_ty = ty0; raw_ty <= ty1; raw_ty++)
+   {
+      unsigned ty = raw_ty % GL_VRAM_SYNC_TILES_Y;
+      for (raw_tx = tx0; raw_tx <= tx1; raw_tx++)
+      {
+         unsigned tx = raw_tx % GL_VRAM_SYNC_TILES_X;
+         uint64_t mask = gl_vram_sync_tile_mask(
+               x, y, w, h, raw_tx, raw_ty);
+         unsigned slot = GL_VRAM_SYNC_WRITERS_PER_TILE;
+         unsigned oldest_slot = 0;
+         uint64_t oldest_sequence = UINT64_MAX;
+         unsigned write_x = x;
+         unsigned write_y = y;
+         unsigned write_x1 = x + w;
+         unsigned write_y1 = y + h;
+         unsigned wi;
+
+         /* Preserve provenance for neighboring pixels. A newer primitive
+          * supersedes only the pixels it actually covers. */
+         for (wi = 0; wi < GL_VRAM_SYNC_WRITERS_PER_TILE; wi++)
+         {
+            renderer->vram_sync.tiles[ty][tx]
+                  .writers[wi].pixel_mask &= ~mask;
+            if (!renderer->vram_sync.tiles[ty][tx]
+                     .writers[wi].pixel_mask &&
+                slot == GL_VRAM_SYNC_WRITERS_PER_TILE)
+               slot = wi;
+            if (renderer->vram_sync.tiles[ty][tx]
+                     .writers[wi].sequence < oldest_sequence)
+            {
+               oldest_sequence = renderer->vram_sync.tiles[ty][tx]
+                     .writers[wi].sequence;
+               oldest_slot = wi;
+            }
+         }
+
+         /* A tile can contain more independent writers than the fixed-size
+          * provenance list. Merge the oldest record into the new one rather
+          * than losing dirty pixels. The resulting producer rectangle is
+          * conservative, so a later dependency may copy extra current data
+          * but cannot sample stale data because of this overflow. */
+         if (slot == GL_VRAM_SYNC_WRITERS_PER_TILE)
+         {
+            struct gl_vram_sync_writer *oldest =
+                  &renderer->vram_sync.tiles[ty][tx].writers[oldest_slot];
+            if (oldest->x < write_x) write_x = oldest->x;
+            if (oldest->y < write_y) write_y = oldest->y;
+            if (oldest->x + oldest->w > write_x1)
+               write_x1 = oldest->x + oldest->w;
+            if (oldest->y + oldest->h > write_y1)
+               write_y1 = oldest->y + oldest->h;
+            mask |= oldest->pixel_mask;
+            slot = oldest_slot;
+         }
+
+         renderer->vram_sync.tiles[ty][tx].writers[slot].sequence = sequence;
+         renderer->vram_sync.tiles[ty][tx].writers[slot].pixel_mask = mask;
+         renderer->vram_sync.tiles[ty][tx].writers[slot].x =
+               (uint16_t)write_x;
+         renderer->vram_sync.tiles[ty][tx].writers[slot].y =
+               (uint16_t)write_y;
+         renderer->vram_sync.tiles[ty][tx].writers[slot].w =
+               (uint16_t)(write_x1 - write_x);
+         renderer->vram_sync.tiles[ty][tx].writers[slot].h =
+               (uint16_t)(write_y1 - write_y);
+         if (!renderer->vram_sync.tiles[ty][tx].pending)
+         {
+            renderer->vram_sync.tiles[ty][tx].pending = true;
+            renderer->vram_sync.pending[renderer->vram_sync.pending_count++] =
+                  (uint16_t)(ty * GL_VRAM_SYNC_TILES_X + tx);
+         }
+      }
+   }
+}
+
+/* Find the union of pending primitive destinations sampled by a texture
+ * rectangle. Mirroring the producer union avoids an unconditional full-VRAM
+ * copy between draw batches while making every intersecting write visible. */
+static bool gl_vram_sync_get_producer_rect(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h, TTRect *out)
+{
+   unsigned tx0;
+   unsigned tx1;
+   unsigned ty0;
+   unsigned ty1;
+   unsigned raw_tx;
+   unsigned raw_ty;
+   unsigned x0 = VRAM_WIDTH_PIXELS;
+   unsigned y0 = VRAM_HEIGHT;
+   unsigned x1 = 0;
+   unsigned y1 = 0;
+   bool found = false;
+
+   if (!w || !h)
+      return false;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   tx0 = x / GL_VRAM_SYNC_TILE_SIZE;
+   tx1 = (x + w - 1) / GL_VRAM_SYNC_TILE_SIZE;
+   ty0 = y / GL_VRAM_SYNC_TILE_SIZE;
+   ty1 = (y + h - 1) / GL_VRAM_SYNC_TILE_SIZE;
+
+   for (raw_ty = ty0; raw_ty <= ty1; raw_ty++)
+   {
+      unsigned ty = raw_ty % GL_VRAM_SYNC_TILES_Y;
+      for (raw_tx = tx0; raw_tx <= tx1; raw_tx++)
+      {
+         unsigned tx = raw_tx % GL_VRAM_SYNC_TILES_X;
+         uint64_t read_mask = gl_vram_sync_tile_mask(
+               x, y, w, h, raw_tx, raw_ty);
+         unsigned wi;
+
+         for (wi = 0; wi < GL_VRAM_SYNC_WRITERS_PER_TILE; wi++)
+         {
+            const uint64_t writer_mask = renderer->vram_sync.tiles[ty][tx]
+                  .writers[wi].pixel_mask;
+            unsigned wx;
+            unsigned wy;
+            unsigned ww;
+            unsigned wh;
+
+            if (!(read_mask & writer_mask))
+               continue;
+
+            wx = renderer->vram_sync.tiles[ty][tx].writers[wi].x;
+            wy = renderer->vram_sync.tiles[ty][tx].writers[wi].y;
+            ww = renderer->vram_sync.tiles[ty][tx].writers[wi].w;
+            wh = renderer->vram_sync.tiles[ty][tx].writers[wi].h;
+
+            /* Primitive destinations are clipped, but retain a safe fallback
+             * for any future writer capable of wrapping around VRAM. */
+            if (wx + ww > VRAM_WIDTH_PIXELS || wy + wh > VRAM_HEIGHT)
+            {
+               out->x = x;
+               out->y = y;
+               out->width = w;
+               out->height = h;
+               return true;
+            }
+
+            if (wx < x0) x0 = wx;
+            if (wy < y0) y0 = wy;
+            if (wx + ww > x1) x1 = wx + ww;
+            if (wy + wh > y1) y1 = wy + wh;
+            found = true;
+         }
+      }
+   }
+
+   if (found)
+   {
+      out->x = x0;
+      out->y = y0;
+      out->width = x1 - x0;
+      out->height = y1 - y0;
+   }
+
+   return found;
+}
+
+#ifdef GL_READ_FRAMEBUFFER
+static void gl_vram_sync_mirror_rect(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned first_w;
+   unsigned first_h;
+
+   if (!w || !h || !gl_caps.fp_glBlitFramebuffer)
+      return;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   first_w = w < VRAM_WIDTH_PIXELS - x ? w : VRAM_WIDTH_PIXELS - x;
+   first_h = h < VRAM_HEIGHT - y ? h : VRAM_HEIGHT - y;
+
+   /* A region stays dirty unless its mirror actually ran. */
+   if (gl_mirror_fb_out_to_fb_texture(renderer, (uint16_t)x, (uint16_t)y,
+         (uint16_t)first_w, (uint16_t)first_h, true))
+      gl_vram_sync_clean_rect(renderer, x, y, first_w, first_h);
+
+   if (w > first_w &&
+       gl_mirror_fb_out_to_fb_texture(renderer, 0, (uint16_t)y,
+            (uint16_t)(w - first_w), (uint16_t)first_h, true))
+      gl_vram_sync_clean_rect(renderer, 0, y, w - first_w, first_h);
+   if (h > first_h)
+   {
+      if (gl_mirror_fb_out_to_fb_texture(renderer, (uint16_t)x, 0,
+            (uint16_t)first_w, (uint16_t)(h - first_h), true))
+         gl_vram_sync_clean_rect(renderer, x, 0, first_w, h - first_h);
+      if (w > first_w &&
+          gl_mirror_fb_out_to_fb_texture(renderer, 0, 0,
+               (uint16_t)(w - first_w), (uint16_t)(h - first_h), true))
+         gl_vram_sync_clean_rect(renderer, 0, 0,
+               w - first_w, h - first_h);
+   }
+}
+#endif
+
+#ifdef GL_READ_FRAMEBUFFER
+static bool gl_palette_cache_overlaps(const gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned palette_width;
+   unsigned dx;
+   unsigned px;
+
+   if (!renderer->palette_cache_valid || !w || !h)
+      return false;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   w = w < VRAM_WIDTH_PIXELS ? w : VRAM_WIDTH_PIXELS;
+   h = h < VRAM_HEIGHT ? h : VRAM_HEIGHT;
+   if ((renderer->palette_cache_y + VRAM_HEIGHT - y) % VRAM_HEIGHT >= h)
+      return false;
+
+   palette_width = renderer->palette_cache_depth == 1 ? 256u : 16u;
+   dx = (renderer->palette_cache_x + VRAM_WIDTH_PIXELS - x) % VRAM_WIDTH_PIXELS;
+   px = (x + VRAM_WIDTH_PIXELS - renderer->palette_cache_x) % VRAM_WIDTH_PIXELS;
+   return dx < w || px < palette_width;
+}
+
+static void gl_palette_cache_preserve(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned palette_width;
+   unsigned first_width;
+
+   if (renderer->palette_cache_saved ||
+       !gl_caps.fp_glBlitFramebuffer ||
+       !gl_palette_cache_overlaps(renderer, x, y, w, h))
+      return;
+
+   palette_width = renderer->palette_cache_depth == 1 ? 256u : 16u;
+   first_width = palette_width < VRAM_WIDTH_PIXELS - renderer->palette_cache_x
+         ? palette_width : VRAM_WIDTH_PIXELS - renderer->palette_cache_x;
+
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->vram_sync_read_fbo);
+#ifdef HAVE_OPENGLES3
+   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, renderer->fb_texture.id, 0);
+#else
+   glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         renderer->fb_texture.id, 0);
+#endif
+   glReadBuffer(GL_COLOR_ATTACHMENT0);
+   glBindTexture(GL_TEXTURE_2D, renderer->palette_texture.id);
+   glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+         renderer->palette_cache_x, renderer->palette_cache_y,
+         first_width, 1);
+
+   if (first_width < palette_width)
+      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, first_width, 0,
+            0, renderer->palette_cache_y,
+            palette_width - first_width, 1);
+
+   glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+   renderer->palette_cache_saved = true;
+}
+#else
+static void gl_palette_cache_preserve(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   (void)renderer;
+   (void)x;
+   (void)y;
+   (void)w;
+   (void)h;
+}
+#endif
+
+/* Conservative bounds for VRAM hazards. Queued UV payloads may pack
+ * integral XY; decode them before inspecting geometry. */
+static void gl_primitive_draw_rect(const gl_renderer *renderer,
+      const gl_command_vertex *v, unsigned vertices, GLint rect[4])
+{
+   float min_x = (float)VRAM_WIDTH_PIXELS, min_y = (float)VRAM_HEIGHT;
+   float max_x = 0.0f, max_y = 0.0f;
+   int x0, y0, x1, y1;
+   unsigned i;
+
+   for (i = 0; i < vertices; i++)
+   {
+      float px, py;
+      gl_command_vertex_get_xy(v + i, &px, &py);
+      px += renderer->config.draw_offset[0];
+      py += renderer->config.draw_offset[1];
+      if (px < min_x)
+         min_x = px;
+      if (px > max_x)
+         max_x = px;
+      if (py < min_y)
+         min_y = py;
+      if (py > max_y)
+         max_y = py;
+   }
+   /* Clamp before float-to-integer conversion, including enhanced vertices
+    * outside VRAM. A zero-width/height primitive can still be a line. */
+   if (min_x < 0.0f)
+      min_x = 0.0f;
+   if (min_y < 0.0f)
+      min_y = 0.0f;
+   if (min_x > VRAM_WIDTH_PIXELS)
+      min_x = (float)VRAM_WIDTH_PIXELS;
+   if (min_y > VRAM_HEIGHT)
+      min_y = (float)VRAM_HEIGHT;
+   if (max_x < 0.0f)
+      max_x = 0.0f;
+   if (max_y < 0.0f)
+      max_y = 0.0f;
+   if (max_x > VRAM_WIDTH_PIXELS)
+      max_x = (float)VRAM_WIDTH_PIXELS;
+   if (max_y > VRAM_HEIGHT)
+      max_y = (float)VRAM_HEIGHT;
+   x0 = (int)floorf(min_x);
+   y0 = (int)floorf(min_y);
+   x1 = (int)ceilf(max_x);
+   y1 = (int)ceilf(max_y);
+   if (x1 == x0)
+      x1++;
+   if (y1 == y0)
+      y1++;
+   if (x0 < renderer->config.draw_area_top_left[0])
+      x0 = renderer->config.draw_area_top_left[0];
+   if (y0 < renderer->config.draw_area_top_left[1])
+      y0 = renderer->config.draw_area_top_left[1];
+   if (x1 > renderer->config.draw_area_bot_right[0])
+      x1 = renderer->config.draw_area_bot_right[0];
+   if (y1 > renderer->config.draw_area_bot_right[1])
+      y1 = renderer->config.draw_area_bot_right[1];
+   if (x1 > VRAM_WIDTH_PIXELS)
+      x1 = VRAM_WIDTH_PIXELS;
+   if (y1 > VRAM_HEIGHT)
+      y1 = VRAM_HEIGHT;
+   rect[0] = x0;
+   rect[1] = y0;
+   rect[2] = x1 > x0 ? x1 - x0 : 0;
+   rect[3] = y1 > y0 ? y1 - y0 : 0;
+}
+
+static void gl_vram_sync_primitive(gl_renderer *renderer,
+      gl_command_vertex *v, unsigned vertices, uint32_t uv_offset)
+{
+   GLint rect[4];
+   unsigned i;
+   bool framebuffer_feedback = false;
+
+#ifdef GL_READ_FRAMEBUFFER
+   if (v[0].texture_blend_mode != 0 &&
+       gl_caps.fp_glBlitFramebuffer)
+   {
+      unsigned depth = v[0].depth_shift > 2 ? 0 : v[0].depth_shift;
+      uint16_t min_u = v[0].texture_limits[0], min_v = v[0].texture_limits[1];
+      uint16_t max_u = v[0].texture_limits[2], max_v = v[0].texture_limits[3];
+      TTRect texture_rect;
+      TTRect producer_rect;
+      unsigned clut_width = depth == 1 ? 256u : 16u;
+      bool texture_dirty;
+      bool clut_dirty = false;
+      bool texture_gpu_written;
+      bool clut_gpu_written = false;
+      bool clut_cached = false;
+      bool scaled_feedback;
+      bool native_uv = false;
+
+      /* Native planes sample the original UVs without the enhancement
+       * bias or edge clamp. Synchronize their bounds as well as the
+       * floating path's limits before marking this draw's destination. */
+      for (i = 0; i < vertices; i++)
+         native_uv |= (v[i].native_flags & 2) != 0;
+      for (i = 0; native_uv && i < vertices; i++)
+      {
+         uint16_t u = v[i].texture_coord[0] - (uint16_t)uv_offset;
+         uint16_t t = v[i].texture_coord[1] - (uint16_t)(uv_offset >> 16);
+         if (u < min_u) min_u = u;
+         if (t < min_v) min_v = t;
+         if (u > max_u) max_u = u;
+         if (t > max_v) max_v = t;
+      }
+      texture_rect = gl_tt_texture_vram_rect(renderer,
+            v[0].texture_page[0], v[0].texture_page[1],
+            min_u, min_v, max_u, max_v, depth, false);
+
+      if (texture_rect.height && !texture_rect.width)
+         texture_rect.width = 1;
+      texture_dirty = gl_vram_sync_get_producer_rect(renderer,
+            texture_rect.x, texture_rect.y,
+            texture_rect.width, texture_rect.height, &producer_rect);
+      texture_gpu_written = gl_vram_sync_rect_has_mask(renderer,
+            texture_rect.x, texture_rect.y,
+            texture_rect.width, texture_rect.height, false);
+      if (depth == 1 || depth == 2)
+      {
+         clut_cached = renderer->palette_cache_valid &&
+               renderer->palette_cache_depth == depth &&
+               renderer->palette_cache_x == v[0].clut[0] &&
+               renderer->palette_cache_y == v[0].clut[1];
+         if (clut_cached)
+            clut_gpu_written = renderer->palette_cache_gpu_written;
+         else
+         {
+            if (renderer->palette_cache_saved &&
+                !gl_draw_buffer_is_empty(renderer->command_buffer))
+               gl_renderer_draw(renderer);
+            renderer->palette_cache_saved = false;
+            clut_dirty = gl_vram_sync_rect_is_dirty(renderer,
+                  v[0].clut[0], v[0].clut[1], clut_width, 1);
+            clut_gpu_written = gl_vram_sync_rect_has_mask(renderer,
+                  v[0].clut[0], v[0].clut[1], clut_width, 1, false);
+            renderer->palette_cache_x = v[0].clut[0];
+            renderer->palette_cache_y = v[0].clut[1];
+            renderer->palette_cache_depth = (uint8_t)depth;
+            renderer->palette_cache_gpu_written = clut_gpu_written;
+            renderer->palette_cache_valid = true;
+         }
+      }
+
+      framebuffer_feedback = texture_gpu_written || clut_gpu_written;
+      /* 32 bpp raw reads must preserve rendered byte colors at 1x too.
+       * Reuse the existing snapshot instead of reducing through RGB5. */
+      scaled_feedback = framebuffer_feedback &&
+            (renderer->internal_upscaling > 1 ||
+             (!psx_hdr_active && renderer->color_mode == PSX_INTERNAL_COLOR_32BPP));
+      if (scaled_feedback && !gl_ensure_fb_feedback_texture(renderer))
+         scaled_feedback = false;
+
+      if (texture_dirty || clut_dirty)
+      {
+         /* Pending vertices must reach fb_out before they are copied. */
+         if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+            gl_renderer_draw(renderer);
+
+         if (texture_dirty)
+         {
+            if (scaled_feedback &&
+                !gl_snapshot_fb_out(renderer,
+                     producer_rect.x, producer_rect.y,
+                     producer_rect.width, producer_rect.height))
+               scaled_feedback = false;
+            if (!scaled_feedback || renderer->texture_tracking_enabled)
+               gl_vram_sync_mirror_rect(renderer,
+                     producer_rect.x, producer_rect.y,
+                     producer_rect.width, producer_rect.height);
+         }
+
+         /* A texture resolve may already have covered the palette row. */
+         if (clut_dirty && gl_vram_sync_rect_is_dirty(renderer,
+               v[0].clut[0], v[0].clut[1], clut_width, 1))
+            gl_vram_sync_mirror_rect(renderer,
+                  v[0].clut[0], v[0].clut[1], clut_width, 1);
+      }
+
+      if (scaled_feedback)
+      {
+         if (gl_vram_sync_rect_has_mask(renderer,
+               texture_rect.x, texture_rect.y,
+               texture_rect.width, texture_rect.height, true))
+            scaled_feedback = gl_snapshot_fb_out(renderer,
+                  texture_rect.x, texture_rect.y,
+                  texture_rect.width, texture_rect.height);
+         if (scaled_feedback && (depth == 1 || depth == 2) &&
+             !renderer->palette_cache_saved &&
+             gl_vram_sync_rect_has_mask(renderer,
+                  v[0].clut[0], v[0].clut[1], clut_width, 1, true))
+            scaled_feedback = gl_snapshot_fb_out(renderer,
+                  v[0].clut[0], v[0].clut[1], clut_width, 1);
+
+         if (!scaled_feedback && texture_dirty &&
+             !renderer->texture_tracking_enabled)
+            gl_vram_sync_mirror_rect(renderer,
+                  producer_rect.x, producer_rect.y,
+                  producer_rect.width, producer_rect.height);
+         else if (texture_dirty && !renderer->texture_tracking_enabled)
+            gl_vram_sync_clean_rect(renderer,
+                  producer_rect.x, producer_rect.y,
+                  producer_rect.width, producer_rect.height);
+      }
+   }
+#endif
+
+   gl_primitive_draw_rect(renderer, v, vertices, rect);
+   if (rect[2] && rect[3])
+   {
+      gl_palette_cache_preserve(renderer, rect[0], rect[1], rect[2], rect[3]);
+      gl_vram_sync_mark_rect(renderer, rect[0], rect[1], rect[2], rect[3]);
+   }
+
+   for (i = 0; i < vertices; i++)
+   {
+      v[i].framebuffer_feedback = framebuffer_feedback;
+      v[i].palette_cached = renderer->palette_cache_saved;
+   }
+}
+
+/* Per-primitive HD query (Vulkan renderer_get_hd_texture_index
+ * counterpart). Also drives dumping and prefetch, so it runs even when
+ * no replacement ends up bound. */
+static HdTextureHandle gl_tt_query_hd(gl_renderer *r,
+      const gl_command_vertex *v)
+{
+   UsedMode mode;
+   TTRect vram_rect;
+   unsigned shift;
+   bool fastpath_capable = false;
+   bool cache_hit = false;
+
+   if (!r->tracker || !r->texture_tracking_enabled)
+      return hd_handle_make_none();
+   if (v[0].texture_blend_mode == 0) /* untextured */
+      return hd_handle_make_none();
+
+   /* GL depth_shift: 0=16bpp, 1=8bpp, 2=4bpp - same shift the Vulkan
+    * side derives from TextureMode. */
+   shift = v[0].depth_shift;
+   mode.mode = (shift == 2) ? TextureMode_Palette4bpp
+             : (shift == 1) ? TextureMode_Palette8bpp
+             : TextureMode_ABGR1555;
+   if (mode.mode == TextureMode_ABGR1555)
+   {
+      /* HACK: no palette in this mode; zero it so it is irrelevant for
+       * equality purposes (matches the Vulkan side). */
+      mode.palette_offset_x = 0;
+      mode.palette_offset_y = 0;
+   }
+   else
+   {
+      mode.palette_offset_x = v[0].clut[0];
+      mode.palette_offset_y = v[0].clut[1];
+   }
+
+   vram_rect = gl_tt_texture_vram_rect(r,
+         v[0].texture_page[0], v[0].texture_page[1],
+         v[0].texture_limits[0], v[0].texture_limits[1],
+         v[0].texture_limits[2], v[0].texture_limits[3],
+         shift, true);
+   if (vram_rect.height == 0)
+      return hd_handle_make_none();
+
+   return texture_tracker_get_hd_texture_index(r->tracker, vram_rect,
+         &mode, v[0].texture_page[0], v[0].texture_page[1],
+         &fastpath_capable, &cache_hit);
+}
+
+static gl_draw_buffer *gl_draw_buffer_build(const char *vertex_shader_src,
+      const char *fragment_shader_src,
+      size_t capacity,
+      size_t element_size,
+      const gl_attribute *attrs,
+      size_t n_attrs)
+{
+   gl_draw_buffer *db = (gl_draw_buffer *)calloc(1, sizeof(*db));
+   if (!db)
+      return NULL;
+   if (!gl_draw_buffer_new(db, vertex_shader_src, fragment_shader_src,
+            capacity, element_size, attrs, n_attrs))
+   {
+      free(db);
+      return NULL;
+   }
+   return db;
+}
+
+/* Unit the VRAM copy snapshot and the readback pack sample from; no
+ * other program uses it. */
+#define GL_COPY_UNIT 5
+
+enum
+{
+   GL_LOAD_LOC_RECT = 0,
+   GL_LOAD_LOC_FB_TEXTURE,
+   GL_LOAD_LOC_UPSCALING,
+   GL_LOAD_LOC_CONVERSION,
+   GL_LOAD_LOC_MASK_PASS
+};
+
+enum
+{
+   GL_CMD_LOC_OFFSET = 0,
+   GL_CMD_LOC_FEEDBACK_UPSCALING,
+   GL_CMD_LOC_SEMI,
+   GL_CMD_LOC_MASK,
+   GL_CMD_LOC_NATIVE,
+   GL_CMD_LOC_COLOR,
+   GL_CMD_LOC_HOT,
+   GL_CMD_LOC_HD_ENABLED,
+   GL_CMD_LOC_HD_VRAM_RECT,
+   GL_CMD_LOC_HD_TEXEL_RECT,
+   GL_CMD_LOC_FORCE_ZERO,
+   GL_CMD_LOC_FORCE_CEILING
+};
+
+/* Clamp through the same primitive coverage without reading a destination
+ * texture. Keep alpha/mask and stencil unchanged, and restore blend state. */
+static void gl_renderer_ceiling_batch(gl_renderer *renderer,
+      const struct gl_primitive_batch *batch, float ceiling,
+      GLenum blend_src, GLenum blend_dst, GLenum blend_func)
+{
+   GLint uniform = renderer->cmd_loc[GL_CMD_LOC_FORCE_CEILING];
+   glUniform1f(uniform, ceiling);
+   glBlendEquationSeparate(GL_MIN, GL_FUNC_ADD);
+   glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+   glStencilMask(0);
+   glDrawElements(batch->draw_mode, batch->count, GL_UNSIGNED_SHORT,
+         GL_INDEX_OFFSET(renderer, batch->first));
+   glStencilMask(1);
+   glUniform1f(uniform, 0.0f);
+   glBlendFuncSeparate(blend_src, blend_dst, GL_ONE, GL_ZERO);
+   glBlendEquationSeparate(blend_func, GL_FUNC_ADD);
+}
+
+static void gl_renderer_upload_indices(gl_renderer *renderer)
+{
+   const unsigned n     = renderer->vertex_index_pos;
+   const size_t   bytes = (size_t)n * sizeof(GLushort);
+   void          *dst;
+#ifdef HAVE_OPENGLES3
+   const GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT;
+#else
+   const GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT
+         | GL_MAP_UNSYNCHRONIZED_BIT;
+#endif
+
+   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, renderer->index_buffer);
+   if (renderer->index_ring_pos + n > INDEX_RING_LEN)
+   {
+      /* Wrapped: fresh storage while the draws in flight keep the old. */
+      glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+            INDEX_RING_LEN * sizeof(GLushort), NULL, GL_DYNAMIC_DRAW);
+      renderer->index_ring_pos = 0;
+   }
+   renderer->index_base = renderer->index_ring_pos;
+   if (!n)
+      return;
+   dst = glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER,
+         (GLintptr)renderer->index_base * sizeof(GLushort), (GLsizeiptr)bytes, flags);
+   if (dst)
+   {
+      memcpy(dst, renderer->vertex_indices, bytes);
+      glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
+   }
+   else
+      glBufferSubData(GL_ELEMENT_ARRAY_BUFFER,
+            (GLintptr)renderer->index_base * sizeof(GLushort), (GLsizeiptr)bytes,
+            renderer->vertex_indices);
+   renderer->index_ring_pos += n;
+}
+
+static void gl_renderer_draw(gl_renderer *renderer)
+{
+   int16_t x;
+   int16_t y;
+   size_t bi;
+   GLint semi_uniform = -1, mask_uniform = -1, native_uniform = -1;
+   GLint color_uniform = -1, hot_uniform = -1;
+   /* Read binding to restore after color-blend snapshots, queried at most
+    * once per draw. */
+   GLint read_fb = -1;
+
+   if (!renderer || static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   if (!renderer->command_buffer->map)
+   {
+      /* A previous command-buffer map failed; nothing was pushed and the
+       * buffer is not mapped, so there is nothing to unmap or draw.
+       * Clear the batch bookkeeping and retry the map. */
+      renderer->command_buffer->map_index = 0;
+      renderer->primitive_ordering        = 0;
+      gl_primitive_batch_vec_clear(&renderer->batches);
+      renderer->vertex_index_pos          = 0;
+      gl_draw_buffer_map_no_bind(renderer->command_buffer);
+      return;
+   }
+
+   x = renderer->config.draw_offset[0];
+   y = renderer->config.draw_offset[1];
+
+   if (renderer->command_buffer->program)
+   {
+      /* Every batch still writes its values, including after auxiliary
+       * ceiling/zero passes. */
+      semi_uniform = renderer->cmd_loc[GL_CMD_LOC_SEMI];
+      mask_uniform = renderer->cmd_loc[GL_CMD_LOC_MASK];
+      native_uniform = renderer->cmd_loc[GL_CMD_LOC_NATIVE];
+      color_uniform = renderer->cmd_loc[GL_CMD_LOC_COLOR];
+      hot_uniform = renderer->cmd_loc[GL_CMD_LOC_HOT];
+      glUseProgram(renderer->command_buffer->program->id);
+      glUniform2i(renderer->cmd_loc[GL_CMD_LOC_OFFSET], (GLint)x, (GLint)y);
+      glActiveTexture(GL_TEXTURE2);
+      glBindTexture(GL_TEXTURE_2D, renderer->palette_texture.id);
+      glUniform1ui(renderer->cmd_loc[GL_CMD_LOC_FEEDBACK_UPSCALING],
+            renderer->fb_feedback_texture.id ? renderer->internal_upscaling : 0);
+      glActiveTexture(GL_TEXTURE0);
+   }
+
+   /* Bind the out framebuffer */
+   gl_framebuffer_bind(renderer->fb_out_fbo, &renderer->fb_out);
+
+   glClear(GL_DEPTH_BUFFER_BIT);
+
+   glStencilMask(1);
+   glEnable(GL_STENCIL_TEST);
+
+   /* Bind and unmap the command buffer */
+   glBindBuffer(GL_ARRAY_BUFFER, renderer->command_buffer->id);
+   glUnmapBuffer(GL_ARRAY_BUFFER);
+
+   /* The VAO needs to be bound here or the glDrawElements calls
+    * will error out on some systems */
+   glBindVertexArray(renderer->command_buffer->vao);
+
+   renderer->command_buffer->map = NULL;
+
+   if (renderer->batches.count > 0)
+   {
+      struct gl_primitive_batch *last = &renderer->batches.items[renderer->batches.count - 1];
+      last->count = renderer->vertex_index_pos - last->first;
+   }
+
+   /* Upload index data to EBO (required for core profile - client-side
+    * index pointers are not allowed) past the previous flush's indices,
+    * which draws still in flight may read. Only a wrap orphans. */
+   gl_renderer_upload_indices(renderer);
+
+   {
+      size_t bi;
+      for (bi = 0; bi < renderer->batches.count; bi++)
+      {
+         struct gl_primitive_batch *it = &renderer->batches.items[bi];
+         bool opaque;
+         GLenum blend_func = GL_FUNC_ADD;
+         GLenum blend_src = GL_CONSTANT_ALPHA;
+         GLenum blend_dst = GL_CONSTANT_ALPHA;
+         bool color_blend = it->color_blend && !it->opaque;
+         bool native_rgb5 = renderer->fb_out_internal_format == GL_RGB5_A1;
+         bool native_average = !it->opaque && native_rgb5 &&
+               it->transparency_mode == SEMI_TRANSPARENCY_MODE_AVERAGE;
+         bool native_quarter = !it->opaque && native_rgb5 &&
+               it->transparency_mode == SEMI_TRANSPARENCY_MODE_ADD_QUARTER_SOURCE;
+
+         /* Mask bits */
+         if (it->set_mask)
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+         else
+            glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
+
+         if (it->mask_test)
+            glStencilFunc(GL_NOTEQUAL, 1, 1);
+         else
+            glStencilFunc(GL_ALWAYS, 1, 1);
+
+         /* Blending */
+      opaque = it->opaque;
+      if (renderer->command_buffer->program)
+      {
+         glUniform1ui(semi_uniform, !opaque);
+         glUniform1ui(mask_uniform, it->force_mask ? 1u : 0u);
+         glUniform1ui(native_uniform, native_average ? 1u : native_quarter ? 2u : 0u);
+         glUniform1ui(color_uniform, color_blend ? (unsigned)it->transparency_mode + 1u : 0u);
+         /* "HDR Additive Overbright": skip the source clamp for plain
+          * additive draws on the fp16 target only, matching the Vulkan
+          * renderer (primitive.frag gates hot on BLEND_ADD). */
+         glUniform1ui(hot_uniform,
+               (renderer->fb_out_fp16 &&
+                ((psx_hdr_overbright_hot && !it->opaque &&
+                  it->transparency_mode == SEMI_TRANSPARENCY_MODE_ADD)
+                 /* Precise colour: the over-white lives in the vertex
+                  * colour itself, so the source clamp must stand aside on
+                  * every draw, not just plain additive. Safe because the
+                  * shadow's accept rule refuses anything that would not
+                  * requantize to the architectural bytes. */
+                 || psx_pgxp_color)) ? 1u : 0u);
+      }
+      /* RGB5 averaging truncates (source + destination) / 2. Bias the
+       * fixed-function result below the half-code rounding threshold,
+       * without fetching the destination or splitting primitive batches.
+       * Desktop GL weights both terms; ES pre-scales the source in the
+       * shader to avoid a second rounding before the blend. These factors
+       * compensate blend/export quantization on tested drivers; UNORM
+       * conversion is not specified identically on every implementation. */
+      if (native_average)
+      {
+#ifdef HAVE_OPENGLES3
+         /* The ES shader has already halved and biased the source; its
+          * 5/992 offset and this 251/512 destination weight are a pair. */
+         glBlendColor(251.0f / 512.0f, 251.0f / 512.0f,
+               251.0f / 512.0f, 1.0f);
+#else
+         glBlendColor(125.0f / 256.0f, 125.0f / 256.0f,
+               125.0f / 256.0f, 125.0f / 256.0f);
+#endif
+      }
+      else
+         glBlendColor(0.25f, 0.25f, 0.25f, 0.5f);
+      if (opaque || color_blend)
+         glDisable(GL_BLEND);
+      else
+      {
+         glEnable(GL_BLEND);
+
+         switch (it->transparency_mode)
+         {
+            /* 0.5xB + 0.5 x F */
+            case SEMI_TRANSPARENCY_MODE_AVERAGE:
+               blend_func = GL_FUNC_ADD;
+               /* Native RGB5 uses the truncating weights set above. */
+               /* Complementary weights sum to one even when the driver
+                * quantizes the blend constant. Two rounded halves can turn
+                * white + white into 254 (or darken other integer averages).
+                * Native RGB5 retains its paired truncation compensation. */
+               blend_src = !native_average && !renderer->fb_out_fp16 ?
+                     GL_ONE_MINUS_CONSTANT_ALPHA : GL_CONSTANT_ALPHA;
+               blend_dst = native_average ? GL_CONSTANT_COLOR : GL_CONSTANT_ALPHA;
+               break;
+            /* 1.0xB + 1.0 x F */
+            case SEMI_TRANSPARENCY_MODE_ADD:
+               blend_func = GL_FUNC_ADD;
+               blend_src = GL_ONE;
+               blend_dst = GL_ONE;
+               break;
+            /* 1.0xB - 1.0 x F */
+            case SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE:
+               blend_func = GL_FUNC_REVERSE_SUBTRACT;
+               blend_src = GL_ONE;
+               blend_dst = GL_ONE;
+               break;
+            case SEMI_TRANSPARENCY_MODE_ADD_QUARTER_SOURCE:
+               blend_func = GL_FUNC_ADD;
+               blend_src = native_quarter ? GL_ONE : GL_CONSTANT_COLOR;
+               blend_dst = GL_ONE;
+               break;
+         }
+
+         glBlendFuncSeparate(blend_src, blend_dst, GL_ONE, GL_ZERO);
+         glBlendEquationSeparate(blend_func, GL_FUNC_ADD);
+      }
+
+      /* HD replacement binding for this batch. get_hd_texture hands out
+       * an OWNED +1 reference; release it right after the draw is issued
+       * (GL keeps deleted-but-queued textures alive until the GPU is
+       * done with them). */
+      {
+         TTGpuImage *hd_owned = NULL;
+         const bool um = renderer->command_buffer->program != NULL;
+         bool have_hd = renderer->tracker && !hd_handle_is_none(&it->hd);
+         if (have_hd)
+         {
+            HdTexture hd = texture_tracker_get_hd_texture(renderer->tracker, it->hd);
+            struct gl_tt_image *img = (struct gl_tt_image *)hd.texture;
+            hd_owned = hd.texture;
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, img ? img->tex : 0);
+            glActiveTexture(GL_TEXTURE0);
+            if (um)
+            {
+               glUniform1ui(renderer->cmd_loc[GL_CMD_LOC_HD_ENABLED], img ? 1u : 0u);
+               glUniform4i(renderer->cmd_loc[GL_CMD_LOC_HD_VRAM_RECT],
+                     hd.vram_rect.x, hd.vram_rect.y,
+                     hd.vram_rect.width, hd.vram_rect.height);
+               glUniform4i(renderer->cmd_loc[GL_CMD_LOC_HD_TEXEL_RECT],
+                     hd.texel_rect.x, hd.texel_rect.y,
+                     hd.texel_rect.width, hd.texel_rect.height);
+            }
+         }
+         else if (um)
+            glUniform1ui(renderer->cmd_loc[GL_CMD_LOC_HD_ENABLED], 0u);
+
+      /* Drawing */
+      if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      {
+         /* This method doesn't call prepare_draw/finalize_draw itself, it
+          * must be handled by the caller. This is because this command
+          * can be called several times on the same buffer (i.e. multiple
+          * draw calls between the prepare/finalize) */
+         /* Ceiling pass BEFORE subtractive blending on the fp16 target.
+          * Hardware saturates every blend at white, so B - F always starts
+          * from B <= 1.0; GL_RGBA16F lets stacked additive layers exceed it
+          * (SotN Fire Demon death: additive white ghost, then a white canvas
+          * subtracted -> black on hardware, see-through here). Redraw the same
+          * geometry with blend equation MIN and force_ceiling (emitted after the
+          * shader's discards, so only the texels the subtraction will touch):
+          * min(dst, 1). Alpha (the mask bit) kept via ZERO/ONE ADD; stencil
+          * writes masked off; depth LEQUAL lets the real draw pass after it. */
+         if (renderer->fb_out_fp16 && !it->opaque &&
+             it->transparency_mode == SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE &&
+             renderer->command_buffer->program)
+         {
+            gl_renderer_ceiling_batch(renderer, it, 1.0f,
+                  blend_src, blend_dst, blend_func);
+         }
+
+         if (color_blend)
+         {
+            unsigned first, stride = it->draw_mode == GL_LINES ? 2 : 3;
+            if (read_fb < 0)
+               glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fb);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->fb_out_fbo);
+            glActiveTexture(GL_TEXTURE4);
+            glBindTexture(GL_TEXTURE_2D, renderer->blend_texture.id);
+            for (first = it->first; first < it->first + it->count; first += stride)
+            {
+               if (it->blend_rect[2] > 0 && it->blend_rect[3] > 0)
+                  glCopyTexSubImage2D(GL_TEXTURE_2D, 0,
+                        it->blend_rect[0], it->blend_rect[1],
+                        it->blend_rect[0], it->blend_rect[1],
+                        it->blend_rect[2], it->blend_rect[3]);
+               glDrawElements(it->draw_mode, stride, GL_UNSIGNED_SHORT,
+                     GL_INDEX_OFFSET(renderer, first));
+            }
+            glActiveTexture(GL_TEXTURE0);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_fb);
+         }
+         else
+            glDrawElements(it->draw_mode, it->count, GL_UNSIGNED_SHORT,
+                           GL_INDEX_OFFSET(renderer, it->first));
+
+         /* Enhanced 16-bpp storage ends at byte248. UNORM would clamp ADD
+          * and quarter-ADD at255 instead, leaving a false residue after SUB.
+          * All sources are nonnegative, so clamping after a positive batch
+          * is equivalent to clamping each primitive. This extra MIN draw
+          * avoids a destination snapshot/barrier for every triangle. */
+         if (!color_blend && !it->opaque && renderer->byte_color_storage &&
+             renderer->internal_color_depth == 16 &&
+             (it->transparency_mode == SEMI_TRANSPARENCY_MODE_ADD ||
+              it->transparency_mode == SEMI_TRANSPARENCY_MODE_ADD_QUARTER_SOURCE))
+            gl_renderer_ceiling_batch(renderer, it, 248.0f / 255.0f,
+                  blend_src, blend_dst, blend_func);
+
+         /* Zero-floor pass for subtractive blending on the fp16 target.
+          * GL_FUNC_REVERSE_SUBTRACT clamps at zero on a UNORM attachment
+          * but not on GL_RGBA16F; hardware floors B - F at 0 per channel.
+          * Redraw the same geometry with blend equation MAX and the
+          * shader forced to emit vec4(0): max(dst, 0) after a contiguous
+          * subtractive run is algebraically identical to hardware's
+          * per-primitive floor (once the running value would clamp,
+          * every further subtraction keeps both forms at zero). Depth is
+          * LEQUAL so the redraw passes against its own depth writes;
+          * alpha (the mask bit) is preserved via ZERO/ONE ADD; stencil
+          * writes are masked off so set_mask state cannot double-apply. */
+         if (renderer->fb_out_fp16 && !it->opaque &&
+             it->transparency_mode == SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE &&
+             renderer->command_buffer->program)
+         {
+            glUniform1ui(renderer->cmd_loc[GL_CMD_LOC_FORCE_ZERO], 1u);
+            glBlendEquationSeparate(GL_MAX, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+            glStencilMask(0);
+            glDrawElements(it->draw_mode, it->count, GL_UNSIGNED_SHORT,
+                           GL_INDEX_OFFSET(renderer, it->first));
+            glStencilMask(1);
+            glUniform1ui(renderer->cmd_loc[GL_CMD_LOC_FORCE_ZERO], 0u);
+         }
+      }
+
+         if (hd_owned)
+            gl_tt_image_release(renderer, hd_owned);
+      }
+      }
+   }
+
+   glDisable(GL_STENCIL_TEST);
+
+   renderer->command_buffer->map_start += renderer->command_buffer->map_index;
+   renderer->command_buffer->map_index  = 0;
+   gl_draw_buffer_map_no_bind(renderer->command_buffer);
+
+   renderer->primitive_ordering = 0;
+   gl_primitive_batch_vec_clear(&renderer->batches);
+   renderer->opaque = false;
+   renderer->vertex_index_pos = 0;
+   renderer->mask_test = false;
+   renderer->set_mask = false;
+   renderer->force_mask = false;
+
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+}
+
+
+static void gl_command_locate(gl_renderer *renderer)
+{
+   static const char *const names[12] = {
+      "offset", "feedback_upscaling", "draw_semi_transparent",
+      "force_mask_bit", "native_blend", "color_blend", "hdr_hot",
+      "hd_enabled", "hd_vram_rect", "hd_texel_rect", "force_zero",
+      "force_ceiling"
+   };
+   unsigned i;
+   for (i = 0; i < 12; i++)
+      renderer->cmd_loc[i] = renderer->command_buffer->program
+         ? gl_uniform_map_get(&renderer->command_buffer->program->uniforms, names[i])
+         : -1;
+}
+
+/* Compiles and links a program; NULL on failure. */
+static gl_program *gl_program_build(const char *vs_src, const char *fs_src)
+{
+   gl_shader vs, fs;
+   gl_program *program = (gl_program *)calloc(1, sizeof(*program));
+   bool vs_ok, fs_ok, ok = false;
+
+   memset(&vs, 0, sizeof(vs));
+   memset(&fs, 0, sizeof(fs));
+   vs_ok = program && gl_shader_init(&vs, vs_src, GL_VERTEX_SHADER);
+   fs_ok = vs_ok && gl_shader_init(&fs, fs_src, GL_FRAGMENT_SHADER);
+   if (fs_ok)
+      ok = gl_program_init(program, &vs, &fs);
+   if (vs_ok)
+      glDeleteShader(vs.id);
+   if (fs_ok)
+      glDeleteShader(fs.id);
+   free(vs.info_log);
+   free(fs.info_log);
+   if (!ok)
+   {
+      free(program);
+      return NULL;
+   }
+   return program;
+}
+
+static void gl_image_load_locate(gl_renderer *renderer)
+{
+   const struct gl_uniform_map *u = &renderer->image_load_program->uniforms;
+   renderer->image_load_loc[GL_LOAD_LOC_RECT]       = gl_uniform_map_get(u, "rect");
+   renderer->image_load_loc[GL_LOAD_LOC_FB_TEXTURE] = gl_uniform_map_get(u, "fb_texture");
+   renderer->image_load_loc[GL_LOAD_LOC_UPSCALING]  = gl_uniform_map_get(u, "internal_upscaling");
+   renderer->image_load_loc[GL_LOAD_LOC_CONVERSION] = gl_uniform_map_get(u, "color_conversion");
+   renderer->image_load_loc[GL_LOAD_LOC_MASK_PASS]  = gl_uniform_map_get(u, "mask_pass");
+}
+
+/* The unit quad, at attribute 0 of every rect program. */
+static void gl_quad_init(gl_renderer *renderer)
+{
+   static const GLfloat corners[8] = { 0, 0, 1, 0, 0, 1, 1, 1 };
+   glGenVertexArrays(1, &renderer->quad_vao);
+   glGenBuffers(1, &renderer->quad_vbo);
+   glBindVertexArray(renderer->quad_vao);
+   glBindBuffer(GL_ARRAY_BUFFER, renderer->quad_vbo);
+   glBufferData(GL_ARRAY_BUFFER, sizeof(corners), corners, GL_STATIC_DRAW);
+   glEnableVertexAttribArray(0);
+   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+   glBindVertexArray(0);
+}
+
+/* Draws the VRAM rect (x0,y0)-(x1,y1) with the bound rect program. */
+static void gl_draw_rect(gl_renderer *renderer, GLint rect,
+      unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+{
+   glBindVertexArray(renderer->quad_vao);
+   glUniform4f(rect, (GLfloat)x0, (GLfloat)y0, (GLfloat)x1, (GLfloat)y1);
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+/* Color alpha is the VRAM mask bit; stencil is only its draw-test mirror.
+ * Upload both together, including reset/restore and format changes. The
+ * color-copy pass clears stencil only over the uploaded rectangle. A second,
+ * stencil-only pass sets protected pixels from alpha, without discarding
+ * pixels during color conversion or scanning the upload on the CPU. */
+static void gl_renderer_upload_color_and_stencil(gl_renderer *renderer,
+      unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+{
+   const GLint *loc = renderer->image_load_loc;
+   GLboolean depth;
+
+   depth = glIsEnabled(GL_DEPTH_TEST);
+   glDisable(GL_DEPTH_TEST);
+   glEnable(GL_STENCIL_TEST);
+   glStencilMask(1);
+   glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+   glStencilFunc(GL_ALWAYS, 0, 1);
+   glUseProgram(renderer->image_load_program->id);
+   glUniform1ui(loc[GL_LOAD_LOC_MASK_PASS], 0);
+   gl_draw_rect(renderer, loc[GL_LOAD_LOC_RECT], x0, y0, x1, y1);
+
+   glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+   glStencilFunc(GL_ALWAYS, 1, 1);
+   glUniform1ui(loc[GL_LOAD_LOC_MASK_PASS], 1);
+   gl_draw_rect(renderer, loc[GL_LOAD_LOC_RECT], x0, y0, x1, y1);
+   glUniform1ui(loc[GL_LOAD_LOC_MASK_PASS], 0);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glDisable(GL_STENCIL_TEST);
+   if (depth)
+      glEnable(GL_DEPTH_TEST);
+}
+
+/* CPU RGB5 uploads and rendered byte-color copies have different encodings.
+ * Select from the retained target, including after a failed format change. */
+static uint32_t gl_upload_color_conversion(const gl_renderer *renderer)
+{
+   if (!renderer->byte_color_storage)
+      return 0u;
+   return renderer->color_mode == PSX_INTERNAL_COLOR_32BPP ? 4u : 1u;
+}
+
+static void gl_renderer_upload_textures(
+      gl_renderer *renderer,
+      uint16_t top_left[2],
+      uint16_t dimensions[2],
+      uint16_t pixel_buffer[VRAM_PIXELS])
+{
+   uint16_t x_start;
+   uint16_t x_end;
+   uint16_t y_start;
+   uint16_t y_end;
+
+   if (!renderer)
+      return;
+
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   gl_palette_cache_preserve(renderer, top_left[0], top_left[1],
+         dimensions[0], dimensions[1]);
+
+   gl_texture_set_sub_image_window(
+         &renderer->fb_texture,
+         top_left,
+         dimensions,
+         (size_t) VRAM_WIDTH_PIXELS,
+         GL_RGBA,
+#ifdef HAVE_OPENGLES3
+         GL_UNSIGNED_SHORT_5_5_5_1,
+#else
+         GL_UNSIGNED_SHORT_1_5_5_5_REV,
+#endif
+         pixel_buffer);
+
+   x_start    = top_left[0];
+   x_end      = x_start + dimensions[0];
+   y_start    = top_left[1];
+   y_end      = y_start + dimensions[1];
+
+   /* This helper seeds a new renderer or converts its existing storage.
+    * A readback used for conversion is derived from the same GPU writes;
+    * preserve their origin so later texture feedback keeps its word rules.
+    * New renderer flags start clear. GP0 uploads mark CPU origin separately
+    * in rhi_gl_load_image. fb_texture is always at 1x. */
+   glUseProgram(renderer->image_load_program->id);
+   glUniform1i(renderer->image_load_loc[GL_LOAD_LOC_FB_TEXTURE], 0);
+   glUniform1ui(renderer->image_load_loc[GL_LOAD_LOC_UPSCALING], 1);
+   glUniform1ui(renderer->image_load_loc[GL_LOAD_LOC_CONVERSION],
+         gl_upload_color_conversion(renderer));
+
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_BLEND);
+
+   /* Bind the output framebuffer */
+   gl_framebuffer_bind(renderer->fb_out_fbo, &renderer->fb_out);
+
+   gl_renderer_upload_color_and_stencil(renderer, x_start, y_start, x_end, y_end);
+
+   glEnable(GL_SCISSOR_TEST);
+
+#ifdef DEBUG
+   get_error("gl_renderer_upload_textures");
+#endif
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+}
+
+static void get_variables(uint8_t *upscaling, bool *display_vram,
+      bool *scaled_uv_offset)
+{
+   struct retro_variable var = {0};
+
+   var.key = BEETLE_OPT(internal_resolution);
+   if (upscaling)
+   {
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         /* Same limitations as libretro.cpp */
+         *upscaling = var.value[0] -'0';
+         if (var.value[1] != 'x')
+         {
+            *upscaling  = (var.value[0] - '0') * 10;
+            *upscaling += var.value[1] - '0';
+         }
+      }
+   }
+
+   if (scaled_uv_offset)
+   {
+      var.key = BEETLE_OPT(scaled_uv_offset);
+      *scaled_uv_offset = true;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         *scaled_uv_offset = strcmp(var.value, "disabled") != 0;
+   }
+
+   if (display_vram)
+   {
+      var.key = BEETLE_OPT(display_vram);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         if (!strcmp(var.value, "enabled"))
+            *display_vram = true;
+         else
+            *display_vram = false;
+      }
+   }
+}
+
+/* Match CPU word readback from the retained target: truncate SDR byte
+ * storage (q*8 in 16 bpp, full range in 32 bpp) as the Vulkan renderer's
+ * psx_color5 does, round HDR byte/float storage, and copy RGB5 directly. Use the
+ * allocated format so a failed settings change keeps the working policy.
+ * Regional copies and the final frame resolve must agree. */
+static uint32_t gl_native_mirror_conversion(const gl_renderer *renderer)
+{
+   if (renderer->byte_color_storage)
+      return 2u;
+   return renderer->fb_out_internal_format == GL_RGBA8 ||
+         renderer->fb_out_internal_format == GL_RGBA16F ? 3u : 0u;
+}
+
+/* Menu value of Replace Textures, read once per option refresh. The HD
+ * hotkey only flips the tracker's session latch, which is resolved per call. */
+static bool gl_replace_textures_menu = false;
+
+static void gl_read_replace_textures_menu(void)
+{
+   struct retro_variable var;
+   var.key   = BEETLE_OPT(replace_textures);
+   var.value = NULL;
+   gl_replace_textures_menu =
+         environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value &&
+         !strcmp(var.value, "enabled");
+}
+
+/* Storage selection is derived from the selected mode and enabled source
+ * enhancements, never from the display's output format. No per-pixel color
+ * provenance is retained. Ordinary writes over an enhanced destination still
+ * reduce their source and blended result to RGB5. */
+static bool gl_use_byte_color_storage(uint8_t filter)
+{
+   return !psx_hdr_active &&
+         (psx_internal_color_mode == PSX_INTERNAL_COLOR_32BPP ||
+          (psx_internal_color_mode == PSX_INTERNAL_COLOR_16BPP &&
+           (filter != FILTER_MODE_NEAREST ||
+            texture_tracker_hd_textures_enabled(gl_replace_textures_menu))));
+}
+
+static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
+{
+   gl_draw_buffer *command_buffer = NULL;
+   uint8_t upscaling         = 1;
+   bool display_vram         = false;
+   bool scaled_uv_offset     = true;
+   struct retro_variable var = {0};
+   uint16_t top_left[2]      = {0, 0};
+   uint16_t dimensions[2]    = {
+      (uint16_t) VRAM_WIDTH_PIXELS, (uint16_t) VRAM_HEIGHT};
+   int crop_overscan         = 1;
+   int32_t image_offset_cycles = 0;
+   unsigned image_crop       = 0;
+   int32_t initial_scanline  = 0;
+   int32_t last_scanline     = 239;
+   int32_t initial_scanline_pal = 0;
+   int32_t last_scanline_pal = 287;
+   uint8_t filter            = FILTER_MODE_NEAREST;
+   uint8_t depth             = 16;
+   enum dither_mode dither_mode = DITHER_NATIVE;
+   uint32_t native_width;
+   uint32_t native_height;
+   GLenum texture_storage    = GL_RGB5_A1;
+
+   if (!renderer)
+      return false;
+
+   var.key = BEETLE_OPT(renderer_software_fb);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "enabled"))
+         has_software_fb = true;
+      else
+         has_software_fb = false;
+   }
+   else
+      has_software_fb = true;
+
+   get_variables(&upscaling, &display_vram, &scaled_uv_offset);
+
+   var.key = BEETLE_OPT(crop_overscan);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "disabled") == 0)
+         crop_overscan = 0;
+      else if (strcmp(var.value, "static") == 0)
+         crop_overscan = 1;
+      else if (strcmp(var.value, "smart") == 0)
+         crop_overscan = 2;
+   }
+
+   var.key = BEETLE_OPT(image_offset_cycles);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      image_offset_cycles = atoi(var.value);
+
+   var.key = BEETLE_OPT(image_crop);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "disabled") == 0)
+         image_crop = 0;
+      else
+         image_crop = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(initial_scanline);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      initial_scanline = atoi(var.value);
+
+   var.key = BEETLE_OPT(last_scanline);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      last_scanline = atoi(var.value);
+
+   var.key = BEETLE_OPT(initial_scanline_pal);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      initial_scanline_pal = atoi(var.value);
+
+   var.key = BEETLE_OPT(last_scanline_pal);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      last_scanline_pal = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(filter);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "nearest"))
+         filter = FILTER_MODE_NEAREST;
+      else if (!strcmp(var.value, "SABR"))
+         filter = FILTER_MODE_SABR;
+      else if (!strcmp(var.value, "xBR"))
+         filter = FILTER_MODE_XBR;
+      else if (!strcmp(var.value, "bilinear"))
+         filter = FILTER_MODE_BILINEAR;
+      else if (!strcmp(var.value, "3-point"))
+         filter = FILTER_MODE_3POINT;
+      else if (!strcmp(var.value, "JINC2"))
+         filter = FILTER_MODE_JINC2;
+
+      renderer->filter_type = filter;
+   }
+
+   depth = psx_hdr_active ||
+         psx_internal_color_mode == PSX_INTERNAL_COLOR_32BPP ? 32 : 16;
+
+   var.key = BEETLE_OPT(dither_mode);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "internal resolution"))
+         dither_mode = DITHER_UPSCALED;
+      else if (!strcmp(var.value, "disabled"))
+         dither_mode  = DITHER_OFF;
+   }
+
+   log_cb(RETRO_LOG_DEBUG, "Building OpenGL state (%dx internal res., %dbpp)\n", upscaling, depth);
+
+   {
+      size_t cmd_n_attrs;
+      size_t out_n_attrs;
+      const gl_attribute *cmd_attrs = gl_command_vertex_attributes(&cmd_n_attrs);
+      const gl_attribute *out_attrs = gl_output_vertex_attributes(&out_n_attrs);
+      gl_draw_buffer *output_buffer;
+      gl_program *image_load_program;
+
+      switch(renderer->filter_type)
+      {
+         case FILTER_MODE_SABR:
+            command_buffer = gl_draw_buffer_build(
+                  command_vertex_xbr,
+                  command_fragment_sabr,
+                  VERTEX_BUFFER_LEN,
+                  sizeof(gl_command_vertex), cmd_attrs, cmd_n_attrs);
+            break;
+         case FILTER_MODE_XBR:
+            command_buffer = gl_draw_buffer_build(
+                  command_vertex_xbr,
+                  command_fragment_xbr,
+                  VERTEX_BUFFER_LEN,
+                  sizeof(gl_command_vertex), cmd_attrs, cmd_n_attrs);
+            break;
+         case FILTER_MODE_BILINEAR:
+            command_buffer = gl_draw_buffer_build(
+                  command_vertex,
+                  command_fragment_bilinear,
+                  VERTEX_BUFFER_LEN,
+                  sizeof(gl_command_vertex), cmd_attrs, cmd_n_attrs);
+            break;
+         case FILTER_MODE_3POINT:
+            command_buffer = gl_draw_buffer_build(
+                  command_vertex,
+                  command_fragment_3point,
+                  VERTEX_BUFFER_LEN,
+                  sizeof(gl_command_vertex), cmd_attrs, cmd_n_attrs);
+            break;
+         case FILTER_MODE_JINC2:
+            command_buffer = gl_draw_buffer_build(
+                  command_vertex,
+                  command_fragment_jinc2,
+                  VERTEX_BUFFER_LEN,
+                  sizeof(gl_command_vertex), cmd_attrs, cmd_n_attrs);
+            break;
+         case FILTER_MODE_NEAREST:
+         default:
+            command_buffer = gl_draw_buffer_build(
+                  command_vertex,
+                  command_fragment,
+                  VERTEX_BUFFER_LEN,
+                  sizeof(gl_command_vertex), cmd_attrs, cmd_n_attrs);
+      }
+
+      {
+         char *out_src = gl_output_fragment_source();
+         output_buffer =
+            gl_draw_buffer_build(
+                  output_vertex,
+                  out_src ? out_src : output_fragment,
+                  4,
+                  sizeof(gl_output_vertex), out_attrs, out_n_attrs);
+         free(out_src);
+      }
+
+      image_load_program = gl_program_build(image_load_vertex,
+            image_load_fragment);
+
+      /* If any of the three failed, free the others to avoid
+       * leaking GL/heap resources, and refuse the renderer. */
+      if (!command_buffer || !output_buffer || !image_load_program)
+      {
+         log_cb(RETRO_LOG_ERROR,
+               "[gl_renderer_new] gl_draw_buffer_build failed: cmd=%p out=%p img=%p\n",
+               (void *)command_buffer, (void *)output_buffer,
+               (void *)image_load_program);
+         if (command_buffer)
+         {
+            gl_draw_buffer_free(command_buffer);
+            free(command_buffer);
+         }
+         if (output_buffer)
+         {
+            gl_draw_buffer_free(output_buffer);
+            free(output_buffer);
+         }
+         if (image_load_program)
+         {
+            gl_program_free(image_load_program);
+            free(image_load_program);
+         }
+         return false;
+      }
+
+      /* Transfer ownership before texture allocation can fail. The context
+       * reset caller releases all acquired resources on a failed creation. */
+      renderer->command_buffer    = command_buffer;
+      gl_command_locate(renderer);
+      renderer->output_buffer     = output_buffer;
+      renderer->image_load_program = image_load_program;
+      gl_image_load_locate(renderer);
+      gl_quad_init(renderer);
+   }
+
+   native_width  = (uint32_t) VRAM_WIDTH_PIXELS;
+   native_height = (uint32_t) VRAM_HEIGHT;
+
+   /* gl_texture holding the raw VRAM texture contents. We can't
+    * meaningfully upscale it since most games use paletted
+    * textures. */
+   if (!gl_texture_init(&renderer->fb_texture, native_width, native_height, GL_RGB5_A1) ||
+       !gl_texture_init(&renderer->palette_texture, 256, 1, GL_RGB5_A1))
+      goto texture_failed;
+
+   renderer->fb_out_fp16 = psx_hdr_active && gl_fp16_renderable();
+   gl_read_replace_textures_menu();
+   renderer->byte_color_storage = gl_use_byte_color_storage(filter);
+
+   if (dither_mode == DITHER_OFF || psx_hdr_active)
+   {
+      /* Dithering is superfluous when we increase the internal
+      * color depth, but users asked for it. On the fp16 HDR target it is
+      * force-disabled, matching the Vulkan renderer: the wide target
+      * carries the full precision the dither exists to fake. */
+      gl_draw_buffer_disable_attribute(command_buffer, "dither");
+   }
+   else
+   {
+      gl_draw_buffer_enable_attribute(command_buffer, "dither");
+   }
+
+   if (command_buffer->program)
+   {
+      uint32_t dither_scaling = dither_mode == DITHER_OFF || psx_hdr_active ? 0 :
+            (dither_mode == DITHER_UPSCALED ? 1 : upscaling);
+      uint32_t native_rgb5 = depth == 16 && !psx_hdr_active;
+      uint32_t fixed_point_modulation = !psx_pgxp_color;
+
+      glUseProgram(command_buffer->program->id);
+      /* Sampler units belong to the linked program and never change. Texture
+       * bindings still follow the live resources at each draw. Rebuilding a
+       * filter program or recreating the context initializes them again here. */
+      glUniform1i(gl_uniform_map_get(&command_buffer->program->uniforms, "fb_texture"), 0);
+      glUniform1i(gl_uniform_map_get(&command_buffer->program->uniforms, "hd_texture"), 1);
+      glUniform1i(gl_uniform_map_get(&command_buffer->program->uniforms, "palette_texture"), 2);
+      glUniform1i(gl_uniform_map_get(&command_buffer->program->uniforms, "fb_feedback_texture"), 3);
+      glUniform1i(gl_uniform_map_get(&command_buffer->program->uniforms, "blend_texture"), 4);
+      glUniform1ui(gl_uniform_map_get(&command_buffer->program->uniforms, "dither_scaling"), dither_scaling);
+      glUniform1ui(gl_uniform_map_get(&command_buffer->program->uniforms,
+               "fixed_point_modulation"), fixed_point_modulation);
+      glUniform1ui(gl_uniform_map_get(&command_buffer->program->uniforms,
+               "native_rgb5"), native_rgb5);
+      glUniform1ui(gl_uniform_map_get(&command_buffer->program->uniforms,
+               "byte_color_storage"), renderer->byte_color_storage);
+   }
+
+   switch (depth)
+   {
+      case 16:
+         texture_storage = renderer->byte_color_storage ? GL_RGBA8 : GL_RGB5_A1;
+         break;
+      case 32:
+         texture_storage = GL_RGBA8;
+         break;
+      default:
+         log_cb(RETRO_LOG_ERROR, "Unsupported depth %d\n", depth);
+         exit(EXIT_FAILURE);
+   }
+
+   /* The HDR scaled framebuffer overrides the Internal Color Depth
+    * choice: additive overshoot and the subtractive floor need a wide
+    * float target, exactly like the Vulkan renderer's 16F path. */
+   if (psx_hdr_active)
+      texture_storage = renderer->fb_out_fp16 ? GL_RGBA16F : GL_RGBA8;
+
+   renderer->fb_out_internal_format = texture_storage;
+   if (renderer->byte_color_storage && depth == 16 &&
+       !gl_texture_init(&renderer->blend_texture,
+             native_width * upscaling, native_height * upscaling, GL_RGBA8))
+      goto texture_failed;
+   if (!gl_texture_init(&renderer->fb_out,
+             native_width * upscaling, native_height * upscaling, texture_storage) ||
+       !gl_texture_init(&renderer->fb_out_depth,
+             renderer->fb_out.width, renderer->fb_out.height, GL_DEPTH24_STENCIL8))
+      goto texture_failed;
+
+   renderer->filter_type = filter;
+   renderer->vertex_index_pos = 0;
+
+   /* Create index buffer object for core profile compatibility */
+   glGenBuffers(1, &renderer->index_buffer);
+   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, renderer->index_buffer);
+   glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                INDEX_RING_LEN * sizeof(GLushort),
+                NULL, GL_DYNAMIC_DRAW);
+   renderer->index_base     = 0;
+   renderer->index_ring_pos = 0;
+   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+   renderer->command_draw_mode = GL_TRIANGLES;
+   renderer->semi_transparency_mode =  SEMI_TRANSPARENCY_MODE_AVERAGE;
+   /* output_buffer and image_load_program were assigned to
+    * renderer above inside the gl_draw_buffer_build block. */
+   renderer->config = config;
+   renderer->frontend_resolution[0] = 0;
+   renderer->frontend_resolution[1] = 0;
+   renderer->internal_upscaling = upscaling;
+   renderer->internal_color_depth = depth;
+   renderer->color_mode = psx_internal_color_mode;
+
+   tt_log_startup("gl renderer init: internal_upscaling=%u depth=%u has_software_fb=%d\n",
+         (unsigned)upscaling, (unsigned)depth, (int)has_software_fb);
+   renderer->crop_overscan = crop_overscan;
+   renderer->image_offset_cycles = image_offset_cycles;
+   renderer->image_crop = image_crop;
+   renderer->curr_width_mode = WIDTH_MODE_320;
+   renderer->initial_scanline = initial_scanline;
+   renderer->last_scanline = last_scanline;
+   renderer->initial_scanline_pal = initial_scanline_pal;
+   renderer->last_scanline_pal = last_scanline_pal;
+   renderer->primitive_ordering = 0;
+   renderer->tex_x_mask = 0;
+   renderer->tex_x_or = 0;
+   renderer->tex_y_mask = 0;
+   renderer->tex_y_or = 0;
+   renderer->display_vram = display_vram;
+   renderer->scaled_uv_offset = scaled_uv_offset;
+   renderer->set_mask  = false;
+   renderer->force_mask = false;
+   renderer->mask_test = false;
+
+   /* Shared HD texture replacement/tracking: create the tracker over the
+    * GL backend before the initial full-VRAM upload below so the upload
+    * seeds the tracker's VRAM mirror (full-frame uploads take the
+    * savestate path: clear + mirror refresh). */
+   glGenFramebuffers(1, &renderer->tt_read_fbo);
+   glGenFramebuffers(1, &renderer->tt_draw_fbo);
+   glGenFramebuffers(1, &renderer->vram_sync_read_fbo);
+   glGenFramebuffers(1, &renderer->vram_sync_draw_fbo);
+   glGenFramebuffers(1, &renderer->fb_out_fbo);
+   glGenFramebuffers(1, &renderer->fb_texture_fbo);
+   if (!renderer->fb_out_fbo || !renderer->fb_texture_fbo)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[gl_renderer_new] framebuffer allocation failed\n");
+      return false;
+   }
+   gl_framebuffer_configure(renderer->fb_out_fbo, &renderer->fb_out,
+         &renderer->fb_out_depth);
+   gl_framebuffer_configure(renderer->fb_texture_fbo, &renderer->fb_texture,
+         NULL);
+   {
+      TTGpuBackend vt = gl_tt_make_backend(renderer);
+      renderer->tracker = texture_tracker_new(&vt, NULL);
+   }
+   renderer->texture_tracking_enabled = false;
+   renderer->hd_handle = hd_handle_make_none();
+
+   if (renderer)
+   {
+      gl_renderer_upload_textures(renderer, top_left, dimensions, GPU_get_vram());
+      if (renderer->tracker)
+      {
+         TTRect _full = { 0, 0, (unsigned)VRAM_WIDTH_PIXELS, (unsigned)VRAM_HEIGHT };
+         texture_tracker_upload(renderer->tracker, _full, GPU_get_vram());
+      }
+   }
+
+   return true;
+
+texture_failed:
+   log_cb(RETRO_LOG_ERROR,
+         "[gl_renderer_new] framebuffer texture allocation failed (%ux, %u bpp)\n",
+         (unsigned)upscaling, (unsigned)depth);
+   return false;
+}
+
+/* === Analog video cable chain: GL resources ==============================
+ *
+ * The signal math lives in rhi/shaders_vulkan and is translated to GL GLSL by
+ * rhi/shaders_gl/gen_analog_gl.py; see rhi/shaders_gl/README_analog.md. This
+ * section owns the GL-side objects those programs need: the program objects
+ * themselves, the intermediate render targets, and their lifetime.
+ *
+ * Programs are built on first use rather than at context reset. The chain is
+ * off by default and most sessions never turn it on, and building twelve
+ * programs costs real time on some drivers - paying that at load for a feature
+ * nobody asked for is the kind of cost that shows up as "the core got slower".
+ * Once built they live until context destroy.
+ *
+ * The trap (gl_analog_notch) is the one stage that can legitimately be absent:
+ * it is a compute program and needs GL 4.3 / GLES 3.1. When gl_caps.has_compute
+ * is false it is never built and gl_analog_yc runs in its place, which is the
+ * trap's own bypass branch - the encoded tiers keep everything except the trap
+ * and show hanging dots. See README_analog.md.
+ */
+
+#include "shaders_gl/analog_vertex.glsl.h"
+#include "shaders_gl/analog_downsample.glsl.h"
+#include "shaders_gl/analog_encode.glsl.h"
+#include "shaders_gl/analog_encode_pal.glsl.h"
+#include "shaders_gl/analog_comb.glsl.h"
+#include "shaders_gl/analog_comb_pal.glsl.h"
+#include "shaders_gl/analog_demod.glsl.h"
+#include "shaders_gl/analog_demod_pal.glsl.h"
+#include "shaders_gl/analog_rgb.glsl.h"
+#include "shaders_gl/analog_rgb_pal.glsl.h"
+#include "shaders_gl/analog_yc.glsl.h"
+#include "shaders_gl/analog_yc_pal.glsl.h"
+#include "shaders_gl/analog_resolve.glsl.h"
+#include "shaders_gl/analog_resolve_hdr.glsl.h"
+#include "shaders_gl/analog_notch.glsl.h"
+#include "shaders_gl/analog_notch_pal.glsl.h"
+#include "analog_trap.h"
+#include "shaders_gl/hdr_bloom_bright.glsl.h"
+#include "shaders_gl/hdr_bloom_blur.glsl.h"
+#include "shaders_gl/hdr_bloom_down.glsl.h"
+#include "shaders_gl/hdr_bloom_down_karis.glsl.h"
+#include "shaders_gl/hdr_bloom_up.glsl.h"
+#include "shaders_gl/hdr_post.glsl.h"
+
+/* Cable tiers. Mirror of AN_CABLE_* in shaders_vulkan/analog.h and of
+ * RHI_CABLE_* in rhi_lib_vulkan.c; analog.h is GLSL and cannot be included
+ * here, so the lists are kept in step by hand. The value reaches the shaders
+ * verbatim as the `cable` uniform. */
+/* Compute is not something every GL header this core builds against can even
+ * express. GLES below 3.1 has none of it; webOS builds against GLES2; and
+ * Apple's GL stops at 4.1, which has image load/store but not the memory
+ * barrier bits the trap needs. Detect that from the constants themselves
+ * rather than from a version macro, because the version macros differ across
+ * the glsym, GLES and Apple header sets while these three are exactly what
+ * the dispatch below refers to.
+ *
+ * Where this comes out false the trap is never compiled, gl_caps.has_compute
+ * is forced off, and the encoded tiers take the analog_yc bypass - the same
+ * path a 3.0-era driver gets at runtime. Nothing else in the renderer is
+ * affected. */
+#if defined(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT) && \
+    defined(GL_TEXTURE_FETCH_BARRIER_BIT) && \
+    defined(GL_WRITE_ONLY)
+#define RHI_GL_HAVE_COMPUTE 1
+#endif
+
+#if defined(RHI_GL_HAVE_COMPUTE)
+/* Not guaranteed to be present even where the rest is, and the enum value is
+ * fixed by the spec. */
+#ifndef GL_COMPUTE_SHADER
+#define GL_COMPUTE_SHADER 0x91B9
+#endif
+#endif
+
+/* The trap declares 12 active uniforms. Program construction fails cleanly
+ * if any shader ever grows beyond the fixed uniform-map capacity. */
+
+#define GL_CABLE_NONE      0
+#define GL_CABLE_SVIDEO    1
+#define GL_CABLE_COMPOSITE 2
+#define GL_CABLE_RF        3
+#define GL_CABLE_RGB       4
+
+enum
+{
+   GL_ANALOG_DOWNSAMPLE = 0,
+   GL_ANALOG_ENCODE,
+   GL_ANALOG_ENCODE_PAL,
+   GL_ANALOG_COMB,
+   GL_ANALOG_COMB_PAL,
+   GL_ANALOG_DEMOD,
+   GL_ANALOG_DEMOD_PAL,
+   GL_ANALOG_RGB,
+   GL_ANALOG_RGB_PAL,
+   GL_ANALOG_YC,
+   GL_ANALOG_YC_PAL,
+   GL_ANALOG_RESOLVE,
+   GL_ANALOG_RESOLVE_HDR,
+   GL_ANALOG_NOTCH,       /* compute; absent without gl_caps.has_compute */
+   GL_ANALOG_NOTCH_PAL,   /* compute */
+   GL_ANALOG_PROGRAM_COUNT
+};
+
+struct gl_analog
+{
+   gl_program *programs[GL_ANALOG_PROGRAM_COUNT];
+
+   /* Intermediate targets. Sized from the native display rect and the dot
+    * clock, never from the internal resolution: the signal is fixed-rate, so
+    * a higher internal setting supersamples into the cable rather than
+    * widening the signal. Reallocated only when those dimensions change. */
+   gl_texture  native;    /* supersample resolve down to native, scaling > 1 */
+   gl_texture  sig;       /* modulated signal, base-clock rate */
+   gl_texture  sep;       /* after the comb */
+   gl_texture  dec;       /* after demodulation */
+   gl_texture  rgb;       /* after the trap (or its bypass): RGB, base rate */
+   gl_texture  scanout;   /* the frame as the display path would have drawn it */
+
+   GLuint      fbo;       /* one reused FBO; the colour attachment is rebound */
+
+   uint32_t    native_w, native_h;
+   uint32_t    sig_w, sig_h;
+   uint32_t    out_w, out_h;
+
+   GLuint      quad_vao;  /* full-viewport strip, shared by every pass */
+   GLuint      quad_vbo;
+
+   int         built;     /* programs compiled */
+   int         failed;    /* a program failed to build - do not retry */
+};
+
+/* Compile one vertex+fragment program from the generated sources. */
+static gl_program *gl_analog_build_program(const char *fs_src, const char *name)
+{
+   gl_shader   vs, fs;
+   gl_program *program;
+
+   memset(&vs, 0, sizeof(vs));
+   memset(&fs, 0, sizeof(fs));
+
+   /* GLES takes the generator's "#version 300 es" twin of every source;
+    * the desktop "#version 330 core" text does not compile there. */
+#ifdef HAVE_OPENGLES3
+   if (!gl_shader_init(&vs, analog_vertex_glsl_ES, GL_VERTEX_SHADER))
+#else
+   if (!gl_shader_init(&vs, analog_vertex_glsl, GL_VERTEX_SHADER))
+#endif
+   {
+      log_cb(RETRO_LOG_ERROR, "[gl_analog] %s: vertex shader failed\n", name);
+      if (vs.info_log) free(vs.info_log);
+      return NULL;
+   }
+   if (!gl_shader_init(&fs, fs_src, GL_FRAGMENT_SHADER))
+   {
+      log_cb(RETRO_LOG_ERROR, "[gl_analog] %s: fragment shader failed\n", name);
+      glDeleteShader(vs.id);
+      if (vs.info_log) free(vs.info_log);
+      if (fs.info_log) free(fs.info_log);
+      return NULL;
+   }
+
+   program = (gl_program *)calloc(1, sizeof(*program));
+   if (!program)
+   {
+      glDeleteShader(vs.id);
+      glDeleteShader(fs.id);
+      if (vs.info_log) free(vs.info_log);
+      if (fs.info_log) free(fs.info_log);
+      return NULL;
+   }
+
+   if (!gl_program_init(program, &vs, &fs))
+   {
+      log_cb(RETRO_LOG_ERROR, "[gl_analog] %s: link failed\n", name);
+      free(program);
+      program = NULL;
+   }
+
+   /* The program owns the linked binary from here; the shader objects and
+    * their info logs are ours to release either way. */
+   glDeleteShader(vs.id);
+   glDeleteShader(fs.id);
+   if (vs.info_log) free(vs.info_log);
+   if (fs.info_log) free(fs.info_log);
+   return program;
+}
+
+/* The trap is compute-only, so it cannot go through gl_program_init (which
+ * takes a vertex/fragment pair). Built by hand, and only when the context
+ * actually supports compute. */
+#if !defined(RHI_GL_HAVE_COMPUTE)
+static gl_program *gl_analog_build_compute(const char *cs_src, const char *name)
+{
+   (void)cs_src; (void)name;
+   return NULL;   /* headers cannot express compute; see RHI_GL_HAVE_COMPUTE */
+}
+#else
+static gl_program *gl_analog_build_compute(const char *cs_src, const char *name)
+{
+   GLuint      sh, id;
+   GLint       status = GL_FALSE;
+   gl_program *program;
+   gl_uniform_map uniforms;
+
+   sh = glCreateShader(GL_COMPUTE_SHADER);
+   if (sh == 0)
+      return NULL;
+   glShaderSource(sh, 1, &cs_src, NULL);
+   glCompileShader(sh);
+   glGetShaderiv(sh, GL_COMPILE_STATUS, &status);
+   if (status == GL_FALSE)
+   {
+      log_cb(RETRO_LOG_ERROR, "[gl_analog] %s: compute shader failed\n", name);
+      glDeleteShader(sh);
+      return NULL;
+   }
+
+   id = glCreateProgram();
+   if (id == 0)
+   {
+      glDeleteShader(sh);
+      return NULL;
+   }
+   glAttachShader(id, sh);
+   glLinkProgram(id);
+   glDetachShader(id, sh);
+   glDeleteShader(sh);
+
+   status = GL_FALSE;
+   glGetProgramiv(id, GL_LINK_STATUS, &status);
+   if (status == GL_FALSE)
+   {
+      log_cb(RETRO_LOG_ERROR, "[gl_analog] %s: compute link failed\n", name);
+      glDeleteProgram(id);
+      return NULL;
+   }
+
+   if (!load_program_uniforms(id, &uniforms))
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[gl_analog] %s: failed to map active uniforms\n", name);
+      glDeleteProgram(id);
+      return NULL;
+   }
+
+   program = (gl_program *)calloc(1, sizeof(*program));
+   if (!program)
+   {
+      glDeleteProgram(id);
+      return NULL;
+   }
+   program->id       = id;
+   program->info_log = NULL;
+   program->uniforms = uniforms;
+   return program;
+}
+#endif /* RHI_GL_HAVE_COMPUTE */
+
+static void gl_analog_free(struct gl_analog *a)
+{
+   int i;
+   if (!a)
+      return;
+
+   for (i = 0; i < GL_ANALOG_PROGRAM_COUNT; i++)
+   {
+      if (a->programs[i])
+      {
+         gl_program_free(a->programs[i]);
+         free(a->programs[i]);
+         a->programs[i] = NULL;
+      }
+   }
+
+   if (a->quad_vbo) { glDeleteBuffers(1, &a->quad_vbo); a->quad_vbo = 0; }
+   if (a->quad_vao) { glDeleteVertexArrays(1, &a->quad_vao); a->quad_vao = 0; }
+   if (a->fbo)      { glDeleteFramebuffers(1, &a->fbo); a->fbo = 0; }
+   if (a->native.id) { glDeleteTextures(1, &a->native.id); a->native.id = 0; }
+   if (a->sig.id)    { glDeleteTextures(1, &a->sig.id);    a->sig.id = 0; }
+   if (a->sep.id)    { glDeleteTextures(1, &a->sep.id);    a->sep.id = 0; }
+   if (a->dec.id)    { glDeleteTextures(1, &a->dec.id);    a->dec.id = 0; }
+   if (a->rgb.id)    { glDeleteTextures(1, &a->rgb.id);    a->rgb.id = 0; }
+   if (a->scanout.id){ glDeleteTextures(1, &a->scanout.id);a->scanout.id = 0; }
+
+   a->built  = 0;
+   a->failed = 0;
+   a->native_w = a->native_h = 0;
+   a->sig_w = a->sig_h = 0;
+   a->out_w = a->out_h = 0;
+}
+
+/* Build every program the chain can need. All or nothing: a partially built
+ * chain would fail somewhere mid-frame with no useful diagnostic, so on any
+ * failure everything is released and `failed` latches so the next frame does
+ * not try again and spam the log.
+ *
+ * The trap is the exception - absent by design without compute, not a
+ * failure. */
+static bool gl_analog_build(struct gl_analog *a)
+{
+   static const struct { int slot; const char *src; const char *name; } progs[] =
+   {
+      { GL_ANALOG_DOWNSAMPLE,  NULL, "downsample"  },
+      { GL_ANALOG_ENCODE,      NULL, "encode"      },
+      { GL_ANALOG_ENCODE_PAL,  NULL, "encode_pal"  },
+      { GL_ANALOG_COMB,        NULL, "comb"        },
+      { GL_ANALOG_COMB_PAL,    NULL, "comb_pal"    },
+      { GL_ANALOG_DEMOD,       NULL, "demod"       },
+      { GL_ANALOG_DEMOD_PAL,   NULL, "demod_pal"   },
+      { GL_ANALOG_RGB,         NULL, "rgb"         },
+      { GL_ANALOG_RGB_PAL,     NULL, "rgb_pal"     },
+      { GL_ANALOG_YC,          NULL, "yc"          },
+      { GL_ANALOG_YC_PAL,      NULL, "yc_pal"      },
+      { GL_ANALOG_RESOLVE,     NULL, "resolve"     },
+      { GL_ANALOG_RESOLVE_HDR, NULL, "resolve_hdr" },
+   };
+   const char *srcs[GL_ANALOG_PROGRAM_COUNT];
+   unsigned i;
+
+   if (a->built)
+      return true;
+   if (a->failed)
+      return false;
+
+   srcs[GL_ANALOG_DOWNSAMPLE]  = analog_downsample_glsl;
+   srcs[GL_ANALOG_ENCODE]      = analog_encode_glsl;
+   srcs[GL_ANALOG_ENCODE_PAL]  = analog_encode_pal_glsl;
+   srcs[GL_ANALOG_COMB]        = analog_comb_glsl;
+   srcs[GL_ANALOG_COMB_PAL]    = analog_comb_pal_glsl;
+   srcs[GL_ANALOG_DEMOD]       = analog_demod_glsl;
+   srcs[GL_ANALOG_DEMOD_PAL]   = analog_demod_pal_glsl;
+   srcs[GL_ANALOG_RGB]         = analog_rgb_glsl;
+   srcs[GL_ANALOG_RGB_PAL]     = analog_rgb_pal_glsl;
+   srcs[GL_ANALOG_YC]          = analog_yc_glsl;
+   srcs[GL_ANALOG_YC_PAL]      = analog_yc_pal_glsl;
+   srcs[GL_ANALOG_RESOLVE]     = analog_resolve_glsl;
+   srcs[GL_ANALOG_RESOLVE_HDR] = analog_resolve_hdr_glsl;
+#ifdef HAVE_OPENGLES3
+   srcs[GL_ANALOG_DOWNSAMPLE]  = analog_downsample_glsl_ES;
+   srcs[GL_ANALOG_ENCODE]      = analog_encode_glsl_ES;
+   srcs[GL_ANALOG_ENCODE_PAL]  = analog_encode_pal_glsl_ES;
+   srcs[GL_ANALOG_COMB]        = analog_comb_glsl_ES;
+   srcs[GL_ANALOG_COMB_PAL]    = analog_comb_pal_glsl_ES;
+   srcs[GL_ANALOG_DEMOD]       = analog_demod_glsl_ES;
+   srcs[GL_ANALOG_DEMOD_PAL]   = analog_demod_pal_glsl_ES;
+   srcs[GL_ANALOG_RGB]         = analog_rgb_glsl_ES;
+   srcs[GL_ANALOG_RGB_PAL]     = analog_rgb_pal_glsl_ES;
+   srcs[GL_ANALOG_YC]          = analog_yc_glsl_ES;
+   srcs[GL_ANALOG_YC_PAL]      = analog_yc_pal_glsl_ES;
+   srcs[GL_ANALOG_RESOLVE]     = analog_resolve_glsl_ES;
+   srcs[GL_ANALOG_RESOLVE_HDR] = analog_resolve_hdr_glsl_ES;
+#endif
+
+   for (i = 0; i < sizeof(progs) / sizeof(progs[0]); i++)
+   {
+      a->programs[progs[i].slot] =
+         gl_analog_build_program(srcs[progs[i].slot], progs[i].name);
+      if (!a->programs[progs[i].slot])
+      {
+         log_cb(RETRO_LOG_ERROR,
+               "[gl_analog] chain unavailable: '%s' did not build\n",
+               progs[i].name);
+         gl_analog_free(a);
+         a->failed = 1;
+         return false;
+      }
+   }
+
+   if (gl_caps.has_compute)
+   {
+#ifdef HAVE_OPENGLES3
+      a->programs[GL_ANALOG_NOTCH] =
+         gl_analog_build_compute(analog_notch_glsl_ES, "notch");
+      a->programs[GL_ANALOG_NOTCH_PAL] =
+         gl_analog_build_compute(analog_notch_pal_glsl_ES, "notch_pal");
+#else
+      a->programs[GL_ANALOG_NOTCH] =
+         gl_analog_build_compute(analog_notch_glsl, "notch");
+      a->programs[GL_ANALOG_NOTCH_PAL] =
+         gl_analog_build_compute(analog_notch_pal_glsl, "notch_pal");
+#endif
+
+      /* A driver that claims 4.3 and then fails to build the trap is not a
+       * reason to lose the cable: drop back to the same bypass path used
+       * below the compute floor and say so once. */
+      if (!a->programs[GL_ANALOG_NOTCH] || !a->programs[GL_ANALOG_NOTCH_PAL])
+      {
+         if (a->programs[GL_ANALOG_NOTCH])
+         {
+            gl_program_free(a->programs[GL_ANALOG_NOTCH]);
+            free(a->programs[GL_ANALOG_NOTCH]);
+            a->programs[GL_ANALOG_NOTCH] = NULL;
+         }
+         if (a->programs[GL_ANALOG_NOTCH_PAL])
+         {
+            gl_program_free(a->programs[GL_ANALOG_NOTCH_PAL]);
+            free(a->programs[GL_ANALOG_NOTCH_PAL]);
+            a->programs[GL_ANALOG_NOTCH_PAL] = NULL;
+         }
+         log_cb(RETRO_LOG_WARN,
+               "[gl_analog] chroma trap did not build on a context that "
+               "reports compute; falling back to the no-trap path "
+               "(composite/RF will show hanging dots)\n");
+      }
+   }
+
+   glGenFramebuffers(1, &a->fbo);
+   a->built = 1;
+
+   log_cb(RETRO_LOG_INFO, "[gl_analog] chain built (chroma trap: %s)\n",
+         a->programs[GL_ANALOG_NOTCH] ? "on" : "off - no compute");
+   return true;
+}
+
+/* (Re)allocate the intermediate targets for a given geometry. All are fp16:
+ * the chain runs in the gamma domain but carries a modulated signal that
+ * swings below black and above white, which 8-bit storage would clip. */
+/* The display-resolution target: the extracted frame. Split out because the
+ * extraction pass needs it before the dot clock - and so the signal-rate
+ * targets - are known. The chain's output has no target of its own; the
+ * resolve draws straight into the frontend's framebuffer. */
+static bool gl_analog_resize_scanout(struct gl_analog *a,
+      uint32_t out_w, uint32_t out_h)
+{
+   if (!out_w || !out_h)
+      return false;
+   if (a->out_w != out_w || a->out_h != out_h)
+   {
+      if (a->scanout.id) glDeleteTextures(1, &a->scanout.id);
+      gl_texture_init(&a->scanout, out_w, out_h, GL_RGBA16F);
+      a->out_w = out_w;
+      a->out_h = out_h;
+   }
+   return a->scanout.id != 0;
+}
+
+static bool gl_analog_resize(struct gl_analog *a,
+      uint32_t native_w, uint32_t native_h,
+      uint32_t sig_w, uint32_t sig_h,
+      uint32_t out_w, uint32_t out_h)
+{
+   if (!native_w || !native_h || !sig_w || !sig_h || !out_w || !out_h)
+      return false;
+
+   if (a->native_w != native_w || a->native_h != native_h)
+   {
+      if (a->native.id)
+         glDeleteTextures(1, &a->native.id);
+      gl_texture_init(&a->native, native_w, native_h, GL_RGBA16F);
+      a->native_w = native_w;
+      a->native_h = native_h;
+   }
+
+   if (a->sig_w != sig_w || a->sig_h != sig_h)
+   {
+      if (a->sig.id) glDeleteTextures(1, &a->sig.id);
+      if (a->sep.id) glDeleteTextures(1, &a->sep.id);
+      if (a->dec.id) glDeleteTextures(1, &a->dec.id);
+      if (a->rgb.id) glDeleteTextures(1, &a->rgb.id);
+      gl_texture_init(&a->sig, sig_w, sig_h, GL_RGBA16F);
+      gl_texture_init(&a->sep, sig_w, sig_h, GL_RGBA16F);
+      gl_texture_init(&a->dec, sig_w, sig_h, GL_RGBA16F);
+      gl_texture_init(&a->rgb, sig_w, sig_h, GL_RGBA16F);
+      a->sig_w = sig_w;
+      a->sig_h = sig_h;
+   }
+
+   if (!gl_analog_resize_scanout(a, out_w, out_h))
+      return false;
+
+   return true;
+}
+
+/* Base clocks per pixel, from GP1(08h)'s horizontal resolution divider.
+ * Same table as the Vulkan renderer's renderer_analog_divisor; these are the
+ * exact CRTC dividers, not an approximation. */
+static unsigned gl_analog_divisor(unsigned width_mode)
+{
+   switch (width_mode)
+   {
+      case 0:  return 10;  /* 256 */
+      case 1:  return 8;   /* 320 */
+      case 2:  return 7;   /* 368 - the 5% wider mode */
+      case 3:  return 5;   /* 512 */
+      default: return 4;   /* 640 */
+   }
+}
+
+/* Which texture to present: the chain's output when every pass ran, otherwise
+ * the extracted frame. Separated out so the call site reads as one decision. */
+/* Fallback when a pass of the chain could not be set up: put the extracted
+ * frame on the frontend's buffer as it is. An unfiltered picture is a far
+ * better failure than a black one. A framebuffer blit rather than a textured
+ * quad, since the sizes match exactly. */
+static void gl_analog_blit(gl_renderer *renderer, struct gl_analog *a,
+      GLuint tex, unsigned w, unsigned h, int dst_x, int dst_y)
+{
+   GLint draw_fbo = 0;
+
+   if (!gl_caps.fp_glBlitFramebuffer)
+      return;
+
+   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, a->fbo);
+   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, tex, 0);
+
+   if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+   {
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_fbo);
+      gl_caps.fp_glBlitFramebuffer(0, 0, (GLint)w, (GLint)h,
+            (GLint)dst_x, (GLint)dst_y,
+            (GLint)(dst_x + (int)w), (GLint)(dst_y + (int)h),
+            GL_COLOR_BUFFER_BIT, GL_NEAREST);
+   }
+
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_fbo);
+   (void)renderer;
+}
+
+/* Redirect the display draw into a texture instead of the frontend's buffer.
+ * The chain needs the frame as the ordinary display path would have produced
+ * it - gamma-domain RGB, offsets and 24bpp unpacking already applied - which
+ * is exactly what the output program emits with the HDR encode switched off.
+ * So rather than duplicating that shader, the existing draw is pointed at a
+ * texture and the encode is left to the chain's resolve, which is the stage
+ * that emits the final pixel. */
+static bool gl_analog_begin_extract(struct gl_analog *a,
+      unsigned native_w, unsigned native_h, unsigned out_w, unsigned out_h)
+{
+   /* Only the scanout is needed here. The signal-rate targets depend on the
+    * dot clock, which gl_analog_run derives; sizing them from a placeholder
+    * would reallocate all four of them twice per frame. */
+   if (!gl_analog_resize_scanout(a, out_w, out_h))
+      return false;
+   (void)native_w; (void)native_h;
+   if (!a->scanout.id)
+      return false;
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, a->fbo);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, a->scanout.id, 0);
+   glViewport(0, 0, (GLsizei)out_w, (GLsizei)out_h);
+   return glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+}
+
+/* Bind one of the chain's textures as the FBO colour attachment and set the
+ * viewport to match. The chain reuses a single FBO and rebinds rather than
+ * keeping six around: the attachment change is cheap next to the passes
+ * themselves, and six live FBOs is six more things to leak. */
+static bool gl_analog_target(struct gl_analog *a, gl_texture *tex)
+{
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, a->fbo);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, tex->id, 0);
+   glViewport(0, 0, (GLsizei)tex->width, (GLsizei)tex->height);
+   return glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+}
+
+/* Full-viewport triangle strip. The analog vertex shader takes a plain
+ * normalised position and every fragment stage addresses off gl_FragCoord, so
+ * one static quad serves all of them. */
+static void gl_analog_draw_quad(struct gl_analog *a)
+{
+   static const GLfloat verts[8] =
+   {
+      -1.0f, -1.0f,
+       1.0f, -1.0f,
+      -1.0f,  1.0f,
+       1.0f,  1.0f
+   };
+
+   if (!a->quad_vbo)
+   {
+      glGenVertexArrays(1, &a->quad_vao);
+      glGenBuffers(1, &a->quad_vbo);
+      glBindVertexArray(a->quad_vao);
+      glBindBuffer(GL_ARRAY_BUFFER, a->quad_vbo);
+      glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+      glEnableVertexAttribArray(0);
+      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(GLfloat), NULL);
+   }
+   else
+      glBindVertexArray(a->quad_vao);
+
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+static void gl_analog_bind_source(gl_program *p, const char *name, GLuint tex)
+{
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, tex);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, name), 0);
+}
+
+static void bind_libretro_framebuffer(gl_renderer *renderer);
+
+/* Run the chain over `src` (gamma-domain RGB at display resolution). The
+ * resolve emits the final pixel straight into the frontend's framebuffer at
+ * (dst_x, dst_y), cleared first, so nothing is copied after the encode.
+ * Returns false if a pass could not be set up before that point, in which
+ * case the frontend's framebuffer is untouched and the caller falls back to
+ * blitting the extracted frame.
+ *
+ * Mirrors renderer_analog_apply in the Vulkan backend pass for pass; the
+ * shaders are the same source translated, so the parameter derivation has to
+ * match exactly or the two renderers disagree on phase. */
+static bool gl_analog_run(gl_renderer *renderer, struct gl_analog *a,
+      GLuint src, unsigned native_w, unsigned native_h,
+      unsigned out_w, unsigned out_h, int dst_x, int dst_y,
+      gl_texture *linear_dst)
+{
+   GLint          frontend_vp[4];
+   const unsigned div    = gl_analog_divisor((unsigned)renderer->curr_width_mode);
+   const unsigned sig_w  = native_w * div;
+   const unsigned sig_h  = native_h;
+   const bool     pal    = renderer->config.is_pal;
+   const bool     ilace  = renderer->config.is_480i;
+   const bool     resolve_ss = (out_w != native_w) || (out_h != native_h);
+   const bool     svideo = (psx_video_cable == GL_CABLE_SVIDEO);
+   const float    inv_ratio  = pal ? (1.0f / 12.0f) : (1.0f / 15.0f);
+   const float    line_adv   = pal ? 0.75f : 0.5f;
+   const float    line_split = ilace ? 2.0f : 1.0f;
+   const float    field_off  = !ilace ? 0.0f : (pal ? 0.375f : 0.25f);
+   const float    x1         = (float)renderer->config.display_area_hrange[0];
+   const float    field_adv  = (float)renderer->analog_phase;
+   gl_program    *p;
+
+   if (!out_w || !out_h || !sig_w || !sig_h)
+      return false;
+   if (!gl_analog_resize(a, native_w, native_h, sig_w, sig_h, out_w, out_h))
+      return false;
+
+   glDisable(GL_BLEND);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_SCISSOR_TEST);
+
+   /* ---- pass 0: resolve supersampling down to native ----
+    * Skipped at 1x, where the extracted image already is native. */
+   if (resolve_ss)
+   {
+      p = a->programs[GL_ANALOG_DOWNSAMPLE];
+      if (!gl_analog_target(a, &a->native))
+         return false;
+      glUseProgram(p->id);
+      gl_analog_bind_source(p, "uSource", src);
+      glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_src_size"),
+            (float)out_w, (float)out_h);
+      glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_native_size"),
+            (float)native_w, (float)native_h);
+      glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_sdr_eotf"), psx_hdr_sdr_eotf);
+      gl_analog_draw_quad(a);
+   }
+
+   {
+      GLuint chain_src = resolve_ss ? a->native.id : src;
+
+      if (psx_video_cable == GL_CABLE_RGB)
+      {
+         /* RGB/SCART: one band-limit pass, no modulation to undo, straight
+          * to the resolve. See analog_rgb.frag. */
+         p = a->programs[pal ? GL_ANALOG_RGB_PAL : GL_ANALOG_RGB];
+         if (!gl_analog_target(a, &a->rgb))
+            return false;
+         glUseProgram(p->id);
+         gl_analog_bind_source(p, "uSource", chain_src);
+         glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_src_size"),
+               (float)native_w, (float)native_h);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_div"), (float)div);
+         gl_analog_draw_quad(a);
+      }
+      else
+      {
+         /* ---- pass 1: encode ---- */
+         p = a->programs[pal ? GL_ANALOG_ENCODE_PAL : GL_ANALOG_ENCODE];
+         if (!gl_analog_target(a, &a->sig))
+            return false;
+         glUseProgram(p->id);
+         gl_analog_bind_source(p, "uSource", chain_src);
+         glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_src_size"),
+               (float)native_w, (float)native_h);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_div"), (float)div);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_x1"), x1);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_inv_ratio"), inv_ratio);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_line_adv"), line_adv);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_line_split"), line_split);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_field_off"), field_off);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_field_adv"), field_adv);
+         glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_cable"), psx_video_cable);
+         gl_analog_draw_quad(a);
+
+         /* ---- pass 2: comb ---- */
+         p = a->programs[pal ? GL_ANALOG_COMB_PAL : GL_ANALOG_COMB];
+         if (!gl_analog_target(a, &a->sep))
+            return false;
+         glUseProgram(p->id);
+         gl_analog_bind_source(p, "uSignal", a->sig.id);
+         glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_sig_size"),
+               (float)sig_w, (float)sig_h);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_line_split"), line_split);
+         glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_svideo"), svideo ? 1 : 0);
+         gl_analog_draw_quad(a);
+
+         /* ---- pass 3: demodulate ---- */
+         p = a->programs[pal ? GL_ANALOG_DEMOD_PAL : GL_ANALOG_DEMOD];
+         if (!gl_analog_target(a, &a->dec))
+            return false;
+         glUseProgram(p->id);
+         gl_analog_bind_source(p, "uComb", a->sep.id);
+         glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_sig_size"),
+               (float)sig_w, (float)sig_h);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_x1"), x1);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_inv_ratio"), inv_ratio);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_line_adv"), line_adv);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_line_split"), line_split);
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_field_off"), field_off);
+         /* Only the decoder is detuned: the console emitted a correct signal,
+          * so the error belongs on this side, not on the encode. */
+         glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_field_adv"),
+               field_adv + psx_phase_error);
+         glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_svideo"), svideo ? 1 : 0);
+         gl_analog_draw_quad(a);
+
+         /* ---- pass 4: chroma trap (or its bypass) -> RGB ----
+          * The trap is compute; without it the bypass fragment path runs and
+          * composite/RF keep everything but the trap. Both stages also do the
+          * PAL delay line, the setup pedestal and the YC->RGB conversion, so
+          * one of them must run. */
+         {
+            float black_scale  = 1.0f;
+            float black_offset = 0.0f;
+            gl_program *notch  = a->programs[pal ? GL_ANALOG_NOTCH_PAL
+                                                 : GL_ANALOG_NOTCH];
+
+            /* NTSC setup. Black sits 7.5 IRE above blanking on NTSC-M and at
+             * 0 on NTSC-J and PAL, and a matched encoder and receiver cancel
+             * out - so this is only ever non-identity when the two disagree,
+             * which is what happened whenever a disc crossed between those
+             * markets. Setup is an NTSC composite-luminance concept: PAL
+             * never had it, and it is applied to luma only, chroma being a
+             * difference signal riding on it. */
+            if (pal || psx_black_setup == 0)
+            {
+               black_scale  = 1.0f;
+               black_offset = 0.0f;
+            }
+            else if (psx_black_setup == 1)   /* NTSC-M signal, no compensation */
+            {
+               black_scale  = 1.0f - 0.075f;
+               black_offset = 0.075f;
+            }
+            else                             /* NTSC-J signal read with setup */
+            {
+               black_scale  = 1.0f / (1.0f - 0.075f);
+               black_offset = -0.075f / (1.0f - 0.075f);
+            }
+
+#if defined(RHI_GL_HAVE_COMPUTE)
+            if (notch)
+            {
+               double c[5];
+               double b0, b1, b2, a1, a2;
+               analog_trap_coeffs((double)inv_ratio, c);
+               b0 = c[0]; b1 = c[1]; b2 = c[2]; a1 = c[3]; a2 = c[4];
+
+               glUseProgram(notch->id);
+               glActiveTexture(GL_TEXTURE0);
+               glBindTexture(GL_TEXTURE_2D, a->dec.id);
+               glUniform1i(gl_uniform_map_get(&notch->uniforms, "uDecoded"), 0);
+               glBindImageTexture(1, a->rgb.id, 0, GL_FALSE, 0,
+                     GL_WRITE_ONLY, GL_RGBA16F);
+               glUniform2f(gl_uniform_map_get(&notch->uniforms, "reg_sig_size"),
+                     (float)sig_w, (float)sig_h);
+               glUniform1f(gl_uniform_map_get(&notch->uniforms, "reg_line_split"), line_split);
+               glUniform1f(gl_uniform_map_get(&notch->uniforms, "reg_black_scale"), black_scale);
+               glUniform1f(gl_uniform_map_get(&notch->uniforms, "reg_black_offset"), black_offset);
+               glUniform1f(gl_uniform_map_get(&notch->uniforms, "reg_b0"), (float)b0);
+               glUniform1f(gl_uniform_map_get(&notch->uniforms, "reg_b1"), (float)b1);
+               glUniform1f(gl_uniform_map_get(&notch->uniforms, "reg_b2"), (float)b2);
+               glUniform1f(gl_uniform_map_get(&notch->uniforms, "reg_a1"), (float)a1);
+               glUniform1f(gl_uniform_map_get(&notch->uniforms, "reg_a2"), (float)a2);
+               /* S-Video never shared a wire, so there is no residue to trap
+                * and a notch would only cost detail. */
+               glUniform1i(gl_uniform_map_get(&notch->uniforms, "reg_enable"),
+                     svideo ? 0 : 1);
+               /* One workgroup per scanline, as the shader's scan assumes. */
+               glDispatchCompute(sig_h, 1, 1);
+               glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT |
+                               GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            }
+            else
+#endif /* RHI_GL_HAVE_COMPUTE */
+            {
+               p = a->programs[pal ? GL_ANALOG_YC_PAL : GL_ANALOG_YC];
+               if (!gl_analog_target(a, &a->rgb))
+                  return false;
+               glUseProgram(p->id);
+               gl_analog_bind_source(p, "uDecoded", a->dec.id);
+               glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_sig_size"),
+                     (float)sig_w, (float)sig_h);
+               glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_line_split"), line_split);
+               glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_black_scale"), black_scale);
+               glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_black_offset"), black_offset);
+               gl_analog_draw_quad(a);
+            }
+         }
+      }
+   }
+
+   /* ---- pass 5: resample to display, and encode ----
+    * The resolve is the stage that emits the final pixel, HDR included, and
+    * it draws it into the frontend's framebuffer. The clear covers what the
+    * display rect does not: the frame's own clear went to the extraction
+    * target, so without it the frontend buffer would keep last frame's
+    * leftovers. */
+   p = a->programs[psx_hdr_active ? GL_ANALOG_RESOLVE_HDR : GL_ANALOG_RESOLVE];
+   /* With the HDR post effects on, the resolve writes scene-linear light
+    * into their scene image instead, and gl_post_run encodes. */
+   if (linear_dst)
+   {
+      frontend_vp[0] = frontend_vp[1] = frontend_vp[2] = frontend_vp[3] = 0;
+      if (!gl_analog_target(a, linear_dst))
+         return false;
+      glClearColor(0.0, 0.0, 0.0, 0.0);
+      glClear(GL_COLOR_BUFFER_BIT);
+   }
+   else
+   {
+      bind_libretro_framebuffer(renderer);
+      glGetIntegerv(GL_VIEWPORT, frontend_vp);
+      glClearColor(0.0, 0.0, 0.0, 0.0);
+      glClear(GL_COLOR_BUFFER_BIT);
+      glViewport((GLint)dst_x, (GLint)dst_y, (GLsizei)out_w, (GLsizei)out_h);
+   }
+   glUseProgram(p->id);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "HDR_LINEAR_OUT"), linear_dst ? 1 : 0);
+   gl_analog_bind_source(p, "uDecoded", a->rgb.id);
+   glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_sig_size"),
+         (float)sig_w, (float)sig_h);
+   glUniform2f(gl_uniform_map_get(&p->uniforms, "reg_out_size"),
+         (float)out_w, (float)out_h);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_sdr_eotf"), psx_hdr_sdr_eotf);
+   glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_paper_white_nits"),
+         psx_hdr_paper_white_nits);
+   glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_peak_nits"), psx_hdr_max_nits);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_expand_gamut"), psx_hdr_expand_gamut);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_shoulder"), psx_hdr_shoulder);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_src_primaries"), psx_src_primaries);
+   glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_black_pq"), psx_hdr_black_pq);
+   glUniformMatrix3fv(gl_uniform_map_get(&p->uniforms, "reg_to_panel"), 1, GL_FALSE,
+         psx_hdr_to_panel);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_scrgb"), psx_hdr_scrgb);
+   if (psx_hdr_active)
+      gl_bind_display_transform(p);
+   gl_analog_draw_quad(a);
+
+   /* Leave the frontend's framebuffer bound with the viewport
+    * bind_libretro_framebuffer set, as the rest of the frame expects. The
+    * post effects rebind it themselves. */
+   if (!linear_dst)
+      glViewport(frontend_vp[0], frontend_vp[1], frontend_vp[2], frontend_vp[3]);
+   glBindVertexArray(0);
+   return true;
+}
+
+/* ---- HDR post effects: bloom, halation, chromatic aberration ----
+ *
+ * The GL twin of renderer_hdr_post_apply: the display draw (or the analog
+ * resolve) writes scene-linear light into `scene`, the bloom is built from it
+ * and the composite encodes into the frontend's framebuffer. The shaders are
+ * hdr_bloom.frag / hdr_post.frag translated by gen_analog_gl.py, run through
+ * the analog chain's vertex stage. Built on first use; a session that never
+ * enables an effect never compiles them. */
+enum
+{
+   GL_POST_BRIGHT = 0,
+   GL_POST_BLUR,
+   GL_POST_DOWN,
+   GL_POST_DOWN_KARIS,
+   GL_POST_UP,
+   GL_POST_COMPOSITE,
+   GL_POST_PROGRAM_COUNT
+};
+
+struct gl_post
+{
+   gl_program *programs[GL_POST_PROGRAM_COUNT];
+   gl_texture  scene;                    /* scene-linear, display size */
+   gl_texture  bloom[4];                 /* [0,1] quarter, [2,3] sixteenth */
+   gl_texture  conv[HDR_POST_CONV_MAX];  /* the convolution pyramid */
+   GLuint      fbo;
+   GLuint      quad_vao;
+   GLuint      quad_vbo;
+   int         built;
+   int         failed;
+};
+
+static void gl_post_free_texture(gl_texture *t)
+{
+   if (t->id)
+      glDeleteTextures(1, &t->id);
+   t->id = 0;
+   t->width = t->height = 0;
+}
+
+static void gl_post_free(struct gl_post *pp)
+{
+   unsigned i;
+   if (!pp)
+      return;
+   for (i = 0; i < GL_POST_PROGRAM_COUNT; i++)
+   {
+      if (pp->programs[i])
+      {
+         gl_program_free(pp->programs[i]);
+         free(pp->programs[i]);
+         pp->programs[i] = NULL;
+      }
+   }
+   gl_post_free_texture(&pp->scene);
+   for (i = 0; i < 4; i++)
+      gl_post_free_texture(&pp->bloom[i]);
+   for (i = 0; i < HDR_POST_CONV_MAX; i++)
+      gl_post_free_texture(&pp->conv[i]);
+   if (pp->fbo)      { glDeleteFramebuffers(1, &pp->fbo); pp->fbo = 0; }
+   if (pp->quad_vbo) { glDeleteBuffers(1, &pp->quad_vbo); pp->quad_vbo = 0; }
+   if (pp->quad_vao) { glDeleteVertexArrays(1, &pp->quad_vao); pp->quad_vao = 0; }
+   pp->built  = 0;
+   pp->failed = 0;
+}
+
+static bool gl_post_build(struct gl_post *pp)
+{
+   static const char *const names[GL_POST_PROGRAM_COUNT] = {
+      "bloom_bright", "bloom_blur", "bloom_down", "bloom_down_karis",
+      "bloom_up", "post" };
+   const char *srcs[GL_POST_PROGRAM_COUNT];
+   unsigned i;
+
+   if (pp->built)
+      return true;
+   if (pp->failed)
+      return false;
+
+   srcs[GL_POST_BRIGHT]     = hdr_bloom_bright_glsl;
+   srcs[GL_POST_BLUR]       = hdr_bloom_blur_glsl;
+   srcs[GL_POST_DOWN]       = hdr_bloom_down_glsl;
+   srcs[GL_POST_DOWN_KARIS] = hdr_bloom_down_karis_glsl;
+   srcs[GL_POST_UP]         = hdr_bloom_up_glsl;
+   srcs[GL_POST_COMPOSITE]  = hdr_post_glsl;
+#ifdef HAVE_OPENGLES3
+   srcs[GL_POST_BRIGHT]     = hdr_bloom_bright_glsl_ES;
+   srcs[GL_POST_BLUR]       = hdr_bloom_blur_glsl_ES;
+   srcs[GL_POST_DOWN]       = hdr_bloom_down_glsl_ES;
+   srcs[GL_POST_DOWN_KARIS] = hdr_bloom_down_karis_glsl_ES;
+   srcs[GL_POST_UP]         = hdr_bloom_up_glsl_ES;
+   srcs[GL_POST_COMPOSITE]  = hdr_post_glsl_ES;
+#endif
+
+   for (i = 0; i < GL_POST_PROGRAM_COUNT; i++)
+   {
+      pp->programs[i] = gl_analog_build_program(srcs[i], names[i]);
+      if (!pp->programs[i])
+      {
+         log_cb(RETRO_LOG_ERROR,
+               "[gl_post] HDR post effects unavailable: '%s' did not build\n", names[i]);
+         gl_post_free(pp);
+         pp->failed = 1;
+         return false;
+      }
+   }
+   glGenFramebuffers(1, &pp->fbo);
+   pp->built = 1;
+   return true;
+}
+
+#ifndef GL_R11F_G11F_B10F
+#define GL_R11F_G11F_B10F 0x8C3A
+#endif
+
+/* Set once a packed-float target failed to attach: Compact Intermediates
+ * then falls back to half floats for the rest of the session. */
+static bool gl_post_compact_broken;
+
+/* The post intermediates' format: half floats, or with Compact
+ * Intermediates the packed 11/11/10 float, which halves their traffic.
+ * They only ever hold non-negative light, which it carries. */
+static GLenum gl_post_format(void)
+{
+   return (hdr_post_compact() && !gl_post_compact_broken)
+         ? GL_R11F_G11F_B10F : GL_RGBA16F;
+}
+
+/* (Re)allocate a post target, bilinear and edge-clamped: the bloom
+ * samples between texels and the aberration reaches past the frame. */
+static bool gl_post_texture(gl_texture *t, unsigned w, unsigned h)
+{
+   GLenum fmt = gl_post_format();
+   if (t->id && t->width == w && t->height == h && t->internal_format == fmt)
+      return true;
+   gl_post_free_texture(t);
+   if (!gl_texture_init(t, w, h, fmt))
+   {
+      gl_post_free_texture(t);
+      return false;
+   }
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   return true;
+}
+
+static bool gl_post_target(struct gl_post *pp, gl_texture *t)
+{
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, pp->fbo);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, t->id, 0);
+   glViewport(0, 0, (GLsizei)t->width, (GLsizei)t->height);
+   if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+      return true;
+   if (t->internal_format == GL_R11F_G11F_B10F)
+      gl_post_compact_broken = true;
+   return false;
+}
+
+static void gl_post_draw_quad(struct gl_post *pp)
+{
+   static const GLfloat verts[8] =
+   {
+      -1.0f, -1.0f,
+       1.0f, -1.0f,
+      -1.0f,  1.0f,
+       1.0f,  1.0f
+   };
+
+   if (!pp->quad_vbo)
+   {
+      glGenVertexArrays(1, &pp->quad_vao);
+      glGenBuffers(1, &pp->quad_vbo);
+      glBindVertexArray(pp->quad_vao);
+      glBindBuffer(GL_ARRAY_BUFFER, pp->quad_vbo);
+      glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+      glEnableVertexAttribArray(0);
+      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(GLfloat), NULL);
+   }
+   else
+      glBindVertexArray(pp->quad_vao);
+
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+/* One bloom stage: p0/p1 are hdr_bloom.frag's two vec4 registers. */
+static bool gl_post_pass(struct gl_post *pp, int prog, gl_texture *dst,
+      unsigned w, unsigned h, GLuint src, const float p0[4], const float p1[4], bool add)
+{
+   gl_program *p = pp->programs[prog];
+   static const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+   if (!add && !gl_post_texture(dst, w, h))
+      return false;
+   if (!gl_post_target(pp, dst))
+      return false;
+   if (add)
+   {
+      glEnable(GL_BLEND);
+      glBlendEquation(GL_FUNC_ADD);
+      glBlendFunc(GL_ONE, GL_ONE);
+   }
+   glUseProgram(p->id);
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, src);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "uSource"), 0);
+   glUniform4fv(gl_uniform_map_get(&p->uniforms, "reg_p0"), 1, p0 ? p0 : zero);
+   glUniform4fv(gl_uniform_map_get(&p->uniforms, "reg_p1"), 1, p1 ? p1 : zero);
+   gl_post_draw_quad(pp);
+   if (add)
+      glDisable(GL_BLEND);
+   return true;
+}
+
+static unsigned gl_post_dim(unsigned v, unsigned shift)
+{
+   v >>= shift;
+   return v ? v : 1u;
+}
+
+static void bind_libretro_framebuffer(gl_renderer *renderer);
+static void gl_bind_display_transform(const struct gl_program *p);
+
+/* Bloom from pp->scene, then the composite into the frontend's framebuffer
+ * at (dst_x, dst_y). Mirrors renderer_hdr_post_apply pass for pass. */
+static bool gl_post_run(gl_renderer *renderer, struct gl_post *pp,
+      int dst_x, int dst_y)
+{
+   struct hdr_post_frame f;
+   const unsigned w = pp->scene.width, h = pp->scene.height;
+   GLuint bloom_t = pp->scene.id, bloom_w = pp->scene.id;
+   GLint  frontend_vp[4];
+   gl_program *p;
+   float p0[4], p1[4];
+   int i;
+
+   hdr_post_frame_params(&f, w, h);
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_BLEND);
+
+   if (f.bloom)
+   {
+      const unsigned qw = gl_post_dim(w, 2), qh = gl_post_dim(h, 2);
+      const unsigned sw = gl_post_dim(w, 4), sh = gl_post_dim(h, 4);
+      gl_texture *base = f.levels ? &pp->conv[0] : &pp->bloom[0];
+
+      memcpy(p0, f.bright, sizeof(p0));
+      p1[0] = 1.0f / (float)w;
+      p1[1] = 1.0f / (float)h;
+      p1[2] = p1[3] = 0.0f;
+      if (!gl_post_pass(pp, GL_POST_BRIGHT, base, qw, qh, pp->scene.id, p0, p1, false))
+         return false;
+
+      if (f.levels)
+      {
+         for (i = 1; i < f.levels; i++)
+         {
+            const unsigned pw = gl_post_dim(qw, (unsigned)(i - 1));
+            const unsigned ph = gl_post_dim(qh, (unsigned)(i - 1));
+            p1[0] = 1.0f / (float)pw;
+            p1[1] = 1.0f / (float)ph;
+            if (!gl_post_pass(pp, i == 1 ? GL_POST_DOWN_KARIS : GL_POST_DOWN,
+                     &pp->conv[i], pw > 1 ? pw / 2 : 1, ph > 1 ? ph / 2 : 1,
+                     pp->conv[i - 1].id, NULL, p1, false))
+               return false;
+         }
+         p0[0] = 1.0f;
+         p0[1] = p0[2] = p0[3] = 0.0f;
+         for (i = f.levels - 1; i > 0; i--)
+         {
+            const unsigned pw = gl_post_dim(qw, (unsigned)i);
+            const unsigned ph = gl_post_dim(qh, (unsigned)i);
+            p1[0] = 1.0f / (float)pw;
+            p1[1] = 1.0f / (float)ph;
+            if (!gl_post_pass(pp, GL_POST_UP, &pp->conv[i - 1], 0, 0,
+                     pp->conv[i].id, p0, p1, true))
+               return false;
+         }
+         bloom_t = bloom_w = pp->conv[0].id;
+      }
+      else
+      {
+         p1[2] = p1[3] = 0.0f;
+         p1[0] = 1.0f / (float)qw; p1[1] = 0.0f;
+         if (!gl_post_pass(pp, GL_POST_BLUR, &pp->bloom[1], qw, qh, pp->bloom[0].id, NULL, p1, false))
+            return false;
+         p1[0] = 0.0f; p1[1] = 1.0f / (float)qh;
+         if (!gl_post_pass(pp, GL_POST_BLUR, &pp->bloom[0], qw, qh, pp->bloom[1].id, NULL, p1, false))
+            return false;
+         p1[0] = 1.0f / (float)sw; p1[1] = 0.0f;
+         if (!gl_post_pass(pp, GL_POST_BLUR, &pp->bloom[3], sw, sh, pp->bloom[0].id, NULL, p1, false))
+            return false;
+         p1[0] = 0.0f; p1[1] = 1.0f / (float)sh;
+         if (!gl_post_pass(pp, GL_POST_BLUR, &pp->bloom[2], sw, sh, pp->bloom[3].id, NULL, p1, false))
+            return false;
+         bloom_t = pp->bloom[0].id;
+         bloom_w = pp->bloom[2].id;
+      }
+   }
+
+   /* The composite, into the frontend's framebuffer. The clear covers what
+    * the display rect does not, as the analog resolve's does. */
+   p = pp->programs[GL_POST_COMPOSITE];
+   bind_libretro_framebuffer(renderer);
+   glGetIntegerv(GL_VIEWPORT, frontend_vp);
+   glClearColor(0.0, 0.0, 0.0, 0.0);
+   glClear(GL_COLOR_BUFFER_BIT);
+   glViewport((GLint)dst_x, (GLint)dst_y, (GLsizei)w, (GLsizei)h);
+   glUseProgram(p->id);
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, pp->scene.id);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "uScene"), 0);
+   glActiveTexture(GL_TEXTURE1);
+   glBindTexture(GL_TEXTURE_2D, bloom_t);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "uBloomT"), 1);
+   glActiveTexture(GL_TEXTURE2);
+   glBindTexture(GL_TEXTURE_2D, bloom_w);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "uBloomW"), 2);
+   glActiveTexture(GL_TEXTURE0);
+   glUniform4fv(gl_uniform_map_get(&p->uniforms, "reg_hal_bloom"), 1, f.hal_bloom);
+   glUniform2fv(gl_uniform_map_get(&p->uniforms, "reg_band_w"), 1, f.band_w);
+   glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_ca"), f.ca);
+   glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_paper_white_nits"), psx_hdr_paper_white_nits);
+   glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_peak_nits"), psx_hdr_max_nits);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_expand_gamut"), psx_hdr_expand_gamut);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_shoulder"), psx_hdr_shoulder);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_src_primaries"), psx_src_primaries);
+   glUniform1f(gl_uniform_map_get(&p->uniforms, "reg_black_pq"), psx_hdr_black_pq);
+   glUniformMatrix3fv(gl_uniform_map_get(&p->uniforms, "reg_to_panel"), 1, GL_FALSE,
+         psx_hdr_to_panel);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "reg_scrgb"), psx_hdr_scrgb);
+   glUniform1i(gl_uniform_map_get(&p->uniforms, "HDR_LINEAR_OUT"), 0);
+   gl_bind_display_transform(p);
+   gl_post_draw_quad(pp);
+
+   glViewport(frontend_vp[0], frontend_vp[1], frontend_vp[2], frontend_vp[3]);
+   glBindVertexArray(0);
+   return true;
+}
+
+static struct gl_post *gl_post_get(gl_renderer *renderer)
+{
+   if (!psx_hdr_active || !hdr_post_enabled())
+      return NULL;
+   if (!renderer->post)
+   {
+      renderer->post = (struct gl_post *)calloc(1, sizeof(struct gl_post));
+      if (!renderer->post)
+         return NULL;
+   }
+   if (!gl_post_build(renderer->post))
+      return NULL;
+   return renderer->post;
+}
+
+/* Point the display draw at the scene image, as the analog extraction does. */
+static bool gl_post_begin(struct gl_post *pp, unsigned w, unsigned h)
+{
+   if (!gl_post_texture(&pp->scene, w, h))
+      return false;
+   if (!gl_post_target(pp, &pp->scene))
+      return false;
+   return true;
+}
+
+/* Bring the chain up if the option asks for it, tear it down if it does not.
+ * Called once per frame from the display path: the option is live (no restart
+ * needed) so the answer can change between frames, and building is guarded by
+ * the `built`/`failed` flags so the steady state is two predictable branches.
+ *
+ * Returns the chain when it is available and wanted, NULL otherwise - which is
+ * also what a build failure returns, so the caller falls back to the ordinary
+ * display path rather than showing nothing. */
+static struct gl_analog *gl_analog_get(gl_renderer *renderer)
+{
+   if (psx_video_cable == GL_CABLE_NONE)
+      return NULL;
+
+   if (!renderer->analog)
+   {
+      renderer->analog = (struct gl_analog *)calloc(1, sizeof(struct gl_analog));
+      if (!renderer->analog)
+         return NULL;
+   }
+
+   if (!gl_analog_build(renderer->analog))
+      return NULL;
+
+   return renderer->analog;
+}
+
+static void gl_renderer_free(gl_renderer *renderer)
+{
+   if (!renderer)
+      return;
+
+   gl_dt_free();
+
+   if (renderer->fb_out_fbo)
+      glDeleteFramebuffers(1, &renderer->fb_out_fbo);
+   if (renderer->fb_texture_fbo)
+      glDeleteFramebuffers(1, &renderer->fb_texture_fbo);
+   renderer->fb_out_fbo = 0;
+   renderer->fb_texture_fbo = 0;
+
+   if (renderer->command_buffer)
+   {
+      gl_draw_buffer_free(renderer->command_buffer);
+      free(renderer->command_buffer);
+   }
+   renderer->command_buffer = NULL;
+
+   if (renderer->output_buffer)
+   {
+      gl_draw_buffer_free(renderer->output_buffer);
+      free(renderer->output_buffer);
+   }
+   renderer->output_buffer = NULL;
+
+   if (renderer->image_load_program)
+   {
+      gl_program_free(renderer->image_load_program);
+      free(renderer->image_load_program);
+   }
+   renderer->image_load_program = NULL;
+   if (renderer->quad_vao)
+      glDeleteVertexArrays(1, &renderer->quad_vao);
+   if (renderer->quad_vbo)
+      glDeleteBuffers(1, &renderer->quad_vbo);
+   renderer->quad_vao = renderer->quad_vbo = 0;
+
+   /* Release the dynamic batch list backing storage.  C++ used
+    * to do this implicitly via std::vector's destructor; in C we
+    * must call gl_primitive_batch_vec_free explicitly or leak. */
+   if (renderer->analog)
+   {
+      gl_analog_free(renderer->analog);
+      free(renderer->analog);
+      renderer->analog = NULL;
+   }
+   if (renderer->post)
+   {
+      gl_post_free(renderer->post);
+      free(renderer->post);
+      renderer->post = NULL;
+   }
+   if (renderer->rb_read_fbo)
+      glDeleteFramebuffers(1, &renderer->rb_read_fbo);
+   if (renderer->rb_scratch_fbo)
+      glDeleteFramebuffers(1, &renderer->rb_scratch_fbo);
+   if (renderer->rb_scratch_tex)
+      glDeleteTextures(1, &renderer->rb_scratch_tex);
+   free(renderer->rb_cpu);
+   if (renderer->rb_pack_program)
+   {
+      gl_program_free(renderer->rb_pack_program);
+      free(renderer->rb_pack_program);
+      renderer->rb_pack_program = NULL;
+   }
+   if (renderer->rb_pack_fbo)
+      glDeleteFramebuffers(1, &renderer->rb_pack_fbo);
+   if (renderer->rb_pack_tex)
+      glDeleteTextures(1, &renderer->rb_pack_tex);
+   renderer->rb_pack_fbo = renderer->rb_pack_tex = 0;
+   renderer->rb_pack_failed = false;
+   renderer->rb_read_fbo = renderer->rb_scratch_fbo = renderer->rb_scratch_tex = 0;
+   renderer->rb_cpu      = NULL;
+   renderer->rb_cpu_len  = 0;
+
+   gl_primitive_batch_vec_free(&renderer->batches);
+
+   if (renderer->index_buffer)
+      glDeleteBuffers(1, &renderer->index_buffer);
+   renderer->index_buffer = 0;
+
+   glDeleteTextures(1, &renderer->fb_texture.id);
+   renderer->fb_texture.id     = 0;
+   renderer->fb_texture.width  = 0;
+   renderer->fb_texture.height = 0;
+
+   glDeleteTextures(1, &renderer->palette_texture.id);
+   renderer->palette_texture.id     = 0;
+   renderer->palette_texture.width  = 0;
+   renderer->palette_texture.height = 0;
+
+   glDeleteTextures(1, &renderer->fb_feedback_texture.id);
+   renderer->fb_feedback_texture.id     = 0;
+   renderer->fb_feedback_texture.width  = 0;
+   renderer->fb_feedback_texture.height = 0;
+   renderer->fb_feedback_texture_failed = false;
+
+#ifdef GL_READ_FRAMEBUFFER
+   gl_copy_free(renderer);
+#endif
+
+   glDeleteTextures(1, &renderer->blend_texture.id);
+   memset(&renderer->blend_texture, 0, sizeof(renderer->blend_texture));
+   glDeleteTextures(1, &renderer->fb_out.id);
+   renderer->fb_out.id     = 0;
+   renderer->fb_out.width  = 0;
+   renderer->fb_out.height = 0;
+   renderer->fb_out_internal_format = 0;
+
+   glDeleteTextures(1, &renderer->fb_out_depth.id);
+   renderer->fb_out_depth.id     = 0;
+   renderer->fb_out_depth.width  = 0;
+   renderer->fb_out_depth.height = 0;
+
+   /* Shared HD texture replacement/tracking teardown. The tracker
+    * releases every TTGpuImage it holds through the GL backend, so this
+    * must run while the context is still current (it is: we're called
+    * from context_destroy / context_reset). */
+   texture_tracker_free(renderer->tracker);
+   renderer->tracker = NULL;
+   if (renderer->tt_read_fbo)
+      glDeleteFramebuffers(1, &renderer->tt_read_fbo);
+   if (renderer->tt_draw_fbo)
+      glDeleteFramebuffers(1, &renderer->tt_draw_fbo);
+   renderer->tt_read_fbo = 0;
+   renderer->tt_draw_fbo = 0;
+   if (renderer->vram_sync_read_fbo)
+      glDeleteFramebuffers(1, &renderer->vram_sync_read_fbo);
+   if (renderer->vram_sync_draw_fbo)
+      glDeleteFramebuffers(1, &renderer->vram_sync_draw_fbo);
+   renderer->vram_sync_read_fbo = 0;
+   renderer->vram_sync_draw_fbo = 0;
+
+   {
+      unsigned i;
+      for (i = 0; i < INDEX_BUFFER_LEN; i++)
+         renderer->vertex_indices[i] = 0;
+   }
+}
+
+static INLINE void apply_scissor(gl_renderer *renderer)
+{
+   uint16_t _x = renderer->config.draw_area_top_left[0];
+   uint16_t _y = renderer->config.draw_area_top_left[1];
+   int _w      = renderer->config.draw_area_bot_right[0] - _x;
+   int _h      = renderer->config.draw_area_bot_right[1] - _y;
+   GLsizei upscale;
+   GLsizei x;
+   GLsizei y;
+   GLsizei w;
+   GLsizei h;
+
+   if (_w < 0)
+      _w = 0;
+
+   if (_h < 0)
+      _h = 0;
+
+   upscale = (GLsizei)renderer->internal_upscaling;
+
+   /* We need to scale those to match the internal resolution if
+    * upscaling is enabled */
+   x = (GLsizei) _x * upscale;
+   y = (GLsizei) _y * upscale;
+   w = (GLsizei) _w * upscale;
+   h = (GLsizei) _h * upscale;
+
+   glScissor(x, y, w, h);
+}
+
+static gl_display_rect compute_gl_display_rect(gl_renderer *renderer)
+{
+   /* Current function logic mostly backported from Vulkan renderer */
+
+   int32_t clock_div;
+   uint32_t width;
+   int32_t x;
+   uint32_t height;
+   int32_t y;
+
+   switch (renderer->curr_width_mode)
+   {
+      case WIDTH_MODE_256:
+         clock_div = 10;
+         break;
+
+      case WIDTH_MODE_320:
+         clock_div = 8;
+         break;
+
+      case WIDTH_MODE_512:
+         clock_div = 5;
+         break;
+
+      case WIDTH_MODE_640:
+         clock_div = 4;
+         break;
+
+      /* The unusual case: 368px mode. Width is 364 px for
+       * typical 368 mode games but often times something
+       * different, which necessitates checking width mode 
+       * rather than calculated pixel width */
+      case WIDTH_MODE_368:
+         clock_div = 7;
+         break;
+
+      default: /* out-of-range width mode: use the 320 divider so clock_div is
+                  never left uninitialised (the divisions below would otherwise
+                  be undefined / a divide-by-zero) */
+         clock_div = 8;
+         break;
+   }
+
+   if (renderer->crop_overscan)
+   {
+      int32_t offset_cycles = renderer->image_offset_cycles;
+      int32_t h_start = (int32_t) renderer->config.display_area_hrange[0];
+      uint32_t win    = rhi_common_crop_window(renderer->crop_overscan, h_start,
+            (int32_t) renderer->config.display_area_hrange[1]);
+      width = (uint32_t) ((RHI_CROP_WIN_WIDTH(win)/clock_div) - renderer->image_crop);
+      /* Restore old center behaviour is render_state.horiz_start is intentionally very high.
+       * 938 fixes Gunbird (1008) and Mobile Light Force (EU release of Gunbird),
+       * but this value should be lowerer in the future if necessary. */
+      if ((renderer->config.display_area_hrange[0] < 938) && (renderer->crop_overscan == 2))
+          x = floor((offset_cycles / (double) clock_div) - (renderer->image_crop / 2));
+      else
+          x = floor(((h_start - RHI_CROP_WIN_START(win) + offset_cycles) / (double) clock_div) - (renderer->image_crop / 2));
+   }
+   else
+   {
+      int32_t offset_cycles = renderer->image_offset_cycles;
+      int32_t h_start = (int32_t) renderer->config.display_area_hrange[0];
+      width = (uint32_t) (2800/clock_div);
+      x = floor((h_start - 488 + offset_cycles) / (double) clock_div);
+   }
+
+   if (renderer->crop_overscan == 2)
+   {
+        if (renderer->config.is_pal)
+        {
+            int h = (renderer->config.display_area_vrange[1] - renderer->config.display_area_vrange[0]) - (287 - renderer->last_scanline_pal) - renderer->initial_scanline_pal;
+            height = (h < 0 ? 0 : (uint32_t) h);
+            y = renderer->last_scanline_pal - 287;
+        }
+        else
+        {
+            int h = (renderer->config.display_area_vrange[1] - renderer->config.display_area_vrange[0]) - (239 - renderer->last_scanline) - renderer->initial_scanline;
+            height = (h < 0 ? 0 : (uint32_t) h);
+            y = renderer->last_scanline - 239;
+        }
+   }
+   if (renderer->crop_overscan != 2 || height > (renderer->config.is_pal? 288 : 240))
+   {
+        if (renderer->config.is_pal)
+        {
+            int h = renderer->last_scanline_pal - renderer->initial_scanline_pal + 1;
+            height = (h < 0 ? 0 : (uint32_t) h);
+            y = (308 - renderer->config.display_area_vrange[1]) + (renderer->last_scanline_pal - 287);
+        }
+        else
+        {
+            int h = renderer->last_scanline - renderer->initial_scanline + 1;
+            height = (h < 0 ? 0 : (uint32_t) h);
+            y = (256 - renderer->config.display_area_vrange[1]) + (renderer->last_scanline - 239);
+        }
+   }
+   /* Startup-logo shift, keyed on the programmed window rather than the
+    * cropped height (see the Vulkan renderer). The viewport origin is
+    * lower-left, so the bottom edge moves down by the same six lines the
+    * height loses and the top line stays where software and Vulkan put it. */
+   if (renderer->crop_overscan == 2 && renderer->config.is_480i &&
+       renderer->config.display_area_vrange[1] - renderer->config.display_area_vrange[0] == 239)
+   {
+      height = 236;
+      y -= 3;
+   }
+   height *= (renderer->config.is_480i ? 2 : 1);
+   y *= (renderer->config.is_480i ? 2 : 1);
+
+   {
+      gl_display_rect r;
+      r.x      = x;
+      r.y      = y;
+      r.width  = width;
+      r.height = height;
+      return r;
+   }
+}
+
+static void bind_libretro_framebuffer(gl_renderer *renderer)
+{
+   GLuint fbo;
+   uint32_t w, h;
+   uint32_t upscale;
+   uint32_t f_w;
+   uint32_t f_h;
+   uint32_t _w;
+   uint32_t _h;
+   uint32_t vp_w;
+   uint32_t vp_h;
+   int32_t x, y;
+   int32_t _x = 0;
+   int32_t _y = 0;
+
+   if (!renderer)
+      return;
+
+   upscale   = renderer->internal_upscaling;
+   f_w       = renderer->frontend_resolution[0];
+   f_h       = renderer->frontend_resolution[1];
+   _w        = renderer->config.display_resolution[0];
+   _h        = renderer->config.display_resolution[1];
+
+   /* vp_w and vp_h currently contingent on rhi_intf_set_display_mode behavior... */
+   vp_w = renderer->config.display_resolution[0];
+   vp_h = renderer->config.display_resolution[1];
+
+   if (renderer->display_vram)
+   {
+      _x           = 0;
+      _y           = 0;
+      _w           = VRAM_WIDTH_PIXELS;
+      _h           = VRAM_HEIGHT; /* override vram fb dimensions for viewport */
+      vp_w = _w;
+      vp_h = _h;
+   }
+   else
+   {
+      gl_display_rect disp_rect = compute_gl_display_rect(renderer);
+      _x = disp_rect.x;
+      _y = disp_rect.y;
+      _w = disp_rect.width;
+      _h = disp_rect.height;
+   }
+
+   x       = _x * (int32_t) upscale;
+   y       = _y * (int32_t) upscale;
+   w       = (uint32_t) _w * upscale;
+   h       = (uint32_t) _h * upscale;
+   vp_w   *= upscale;
+   vp_h   *= upscale;
+
+   if (w != f_w || h != f_h)
+   {
+      /* We need to change the frontend's resolution */
+      struct retro_game_geometry geometry;
+      geometry.base_width  = MEDNAFEN_CORE_GEOMETRY_BASE_W;
+      geometry.base_height = MEDNAFEN_CORE_GEOMETRY_BASE_H;
+
+      /* Max parameters are ignored by this call */
+      geometry.max_width  = MEDNAFEN_CORE_GEOMETRY_MAX_W * upscale;
+      geometry.max_height = MEDNAFEN_CORE_GEOMETRY_MAX_H * upscale;
+
+      geometry.aspect_ratio = rhi_common_get_aspect_ratio(content_is_pal, renderer->crop_overscan,
+                                                          content_is_pal ? renderer->initial_scanline_pal :
+                                                                           renderer->initial_scanline,
+                                                          content_is_pal ? renderer->last_scanline_pal :
+                                                                           renderer->last_scanline,
+                                                          aspect_ratio_setting, renderer->display_vram, widescreen_hack,
+                                                          widescreen_hack_aspect_ratio_setting);
+
+      environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
+
+      renderer->frontend_resolution[0] = w;
+      renderer->frontend_resolution[1] = h;
+   }
+
+   /* Bind the output framebuffer provided by the frontend */
+   fbo = beetle_gl_get_current_framebuffer();
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+   glViewport((GLsizei) x, (GLsizei) y, (GLsizei) vp_w, (GLsizei) vp_h);
+}
+
+static bool retro_refresh_variables(gl_renderer *renderer)
+{
+   uint8_t filter            = FILTER_MODE_NEAREST;
+   uint8_t upscaling         = 1;
+   bool display_vram         = false;
+   bool scaled_uv_offset     = true;
+   struct retro_variable var = {0};
+   int crop_overscan         = 1;
+   int32_t image_offset_cycles = 0;
+   unsigned image_crop         = 0;
+   int32_t initial_scanline       = 0;
+   int32_t last_scanline          = 239;
+   int32_t initial_scanline_pal   = 0;
+   int32_t last_scanline_pal      = 287;
+   uint8_t depth                  = 16;
+   enum dither_mode dither_mode   = DITHER_NATIVE;
+   bool rebuild_fb_out;
+   bool reconfigure_frontend;
+   bool byte_color_storage;
+
+   var.key = BEETLE_OPT(renderer_software_fb);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "enabled"))
+         has_software_fb = true;
+      else
+         has_software_fb = false;
+   }
+   else
+      /* If 'BEETLE_OPT(renderer_software_fb)' option is not found, then
+       * we are running in software mode */
+      has_software_fb = true;
+
+   get_variables(&upscaling, &display_vram, &scaled_uv_offset);
+
+   var.key = BEETLE_OPT(crop_overscan);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "disabled") == 0)
+         crop_overscan = 0;
+      else if (strcmp(var.value, "static") == 0)
+         crop_overscan = 1;
+      else if (strcmp(var.value, "smart") == 0)
+         crop_overscan = 2;
+   }
+
+   var.key = BEETLE_OPT(image_offset_cycles);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      image_offset_cycles = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(image_crop);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "disabled") == 0)
+         image_crop = 0;
+      else
+         image_crop = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(initial_scanline);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      initial_scanline = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(last_scanline);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      last_scanline = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(initial_scanline_pal);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      initial_scanline_pal = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(last_scanline_pal);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      last_scanline_pal = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(filter);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "nearest"))
+         filter = FILTER_MODE_NEAREST;
+      else if (!strcmp(var.value, "SABR"))
+         filter = FILTER_MODE_SABR;
+      else if (!strcmp(var.value, "xBR"))
+         filter = FILTER_MODE_XBR;
+      else if (!strcmp(var.value, "bilinear"))
+         filter = FILTER_MODE_BILINEAR;
+      else if (!strcmp(var.value, "3-point"))
+         filter = FILTER_MODE_3POINT;
+      else if (!strcmp(var.value, "JINC2"))
+         filter = FILTER_MODE_JINC2;
+   }
+
+   depth = psx_hdr_active ||
+         psx_internal_color_mode == PSX_INTERNAL_COLOR_32BPP ? 32 : 16;
+
+   var.key = BEETLE_OPT(dither_mode);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "1x(native)"))
+      {
+         dither_mode = DITHER_NATIVE;
+
+      }
+      else if (!strcmp(var.value, "internal resolution"))
+      {
+         dither_mode = DITHER_UPSCALED;
+
+      }
+      else if (!strcmp(var.value, "disabled"))
+      {
+         dither_mode  = DITHER_OFF;
+
+      }
+   }
+
+   gl_read_replace_textures_menu();
+   byte_color_storage = gl_use_byte_color_storage(filter);
+   rebuild_fb_out =
+      upscaling != renderer->internal_upscaling ||
+      depth != renderer->internal_color_depth ||
+      byte_color_storage != renderer->byte_color_storage;
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   if (rebuild_fb_out)
+   {
+      uint32_t native_width  = (uint32_t) VRAM_WIDTH_PIXELS;
+      uint32_t native_height = (uint32_t) VRAM_HEIGHT;
+      uint32_t w             = native_width  * upscaling;
+      uint32_t h             = native_height * upscaling;
+      GLenum texture_storage = GL_RGB5_A1;
+      uint16_t top_left[2]   = {0, 0};
+      uint16_t dimensions[2] = {(uint16_t) VRAM_WIDTH_PIXELS, (uint16_t) VRAM_HEIGHT};
+      gl_texture new_out = {0};
+      gl_texture new_blend = {0};
+      gl_texture new_depth = {0};
+      bool keep_depth = renderer->fb_out_depth.width == w &&
+            renderer->fb_out_depth.height == h;
+
+      /* With the software framebuffer the CPU copy is authoritative and is
+       * re-uploaded below; otherwise pull the GPU's VRAM back first. */
+      if (!has_software_fb && !rhi_intf_read_vram(0, 0, VRAM_WIDTH_PIXELS,
+               VRAM_HEIGHT, GPU_get_vram()))
+      {
+         log_cb(RETRO_LOG_WARN, "Color mode change deferred: VRAM readback failed\n");
+         goto framebuffer_kept;
+      }
+
+      switch (depth)
+      {
+         case 16:
+            texture_storage = byte_color_storage ? GL_RGBA8 : GL_RGB5_A1;
+            break;
+         case 32:
+            texture_storage = GL_RGBA8;
+            break;
+         default:
+            log_cb(RETRO_LOG_ERROR, "Unsupported depth %d\n", depth);
+            exit(EXIT_FAILURE);
+      }
+
+      /* See the initial allocation: HDR pins the storage to fp16
+       * regardless of the Internal Color Depth setting. */
+      if (psx_hdr_active)
+         texture_storage = renderer->fb_out_fp16 ? GL_RGBA16F : GL_RGBA8;
+
+      /* Allocate replacements before releasing a working framebuffer. */
+      if (!gl_texture_init(&new_out, w, h, texture_storage))
+         goto framebuffer_failed;
+      if (byte_color_storage && depth == 16)
+      {
+         if (!gl_texture_init(&new_blend, w, h, GL_RGBA8))
+            goto framebuffer_failed;
+      }
+      if (!keep_depth)
+      {
+         if (!gl_texture_init(&new_depth, w, h, GL_DEPTH24_STENCIL8))
+            goto framebuffer_failed;
+      }
+      glDeleteTextures(1, &renderer->fb_out.id);
+      renderer->fb_out = new_out;
+      renderer->fb_out_internal_format = texture_storage;
+      renderer->byte_color_storage = byte_color_storage;
+      glDeleteTextures(1, &renderer->blend_texture.id);
+      renderer->blend_texture = new_blend;
+      if (!keep_depth)
+      {
+         glDeleteTextures(1, &renderer->fb_out_depth.id);
+         renderer->fb_out_depth = new_depth;
+      }
+
+      gl_framebuffer_configure(renderer->fb_out_fbo, &renderer->fb_out,
+            &renderer->fb_out_depth);
+
+      glDeleteTextures(1, &renderer->fb_feedback_texture.id);
+      renderer->fb_feedback_texture.id     = 0;
+      renderer->fb_feedback_texture.width  = 0;
+      renderer->fb_feedback_texture.height = 0;
+      renderer->fb_feedback_texture_failed = false;
+
+      /* This is a bit wasteful since it'll re-upload the data
+       * to 'fb_texture' even though we haven't touched it but
+       * this code is not very performance-critical anyway. */
+
+      if (renderer)
+         gl_renderer_upload_textures(renderer, top_left, dimensions, GPU_get_vram());
+
+      goto framebuffer_ready;
+
+framebuffer_failed:
+      glDeleteTextures(1, &new_out.id);
+      glDeleteTextures(1, &new_blend.id);
+      glDeleteTextures(1, &new_depth.id);
+      glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
+      log_cb(RETRO_LOG_WARN, "Color mode change deferred: framebuffer allocation failed\n");
+
+framebuffer_kept:
+      /* Keep drawing to the working target with its own settings; the
+       * remaining options still apply. The next option refresh retries. */
+      renderer->fb_rebuild_failed = true;
+      upscaling = renderer->internal_upscaling;
+      depth     = renderer->internal_color_depth;
+      goto framebuffer_done;
+
+framebuffer_ready:
+      renderer->fb_rebuild_failed = false;
+      renderer->color_mode = psx_internal_color_mode;
+
+framebuffer_done:
+      ;
+   }
+   else
+   {
+      renderer->fb_rebuild_failed = false;
+      renderer->color_mode = psx_internal_color_mode;
+   }
+
+   if (dither_mode == DITHER_OFF || psx_hdr_active)
+      gl_draw_buffer_disable_attribute(renderer->command_buffer, "dither");
+   else
+      gl_draw_buffer_enable_attribute(renderer->command_buffer, "dither");
+
+   if (renderer->command_buffer->program)
+   {
+      uint32_t dither_scaling = dither_mode == DITHER_OFF || psx_hdr_active ? 0 :
+            (dither_mode == DITHER_UPSCALED ? 1 : upscaling);
+      uint32_t native_rgb5 = depth == 16 && !psx_hdr_active;
+      uint32_t fixed_point_modulation = !psx_pgxp_color;
+
+      glUseProgram(renderer->command_buffer->program->id);
+      glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "dither_scaling"), dither_scaling);
+      glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms,
+               "fixed_point_modulation"), fixed_point_modulation);
+      glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms,
+               "native_rgb5"), native_rgb5);
+      glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms,
+               "byte_color_storage"), renderer->byte_color_storage);
+   }
+
+   glLineWidth((GLfloat) upscaling);
+
+   /* ---- Shared HD texture replacement/tracking options (same keys and
+    * semantics as the Vulkan renderer's refresh path). ---- */
+   if (renderer->tracker)
+   {
+      bool track_textures   = false;
+      bool dump_textures    = false;
+      bool replace_textures = false;
+      size_t hd_cache_vram_bytes = (size_t)3 * 1024 * 1024 * 1024;
+      size_t hd_cache_ram_bytes  = (size_t)2 * 1024 * 1024 * 1024;
+      bool eager_hd_textures     = true;
+      bool lazy_sync_hd_textures = false;
+      bool hd_dump_mode_rect     = true;
+      bool hd_dump_mode_pages    = false;
+      bool hd_replacement_mode_pages = false;
+      bool hd_replacement_fallback   = false;
+      bool hd_reduce_palette_range   = false;
+      int  hd_texture_dir_mode       = 0;
+      struct retro_core_option_display option_display;
+
+      var.key = BEETLE_OPT(track_textures);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         track_textures = (!strcmp(var.value, "enabled"));
+
+      var.key = BEETLE_OPT(dump_textures);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         dump_textures = (!strcmp(var.value, "enabled"));
+
+      var.key = BEETLE_OPT(replace_textures);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         replace_textures = (!strcmp(var.value, "enabled"));
+
+      var.key = BEETLE_OPT(hd_cache_vram_budget);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         hd_cache_vram_bytes = (size_t)atoi(var.value) * 1024 * 1024;
+
+      var.key = BEETLE_OPT(hd_cache_ram_budget);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         hd_cache_ram_bytes = (size_t)atoi(var.value) * 1024 * 1024;
+
+      var.key = BEETLE_OPT(hd_caching_method);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         /* "eager" (default), "lazy" (async), or "lazy_sync" (synchronous) */
+         eager_hd_textures     = (!strcmp(var.value, "eager"));
+         lazy_sync_hd_textures = (!strcmp(var.value, "lazy_sync"));
+      }
+
+      /* Page-aligned experiment: "upload_rect" (default), "page_aligned", or "both". */
+      var.key = BEETLE_OPT(hd_dump_mode);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         hd_dump_mode_rect  = (!strcmp(var.value, "upload_rect")  || !strcmp(var.value, "both"));
+         hd_dump_mode_pages = (!strcmp(var.value, "page_aligned") || !strcmp(var.value, "both"));
+      }
+
+      var.key = BEETLE_OPT(hd_replacement_mode);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         hd_replacement_mode_pages = (!strcmp(var.value, "page_aligned"));
+
+      var.key = BEETLE_OPT(hd_replacement_fallback);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         hd_replacement_fallback = (!strcmp(var.value, "enabled"));
+
+      var.key = BEETLE_OPT(reduce_palette_range);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         hd_reduce_palette_range = (!strcmp(var.value, "enabled"));
+
+      /* HD Texture Folder: base location for dump/replacement folders. */
+      var.key = BEETLE_OPT(texture_directory);
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         if (!strcmp(var.value, "system"))    hd_texture_dir_mode = 1;
+         else if (!strcmp(var.value, "save")) hd_texture_dir_mode = 2;
+         else                                 hd_texture_dir_mode = 0;
+      }
+
+      /* Dump/Replace Textures only mean anything once tracking is on;
+       * mirror the Vulkan backend's dependent visibility so the option
+       * page reads the same on both hardware renderers. */
+      option_display.visible = track_textures;
+
+      option_display.key = BEETLE_OPT(dump_textures);
+      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+      option_display.key = BEETLE_OPT(replace_textures);
+      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+
+      renderer->texture_tracking_enabled = track_textures;
+
+      /* HD Texture Folder changed (or first non-default read): re-point
+       * the tracker's folder helpers and re-scan replacements from the
+       * new base (the tracker init loaded from the content dir, mode 0). */
+      {
+         static int texture_dir_mode_applied = 0;
+         texture_tracker_set_texture_dir_mode(hd_texture_dir_mode);
+         if (hd_texture_dir_mode != texture_dir_mode_applied)
+         {
+            texture_tracker_reload_textures_from_disk(renderer->tracker);
+            texture_dir_mode_applied = hd_texture_dir_mode;
+         }
+      }
+
+      /* Everything else goes through the shared tracker's config setter.
+       * Replace Textures is edge-applied inside set_config so the in-game
+       * ']' toggle (see texture_tracker_endFrame) isn't re-stamped back to
+       * the menu value on every refresh. */
+      {
+         TextureTrackerConfig ttcfg;
+         ttcfg.dump_enabled           = dump_textures;
+         ttcfg.hd_textures_enabled    = replace_textures;
+         ttcfg.eager_textures         = eager_hd_textures;
+         ttcfg.lazy_sync              = lazy_sync_hd_textures;
+         ttcfg.dump_mode_rect         = hd_dump_mode_rect;
+         ttcfg.dump_mode_pages        = hd_dump_mode_pages;
+         ttcfg.replacement_mode_pages = hd_replacement_mode_pages;
+         ttcfg.replacement_fallback   = hd_replacement_fallback;
+         ttcfg.reduce_palette_range   = hd_reduce_palette_range;
+         texture_tracker_set_config(renderer->tracker, &ttcfg);
+      }
+      texture_tracker_set_cache_budgets(renderer->tracker,
+            hd_cache_ram_bytes, hd_cache_vram_bytes);
+      /* Auto-create the dump/replacement folders once enabled + a game is
+       * loaded (after the config above so it picks the right rect/pages
+       * folder). */
+      texture_tracker_ensure_directories(renderer->tracker,
+            dump_textures, replace_textures);
+   }
+
+   /* If the scaling factor has changed the frontend should be
+   *  reconfigured. We can't do that here because it could
+   *  destroy the OpenGL context which would destroy 'this' */
+   reconfigure_frontend =
+      renderer->internal_upscaling != upscaling ||
+      renderer->display_vram != display_vram ||
+      renderer->filter_type != filter;
+
+   renderer->internal_upscaling     = upscaling;
+   renderer->display_vram           = display_vram;
+   renderer->scaled_uv_offset       = scaled_uv_offset;
+   renderer->internal_color_depth   = depth;
+   renderer->filter_type            = filter;
+   renderer->crop_overscan          = crop_overscan;
+   renderer->image_offset_cycles    = image_offset_cycles;
+   renderer->image_crop             = image_crop;
+   renderer->initial_scanline       = initial_scanline;
+   renderer->last_scanline          = last_scanline;
+   renderer->initial_scanline_pal   = initial_scanline_pal;
+   renderer->last_scanline_pal      = last_scanline_pal;
+
+   return reconfigure_frontend;
+}
+
+static void vertex_preprocessing(
+      gl_renderer *renderer,
+      gl_command_vertex *v,
+      unsigned count,
+      GLenum mode,
+      gl_semi_transparency_mode stm,
+      bool mask_test,
+      bool set_mask,
+      HdTextureHandle hd)
+{
+   bool is_semi_transparent;
+   bool is_textured;
+   bool is_opaque;
+   bool color_blend;
+   bool buffer_full;
+   bool index_full;
+   bool unmapped;
+
+   if (!renderer)
+      return;
+
+   is_semi_transparent = v[0].semi_transparent == 1;
+   is_textured         = v[0].texture_blend_mode != 0;
+   /* Filtered draws retain byte precision and can use fixed blending.
+    * Positive additive batches receive a cheap ceiling pass below. Ordinary
+    * draws still need RGB5 destination/result truncation. Nearest HD draws
+    * can fall back per pixel; masked draws retain their existing exact path. */
+   color_blend = renderer->byte_color_storage &&
+         renderer->internal_color_depth == 16 && is_semi_transparent &&
+         !(is_textured && renderer->filter_type != FILTER_MODE_NEAREST &&
+           !mask_test);
+   /* Textured semi-transparent polys can contain opaque texels (when
+    * bit 15 of the color is set to 0). Therefore they're drawn twice,
+    * once for the opaque texels and once for the semi-transparent
+    * ones. Only untextured semi-transparent triangles don't need to be
+    * drawn as opaque. */
+   is_opaque   = !is_semi_transparent || is_textured;
+   buffer_full = gl_draw_buffer_remaining_capacity(renderer->command_buffer) < count;
+   /* Index space is tracked separately from vertex space: a quad
+    * occupies four vertices but six indices, so the two run out at
+    * different times. Charge the primitive the same 3/2 worst case
+    * INDEX_BUFFER_LEN is sized on, which covers the quad exactly and
+    * over-reserves slightly for triangles and lines. */
+   index_full  = (renderer->vertex_index_pos + ((count * 3 + 1) / 2))
+                 > INDEX_BUFFER_LEN;
+   /* An unmapped command buffer accepts no vertices, so map_index
+    * stays where it is and neither the capacity test above nor the
+    * is_empty gate below can ever fire again. Route into
+    * gl_renderer_draw regardless so its remap path runs and the index
+    * cursor is reset; without this the index writes in push_primitive
+    * and rhi_gl_push_quad accumulate past INDEX_BUFFER_LEN and run
+    * off the end of renderer->vertex_indices into the members that
+    * follow it. */
+   unmapped    = (renderer->command_buffer->map == NULL);
+
+   if (unmapped)
+      gl_renderer_draw(renderer);
+   else if (buffer_full || index_full)
+   {
+      if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+         gl_renderer_draw(renderer);
+   }
+
+   {
+      int16_t z = renderer->primitive_ordering;
+      unsigned i;
+      renderer->primitive_ordering += 1;
+
+      for (i = 0; i < count; i++)
+      {
+         v[i].position[2] = z;
+         v[i].texture_window[0] = renderer->tex_x_mask;
+         v[i].texture_window[1] = renderer->tex_x_or;
+         v[i].texture_window[2] = renderer->tex_y_mask;
+         v[i].texture_window[3] = renderer->tex_y_or;
+      }
+   }
+
+   if (renderer->batches.count == 0
+       || color_blend
+       || mode != renderer->command_draw_mode
+       || is_opaque != renderer->opaque
+       || (is_semi_transparent &&
+           stm != renderer->semi_transparency_mode)
+       || renderer->set_mask != set_mask
+       || renderer->force_mask != set_mask
+       || renderer->mask_test != mask_test
+       || hd_handle_ne(&hd, &renderer->hd_handle))
+   {
+      struct gl_primitive_batch batch;
+
+      if (renderer->batches.count > 0)
+      {
+         struct gl_primitive_batch *last = &renderer->batches.items[renderer->batches.count - 1];
+         last->count = renderer->vertex_index_pos - last->first;
+      }
+      batch.opaque = is_opaque;
+      batch.draw_mode = mode;
+      batch.transparency_mode = stm;
+      batch.set_mask = set_mask;
+      batch.force_mask = set_mask;
+      batch.mask_test = mask_test;
+      batch.first = renderer->vertex_index_pos;
+      batch.count = 0;
+      batch.hd = hd;
+      batch.color_blend = color_blend;
+      memset(batch.blend_rect, 0, sizeof(batch.blend_rect));
+      if (color_blend)
+      {
+         unsigned i;
+         gl_primitive_draw_rect(renderer, v, count, batch.blend_rect);
+         for (i = 0; i < 4; i++)
+            batch.blend_rect[i] *= renderer->internal_upscaling;
+      }
+      gl_primitive_batch_vec_push(&renderer->batches, &batch);
+
+      renderer->semi_transparency_mode = stm;
+      renderer->command_draw_mode = mode;
+      renderer->opaque = is_opaque;
+      renderer->set_mask = set_mask;
+      renderer->force_mask = set_mask;
+      renderer->mask_test = mask_test;
+      renderer->hd_handle = hd;
+   }
+}
+
+static void vertex_add_blended_pass(
+      gl_renderer *renderer, int vertex_index)
+{
+   if (renderer->batches.count > 0)
+   {
+      struct gl_primitive_batch *last = &renderer->batches.items[renderer->batches.count - 1];
+      struct gl_primitive_batch batch;
+
+      last->count = renderer->vertex_index_pos - last->first;
+
+      batch.opaque = false;
+      batch.draw_mode = last->draw_mode;
+      batch.transparency_mode = last->transparency_mode;
+      batch.set_mask = true;
+      batch.force_mask = last->force_mask;
+      batch.mask_test = last->mask_test;
+      batch.first = vertex_index;
+      batch.count = 0;
+      batch.hd = last->hd;
+      batch.color_blend = last->color_blend;
+      memcpy(batch.blend_rect, last->blend_rect, sizeof(batch.blend_rect));
+      gl_primitive_batch_vec_push(&renderer->batches, &batch);
+
+      renderer->opaque = false;
+      renderer->set_mask = true;
+   }
+}
+
+/* Native planes replace colour/fog only on the provoking (last) vertex.
+ * gl_normalize_inherited_state enforces this on desktop GL; ES uses the
+ * same convention. Triangle v[2] therefore supplies the flat planes. The
+ * original packed colour keeps its smooth fallback value available to the
+ * other triangle in a quad. Enhanced geometry/colour never uses these lanes. */
+static void gl_set_native_color_plane(gl_command_vertex *v,
+      const uint32_t *planes, uint32_t color)
+{
+   memcpy(v->color, planes, 3 * sizeof(uint32_t));
+   memcpy(v->fog, planes + 3, 3 * sizeof(uint32_t));
+   memcpy(v->fog + 3, &color, sizeof(color));
+   v->native_flags |= 1;
+}
+
+/* Coverage depends on geometry, not color depth or texture sampling. Match
+ * Vulkan's original-grid selection without applying it to PGXP or upscaling. */
+static bool gl_native_positions(const gl_renderer *renderer,
+      const gl_command_vertex *v, unsigned count, int32_t *x, int32_t *y)
+{
+   unsigned i;
+   if (renderer->internal_upscaling != 1 || psx_pgxp_mode != 0)
+      return false;
+   for (i = 0; i < count; i++)
+   {
+      float px = v[i].position[0] + renderer->config.draw_offset[0];
+      float py = v[i].position[1] + renderer->config.draw_offset[1];
+      if (v[i].position[3] != 1.0f ||
+          !(px >= -32768.0f && px <= 32767.0f) ||
+          !(py >= -32768.0f && py <= 32767.0f))
+         return false;
+      x[i] = (int32_t)px;
+      y[i] = (int32_t)py;
+      if ((float)x[i] != px || (float)y[i] != py)
+         return false;
+   }
+   return true;
+}
+
+/* Integer color/UV interpolation retains its narrower shading policy.
+ * Native line coverage is independent of these restrictions. RGB5 blending
+ * also has its own target-format gate in gl_renderer_draw. */
+static bool gl_native_shading(const gl_renderer *renderer, HdTextureHandle hd)
+{
+   return renderer->internal_color_depth == 16 && !renderer->fb_out_fp16 &&
+         !psx_pgxp_color && renderer->filter_type == FILTER_MODE_NEAREST &&
+         hd_handle_is_none(&hd);
+}
+
+/* Queued GP0 colours and draw-offset-adjusted positions are authoritative.
+ * The wrapped 8.12 planes travel with the primitive; no side state survives
+ * a flush, reset or savestate restore. Flat colours need no plane. */
+static void gl_build_native_triangle_interpolants(gl_renderer *renderer,
+      gl_command_vertex *v, const uint32_t *colors, HdTextureHandle hd,
+      uint32_t uv_offset)
+{
+   int32_t x[3], y[3];
+   int64_t denom;
+   uint32_t planes[6];
+   unsigned i, c, anchor;
+   if (!gl_native_shading(renderer, hd) ||
+       !gl_native_positions(renderer, v, 3, x, y))
+      return;
+   for (i = 0; i < 3; i++)
+      v[i].native_flags |= 8;
+   denom = (int64_t)(x[1] - x[0]) * (y[2] - y[1]) -
+         (int64_t)(x[2] - x[1]) * (y[1] - y[0]);
+   if (!denom)
+      return;
+   anchor = rhi_triangle_anchor(x);
+   if (v[0].texture_blend_mode != 0)
+   {
+      for (c = 0; c < 2; c++)
+      {
+         int32_t value[3];
+         for (i = 0; i < 3; i++)
+            /* The decoder biases flipped quads for floating interpolation.
+             * Native 8.12 planes must start from the original command UVs. */
+            value[i] = (int32_t)v[i].texture_coord[c] -
+                  (int32_t)(uint16_t)(uv_offset >> (c * 16));
+         rhi_triangle_interpolant(planes + c * 2,
+               x, y, value, denom, anchor);
+      }
+      {
+         /* As in Vulkan, signed integral XY share one word; Y/W carry
+          * the first UV plane. Depth and original UVs remain untouched. */
+         uint32_t xy = (uint16_t)(int32_t)v[2].position[0] |
+               ((uint32_t)(uint16_t)(int32_t)v[2].position[1] << 16);
+         memcpy(v[2].position, &xy, sizeof(xy));
+         memcpy(v[2].position + 1, planes, sizeof(uint32_t));
+         memcpy(v[2].position + 3, planes + 1, sizeof(uint32_t));
+         memcpy(v[2].native_uv, planes + 2, sizeof(v[2].native_uv));
+      }
+      v[2].native_flags |= 2;
+   }
+   if (v[0].texture_blend_mode == 1 ||
+       (colors[0] == colors[1] && colors[0] == colors[2]))
+      return;
+   for (c = 0; c < 3; c++)
+   {
+      int32_t value[3];
+      for (i = 0; i < 3; i++)
+         value[i] = (colors[i] >> (c * 8)) & 255;
+      rhi_triangle_interpolant(planes + c * 2, x, y, value, denom, anchor);
+   }
+   gl_set_native_color_plane(v + 2, planes, colors[2]);
+}
+
+static void push_primitive(
+      gl_renderer *renderer,
+      gl_command_vertex *v,
+      unsigned count,
+      const uint32_t *colors,
+      GLenum mode,
+      gl_semi_transparency_mode stm,
+      bool mask_test,
+      bool set_mask)
+{
+   bool is_semi_transparent;
+   bool is_textured;
+   unsigned index;
+   unsigned index_pos;
+   unsigned i;
+
+   if (!renderer)
+      return;
+
+   is_semi_transparent = v[0].semi_transparent   == 1;
+   is_textured         = v[0].texture_blend_mode != 0;
+
+   {
+      /* Per-primitive HD replacement query. Even when no replacement is
+       * bound this drives dumping + prefetch (Vulkan does the same from
+       * renderer_build_attribs). Untextured primitives short-circuit to
+       * a none handle inside the query. */
+      HdTextureHandle hd = gl_tt_query_hd(renderer, v);
+      if (colors && count == 3)
+      {
+         gl_build_native_triangle_interpolants(renderer, v, colors, hd, 0);
+         gl_vram_sync_primitive(renderer, v, count, 0);
+      }
+      vertex_preprocessing(renderer, v, count, mode, stm, mask_test, set_mask, hd);
+   }
+
+   index     = gl_draw_buffer_next_index(renderer->command_buffer);
+   index_pos = renderer->vertex_index_pos;
+
+#ifdef DEBUG
+   /* vertex_preprocessing reserves the index space for this primitive. */
+   assert(renderer->vertex_index_pos + count <= INDEX_BUFFER_LEN);
+#endif
+
+   for (i = 0; i < count; i++)
+      renderer->vertex_indices[renderer->vertex_index_pos++] = index + i;
+
+   /* Add transparent pass if needed */
+   if (is_semi_transparent && is_textured)
+      vertex_add_blended_pass(renderer, index_pos);
+
+   gl_draw_buffer_push_slice(renderer->command_buffer, v, count,
+         sizeof(gl_command_vertex)
+         );
+}
+
+/* Vertex-attribute layouts.  The original code expressed these as
+ * 'static std::vector<gl_attribute> T::attributes()' factory methods;
+ * we drop them in favour of file-static const arrays plus small
+ * accessor helpers since the layouts never change at runtime. */
+static const struct gl_attribute gl_command_vertex_attribs[] = {
+   { "position",           offsetof(gl_command_vertex, position),           GL_UNSIGNED_INT,   4 },
+   { "color",              offsetof(gl_command_vertex, color),              GL_UNSIGNED_INT,   3 },
+   { "fog",                offsetof(gl_command_vertex, fog),                GL_UNSIGNED_INT,   4 },
+   { "texture_coord",      offsetof(gl_command_vertex, texture_coord),      GL_UNSIGNED_SHORT, 2 },
+   { "texture_page",       offsetof(gl_command_vertex, texture_page),       GL_UNSIGNED_SHORT, 2 },
+   { "clut",               offsetof(gl_command_vertex, clut),               GL_UNSIGNED_SHORT, 2 },
+   { "texture_blend_mode", offsetof(gl_command_vertex, texture_blend_mode), GL_UNSIGNED_BYTE,  1 },
+   { "depth_shift",        offsetof(gl_command_vertex, depth_shift),        GL_UNSIGNED_BYTE,  1 },
+   { "dither",             offsetof(gl_command_vertex, dither),             GL_UNSIGNED_BYTE,  1 },
+   { "semi_transparent",   offsetof(gl_command_vertex, semi_transparent),   GL_UNSIGNED_BYTE,  1 },
+   { "texture_window",     offsetof(gl_command_vertex, texture_window),     GL_UNSIGNED_BYTE,  4 },
+   { "framebuffer_feedback",
+      offsetof(gl_command_vertex, framebuffer_feedback), GL_UNSIGNED_BYTE, 1 },
+   { "palette_cached",
+      offsetof(gl_command_vertex, palette_cached), GL_UNSIGNED_BYTE, 1 },
+   { "native_flags",
+      offsetof(gl_command_vertex, native_flags), GL_UNSIGNED_BYTE, 1 },
+   { "native_uv", offsetof(gl_command_vertex, native_uv), GL_UNSIGNED_INT, 2 },
+   { "texture_limits",     offsetof(gl_command_vertex, texture_limits),     GL_UNSIGNED_SHORT, 4 }
+};
+
+static const struct gl_attribute gl_output_vertex_attribs[] = {
+   { "position", offsetof(gl_output_vertex, position), GL_FLOAT,          2 },
+   { "fb_coord", offsetof(gl_output_vertex, fb_coord), GL_UNSIGNED_SHORT, 2 }
+};
+
+
+static const struct gl_attribute *gl_command_vertex_attributes(size_t *count)
+{
+   *count = sizeof(gl_command_vertex_attribs) / sizeof(gl_command_vertex_attribs[0]);
+   return gl_command_vertex_attribs;
+}
+
+static const struct gl_attribute *gl_output_vertex_attributes(size_t *count)
+{
+   *count = sizeof(gl_output_vertex_attribs) / sizeof(gl_output_vertex_attribs[0]);
+   return gl_output_vertex_attribs;
+}
+
+
+static void cleanup_gl_state(void)
+{
+   /* Cleanup OpenGL context before returning to the frontend.
+    * Must reset ALL state that the core modifies, otherwise
+    * the frontend's presentation pass may render incorrectly. */
+   glDisable(GL_BLEND);
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_STENCIL_TEST);
+   glBlendColor(0.0, 0.0, 0.0, 0.0);
+   glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+   glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glDepthMask(GL_TRUE);
+   glStencilMask(0xFF);
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, 0);
+   glUseProgram(0);
+   glBindVertexArray(0);
+   glBindBuffer(GL_ARRAY_BUFFER, 0);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+   glLineWidth(1.0);
+   glClearColor(0.0, 0.0, 0.0, 0.0);
+}
+
+/* Resolve a function via the libretro frontend's get_proc_address,
+ * trying the core name first then a NULL-terminated list of common
+ * extension suffixes (OES, EXT, ARB, NV, ...).  Returns the first
+ * non-NULL pointer or NULL if nothing matched. */
+static retro_proc_address_t gl_caps_resolve(
+      retro_get_proc_address_t get_proc,
+      const char *base_name,
+      const char *const *suffixes)
+{
+   retro_proc_address_t ptr;
+   char buf[128];
+   const char *s;
+   size_t base_len;
+   size_t i;
+
+   if (!get_proc || !base_name)
+      return NULL;
+
+   ptr = get_proc(base_name);
+   if (ptr)
+      return ptr;
+
+   if (!suffixes)
+      return NULL;
+
+   base_len = strlen(base_name);
+   if (base_len + 8 >= sizeof(buf))
+      return NULL;
+
+   for (i = 0; (s = suffixes[i]) != NULL; i++)
+   {
+      size_t s_len;
+      s_len = strlen(s);
+      if (base_len + s_len + 1 > sizeof(buf))
+         continue;
+      memcpy(buf, base_name, base_len);
+      memcpy(buf + base_len, s, s_len);
+      buf[base_len + s_len] = '\0';
+      ptr = get_proc(buf);
+      if (ptr)
+         return ptr;
+   }
+
+   return NULL;
+}
+
+/* Parse "X.Y" out of a version string fragment.  Accepts a
+ * leading "OpenGL ES " prefix.  Stores results into *major /
+ * *minor; on parse failure leaves them untouched. */
+static void gl_caps_parse_version(const char *version,
+      int *major, int *minor)
+{
+   const char *p;
+   int mj = 0;
+   int mn = 0;
+
+   if (!version)
+      return;
+
+   p = version;
+   if (strncmp(p, "OpenGL ES", 9) == 0)
+   {
+      p += 9;
+      while (*p == ' ')
+         p++;
+   }
+
+   while (*p >= '0' && *p <= '9')
+   {
+      mj = mj * 10 + (*p - '0');
+      p++;
+   }
+   if (*p != '.')
+      return;
+   p++;
+   while (*p >= '0' && *p <= '9')
+   {
+      mn = mn * 10 + (*p - '0');
+      p++;
+   }
+
+   *major = mj;
+   *minor = mn;
+}
+
+/* Initialise gl_caps once a real GL context is current.
+ * Must be called after rglgen_resolve_symbols(...) so the
+ * baseline GL function-pointer table is populated. */
+static void gl_caps_init(void)
+{
+   /* Suffix lists ordered most-likely-first.  ARB before EXT
+    * because ARB tends to be the canonical desktop extension;
+    * OES/EXT before NV because vendor-prefixed are last resort. */
+   static const char *const copy_image_suffixes[] = {
+      "ARB", "OES", "EXT", "NV", NULL
+   };
+   static const char *const blit_framebuffer_suffixes[] = {
+      "EXT", "NV", "ANGLE", NULL
+   };
+
+   retro_get_proc_address_t get_proc = NULL;
+   const GLubyte *gl_version_str;
+   const GLubyte *gl_vendor_str;
+   const GLubyte *gl_renderer_str;
+
+   memset(&gl_caps, 0, sizeof(gl_caps));
+
+   /* Strings: safe to query before anything else. */
+   gl_version_str  = glGetString(GL_VERSION);
+   gl_vendor_str   = glGetString(GL_VENDOR);
+   gl_renderer_str = glGetString(GL_RENDERER);
+
+   gl_caps.version_string = gl_version_str  ? (const char *)gl_version_str  : "(unknown)";
+   gl_caps.vendor         = gl_vendor_str   ? (const char *)gl_vendor_str   : "(unknown)";
+   gl_caps.renderer       = gl_renderer_str ? (const char *)gl_renderer_str : "(unknown)";
+
+   /* Detect API family from the version string.  GL_VERSION on
+    * any GLES context begins with "OpenGL ES "; desktop versions
+    * begin with the version number directly. */
+   if (gl_version_str
+         && strncmp((const char *)gl_version_str, "OpenGL ES", 9) == 0)
+      gl_caps.api = GL_API_GLES;
+   else
+      gl_caps.api = GL_API_DESKTOP;
+
+   /* Parse "X.Y" out of GL_VERSION.  String parse rather than
+    * glGetIntegerv(GL_MAJOR_VERSION) because the latter only
+    * works on GL 3.0+ / GLES 3.0+ contexts. */
+   gl_caps_parse_version(gl_caps.version_string,
+         &gl_caps.version_major, &gl_caps.version_minor);
+   gl_caps.version_packed =
+        ((gl_caps.version_major & 0xFF) << 8)
+      |  (gl_caps.version_minor & 0xFF);
+
+   /* Profile detection.  GL_CONTEXT_PROFILE_MASK is a 3.2+ desktop
+    * enum and is not defined in any GLES header; GLES has no
+    * profile distinction so we don't need it there anyway. */
+   if (gl_caps.api == GL_API_GLES)
+      gl_caps.profile = GL_PROFILE_ES;
+#if defined(GL_CONTEXT_PROFILE_MASK) && defined(GL_CONTEXT_CORE_PROFILE_BIT)
+   else if (gl_caps.version_packed >= 0x0302)
+   {
+      GLint mask = 0;
+      glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &mask);
+      if (mask & GL_CONTEXT_CORE_PROFILE_BIT)
+         gl_caps.profile = GL_PROFILE_CORE;
+      else
+         gl_caps.profile = GL_PROFILE_LEGACY;
+   }
+#endif
+   else
+      gl_caps.profile = GL_PROFILE_LEGACY;
+
+   /* Pull the libretro frontend's symbol resolver.  Without it
+    * we can't probe for runtime-loaded extension entry points;
+    * leave function pointers NULL and let call sites fall back. */
+   if (hw_render.get_proc_address)
+      get_proc = hw_render.get_proc_address;
+
+   if (get_proc)
+   {
+      gl_caps.fp_glBlitFramebuffer =
+         (PFN_BEETLE_GL_BLITFRAMEBUFFER)gl_caps_resolve(
+            get_proc, "glBlitFramebuffer", blit_framebuffer_suffixes);
+
+      gl_caps.fp_glCopyImageSubData =
+         (PFN_BEETLE_GL_COPYIMAGESUBDATA)gl_caps_resolve(
+            get_proc, "glCopyImageSubData", copy_image_suffixes);
+
+      if (gl_caps.api == GL_API_DESKTOP && gl_caps.version_packed >= 0x0302)
+         gl_caps.fp_glProvokingVertex =
+            (PFN_BEETLE_GL_PROVOKINGVERTEX)gl_caps_resolve(
+               get_proc, "glProvokingVertex", NULL);
+   }
+
+   log_cb(RETRO_LOG_INFO,
+         "[gl_caps] %s | %s | %s\n",
+         gl_caps.vendor, gl_caps.renderer, gl_caps.version_string);
+   log_cb(RETRO_LOG_INFO,
+         "[gl_caps] api=%s profile=%s version=%d.%d (packed 0x%04x)\n",
+         gl_caps.api == GL_API_GLES ? "GLES"
+            : gl_caps.api == GL_API_DESKTOP ? "Desktop" : "?",
+         gl_caps.profile == GL_PROFILE_CORE   ? "Core"
+            : gl_caps.profile == GL_PROFILE_ES     ? "ES"
+            : gl_caps.profile == GL_PROFILE_LEGACY ? "Legacy/Compat" : "?",
+         gl_caps.version_major, gl_caps.version_minor,
+         gl_caps.version_packed);
+   log_cb(RETRO_LOG_INFO,
+         "[gl_caps] glBlitFramebuffer:  %s\n",
+         gl_caps.fp_glBlitFramebuffer  ? "available" : "NOT available");
+   log_cb(RETRO_LOG_INFO,
+         "[gl_caps] glCopyImageSubData: %s\n",
+         gl_caps.fp_glCopyImageSubData ? "available" : "NOT available");
+
+   /* Floor check.  Beetle's GL renderer needs VAOs (3.0+ core),
+    * separate read/draw FBO bindings (3.0+), glMapBufferRange
+    * (3.0+), glDrawBuffers in core (3.0+), unsigned-integer
+    * uniforms (3.0+), and several other 3.0+ features.  Below
+    * GL 3.0 / GLES 3.0 the renderer cannot function, so we mark
+    * the context unsupported and gl_context_reset will skip
+    * activating the renderer.  Logged as ERROR so the user sees
+    * exactly why nothing's drawing.
+    *
+    * Exception: a parsed version of 0.0 means the version string
+    * was unrecognised - rather than refuse outright we let it
+    * through and let the call sites fail naturally, since this
+    * usually indicates a context-detection oddity rather than a
+    * genuinely-too-old driver. */
+   if (gl_caps.version_packed != 0 && gl_caps.version_packed < 0x0300)
+   {
+      gl_caps.unsupported = 1;
+      log_cb(RETRO_LOG_ERROR,
+            "[gl_caps] GL/GLES version %d.%d is below the supported "
+            "floor of 3.0.  This renderer requires GL 3.0+ or GLES "
+            "3.0+ features (VAOs, separate read/draw FBOs, "
+            "glMapBufferRange, unsigned uniforms, ...).  The "
+            "renderer will not be activated; expect a black "
+            "screen or no output.\n",
+            gl_caps.version_major, gl_caps.version_minor);
+   }
+
+   /* Compute availability. Core in GL 4.3 and GLES 3.1; below that a
+    * driver may still expose ARB_compute_shader, but that extension
+    * does not carry the image-store and shared-memory guarantees the
+    * trap relies on in one piece, so only the core versions count
+    * here. Logged either way: which path the trap took is otherwise
+    * invisible from a screenshot, and hanging dots look like a bug
+    * rather than a documented fallback. */
+#if defined(RHI_GL_HAVE_COMPUTE)
+   if (gl_caps.api == GL_API_GLES)
+      gl_caps.has_compute = (gl_caps.version_packed >= 0x0301);
+   else
+      gl_caps.has_compute = (gl_caps.version_packed >= 0x0403);
+#else
+   /* Built against headers with no compute at all - a runtime version check
+    * would be answering a question this binary cannot act on. */
+   gl_caps.has_compute = 0;
+#endif
+
+   if (log_cb && !gl_caps.unsupported)
+      log_cb(RETRO_LOG_INFO,
+            "[gl_caps] compute shaders: %s (analog chroma trap %s)\n",
+            gl_caps.has_compute ? "yes" : "no",
+            gl_caps.has_compute ? "available"
+                                : "unavailable - composite/RF will show "
+                                  "hanging dots");
+}
+
+/*
+ * Dispatcher for the deferred-op queue. Invoked once per queued op
+ * during gl_context_reset's drain. Each case calls back into the
+ * matching rhi_gl_<op>() entry point with the captured arguments. By
+ * drain time the renderer is up, so the entry point's "renderer present"
+ * branch executes and actually performs the work that was originally
+ * dropped. The `user` parameter is unused - we don't need any extra
+ * state because the entry points already read everything they need from
+ * the file-static `static_renderer`.
+ */
+static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op)
+{
+   (void)user;
+   if (!op)
+      return;
+
+   switch (op->kind)
+   {
+      case RHI_DEFER_SET_TEX_WINDOW:
+         rhi_gl_set_tex_window(op->u.set_tex_window.tww,
+                               op->u.set_tex_window.twh,
+                               op->u.set_tex_window.twx,
+                               op->u.set_tex_window.twy);
+         break;
+      case RHI_DEFER_SET_DRAW_OFFSET:
+         rhi_gl_set_draw_offset(op->u.set_draw_offset.x,
+                                op->u.set_draw_offset.y);
+         break;
+      case RHI_DEFER_SET_DRAW_AREA:
+         rhi_gl_set_draw_area(op->u.set_draw_area.x0,
+                              op->u.set_draw_area.y0,
+                              op->u.set_draw_area.x1,
+                              op->u.set_draw_area.y1);
+         break;
+      case RHI_DEFER_SET_VRAM_FRAMEBUFFER_COORDS:
+         rhi_gl_set_vram_framebuffer_coords(
+               op->u.set_vram_framebuffer_coords.xstart,
+               op->u.set_vram_framebuffer_coords.ystart);
+         break;
+      case RHI_DEFER_SET_HORIZONTAL_DISPLAY_RANGE:
+         rhi_gl_set_horizontal_display_range(
+               op->u.set_horizontal_display_range.x1,
+               op->u.set_horizontal_display_range.x2);
+         break;
+      case RHI_DEFER_SET_VERTICAL_DISPLAY_RANGE:
+         rhi_gl_set_vertical_display_range(
+               op->u.set_vertical_display_range.y1,
+               op->u.set_vertical_display_range.y2);
+         break;
+      case RHI_DEFER_SET_DISPLAY_MODE:
+         rhi_gl_set_display_mode(op->u.set_display_mode.depth_24bpp,
+                                 op->u.set_display_mode.is_pal,
+                                 op->u.set_display_mode.is_480i,
+                                 op->u.set_display_mode.width_mode);
+         break;
+      case RHI_DEFER_LOAD_IMAGE:
+         rhi_gl_load_image(op->u.load_image.x,
+                           op->u.load_image.y,
+                           op->u.load_image.w,
+                           op->u.load_image.h,
+                           op->u.load_image.vram,
+                           op->u.load_image.mask_test,
+                           op->u.load_image.set_mask);
+         break;
+      case RHI_DEFER_TOGGLE_DISPLAY:
+         rhi_gl_toggle_display(op->u.toggle_display.status);
+         break;
+   }
+}
+
+static void gl_context_reset(void)
+{
+   /* Resolve the GL function-pointer table for this context.
+    * rglgen_resolve_symbols walks the rglgen-generated symbol
+    * declarations and populates each __rglgen_glFoo via the
+    * frontend's get_proc_address callback.  Must run before any
+    * gl call that goes through one of those wrappers. */
+   if (hw_render.get_proc_address)
+      rglgen_resolve_symbols(hw_render.get_proc_address);
+
+   /* Detect what the running driver actually supports.  Must run
+    * after the symbol table is populated and before any
+    * feature-gated code path is taken. */
+   gl_caps_init();
+
+   gl_normalize_inherited_state();
+
+   /* If the version is below our floor, leave the renderer in
+    * GL_STATE_INVALID so all subsequent rhi_gl_* entry points
+    * short-circuit.  The user sees nothing render but gets an
+    * unambiguous error in the log explaining why. */
+   if (gl_caps.unsupported)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[gl_context_reset] aborting renderer init due to "
+            "unsupported GL/GLES version (see [gl_caps] error "
+            "above).\n");
+      return;
+   }
+
+   /* A context_reset may arrive while a renderer from a previous reset is
+    * still live: some frontends fire it on surface/window recreation without
+    * an intervening context_destroy. Allocating over the existing pointer
+    * would orphan that renderer along with every GL object, texture tracker
+    * and draw buffer it owns. Tear it down first so reset is idempotent,
+    * mirroring vk_context_reset. */
+   if (static_renderer.state_data)
+   {
+      gl_renderer_free(static_renderer.state_data);
+      free(static_renderer.state_data);
+      static_renderer.state_data = NULL;
+      static_renderer.state      = GL_STATE_INVALID;
+      static_renderer.inited     = false;
+   }
+
+   static_renderer.state_data = (gl_renderer *)calloc(1, sizeof(gl_renderer));
+   if (!static_renderer.state_data)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[gl_context_reset] OOM allocating gl_renderer\n");
+      return;
+   }
+   /* Initialise the dynamic batch vec.  gl_renderer_new doesn't
+    * touch it; the per-frame draw code is the first thing to push
+    * into it.  Must be init'd before any push or free or we'd
+    * be reading garbage. */
+   gl_primitive_batch_vec_init(&static_renderer.state_data->batches);
+
+   if (gl_renderer_new(static_renderer.state_data, persistent_config))
+   {
+      static_renderer.inited = true;
+      static_renderer.state  = GL_STATE_VALID;
+
+      GPU_RestoreStateP1(true, false);
+      GPU_RestoreStateP2(true);
+      GPU_RestoreStateP3();
+
+      /* Replay any rhi_gl_* state-sets / VRAM uploads / display
+       * toggles that arrived between rhi_gl_open's SET_HW_RENDER
+       * and this context_reset firing. By this point the renderer
+       * is live, so every push the dispatcher makes lands on a
+       * real GL renderer rather than getting silently dropped.
+       *
+       * Drained AFTER GPU_RestoreStateP3 so the deferred ops layer
+       * on top of the freshly-restored P3 baseline; this matches
+       * the Vulkan backend, which also drains its queue after
+       * the renderer has taken its initial state snapshot. */
+      if (rhi_defer_count(&gl_defer_queue) > 0)
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[gl_context_reset] replaying %u deferred RHI op(s)\n",
+               (unsigned)rhi_defer_count(&gl_defer_queue));
+         rhi_defer_drain(&gl_defer_queue, gl_defer_dispatch, NULL);
+      }
+   }
+   else
+   {
+      log_cb(RETRO_LOG_WARN, "[gl_context_reset] gl_renderer_new failed. State will be invalid.\n");
+      /* Tear down anything gl_renderer_new acquired before failing
+       * so we don't leak GL resources or heap. */
+      gl_renderer_free(static_renderer.state_data);
+      free(static_renderer.state_data);
+      static_renderer.state_data = NULL;
+      /* Every sibling failure branch marks the state INVALID; this one
+       * did not, which left "state VALID, data NULL" behind a failed
+       * shader build -- prepare_frame then demoted to RHI_SOFTWARE, and
+       * GPU_Update walked the software line renderer over surfaces a HW
+       * session never allocates: the reported boot SEGV at
+       * GPU_Update+775. INVALID makes every rhi_gl_* entry point refuse
+       * cleanly instead. */
+      static_renderer.state      = GL_STATE_INVALID;
+
+      /* Drop any pending deferred ops too: with no renderer they
+       * can never be replayed, and surviving across a failed
+       * context_reset would let them leak into a future, unrelated
+       * reset attempt. */
+      rhi_defer_clear(&gl_defer_queue);
+   }
+}
+
+static void gl_context_destroy(void)
+{
+   if (static_renderer.state_data)
+   {
+      gl_renderer_free(static_renderer.state_data);
+      free(static_renderer.state_data);
+   }
+
+   static_renderer.state_data = NULL;
+   static_renderer.state      = GL_STATE_INVALID;
+   static_renderer.inited     = false;
+
+   /* Free the deferred-op storage. A new context_reset would start
+    * from an empty queue anyway; carrying allocations across a
+    * destroy would just hold memory we have no use for. */
+   rhi_defer_clear(&gl_defer_queue);
+}
+
+static struct retro_system_av_info get_av_info(gl_video_clock std)
+{
+   struct retro_system_av_info info;
+   unsigned int max_width                   = 0;
+   unsigned int max_height                  = 0;
+   uint8_t upscaling                        = 1;
+   bool widescreen_hack                     = false;
+   int widescreen_hack_aspect_ratio_setting = 1;
+   bool display_vram                        = false;
+   int crop_overscan                        = 0;
+   int initial_scanline_ntsc                = 0;
+   int last_scanline_ntsc                   = 239;
+   int initial_scanline_pal                 = 0;
+   int last_scanline_pal                    = 287;
+   struct retro_variable var                = {0};
+
+   /* This function currently queries core options rather than
+      checking gl_renderer state; possible to refactor? */
+
+   get_variables(&upscaling, &display_vram, NULL);
+
+   var.key = BEETLE_OPT(widescreen_hack);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "enabled"))
+         widescreen_hack = true;
+   }
+
+   var.key = BEETLE_OPT(widescreen_hack_aspect_ratio);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "16:10"))
+         widescreen_hack_aspect_ratio_setting = 0;
+      else if (!strcmp(var.value, "16:9"))
+         widescreen_hack_aspect_ratio_setting = 1;
+      else if (!strcmp(var.value, "18:9"))
+         widescreen_hack_aspect_ratio_setting = 2;
+      else if (!strcmp(var.value, "19:9"))
+         widescreen_hack_aspect_ratio_setting = 3;
+      else if (!strcmp(var.value, "20:9"))
+         widescreen_hack_aspect_ratio_setting = 4;
+      else if (!strcmp(var.value, "21:9"))
+         widescreen_hack_aspect_ratio_setting = 5;
+      else if (!strcmp(var.value, "32:9"))
+         widescreen_hack_aspect_ratio_setting = 6;
+   }
+
+   var.key = BEETLE_OPT(crop_overscan);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "disabled") == 0)
+         crop_overscan = 0;
+      else if (strcmp(var.value, "static") == 0)
+         crop_overscan = 1;
+      else if (strcmp(var.value, "smart") == 0)
+         crop_overscan = 2;
+   }
+
+   var.key = BEETLE_OPT(initial_scanline);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      initial_scanline_ntsc = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(last_scanline);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      last_scanline_ntsc = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(initial_scanline_pal);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      initial_scanline_pal = atoi(var.value);
+   }
+
+   var.key = BEETLE_OPT(last_scanline_pal);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      last_scanline_pal = atoi(var.value);
+   }
+
+   if (display_vram)
+   {
+      max_width  = VRAM_WIDTH_PIXELS;
+      max_height = VRAM_HEIGHT;
+   }
+   else
+   {
+      max_width  = MEDNAFEN_CORE_GEOMETRY_MAX_W;
+      max_height = MEDNAFEN_CORE_GEOMETRY_MAX_H;
+   }
+
+   memset(&info, 0, sizeof(info));
+
+   /* The base resolution will be overriden using
+    * ENVIRONMENT_SET_GEOMETRY before rendering a frame so
+    * this base value is not really important */
+   info.geometry.base_width     = MEDNAFEN_CORE_GEOMETRY_BASE_W;
+   info.geometry.base_height    = MEDNAFEN_CORE_GEOMETRY_BASE_H;
+   info.geometry.max_width      = max_width  * upscaling;
+   info.geometry.max_height     = max_height * upscaling;
+   info.geometry.aspect_ratio = rhi_common_get_aspect_ratio(std, crop_overscan,
+                                                            std ? initial_scanline_pal : initial_scanline_ntsc,
+                                                            std ? last_scanline_pal : last_scanline_ntsc,
+                                                            aspect_ratio_setting, display_vram, widescreen_hack,
+                                                            widescreen_hack_aspect_ratio_setting);
+
+   info.timing.fps = rhi_common_get_timing_fps();
+   info.timing.sample_rate = SOUND_FREQUENCY;
+
+   return info;
+}
+
+void rhi_gl_get_system_av_info(struct retro_system_av_info *info)
+{
+   struct retro_system_av_info result;
+
+   /* This will possibly trigger the frontend to reconfigure itself */
+   if (static_renderer.inited)
+      rhi_gl_refresh_variables();
+
+   result = get_av_info(static_renderer.video_clock);
+   memcpy(info, &result, sizeof(result));
+}
+
+bool rhi_gl_open(bool is_pal)
+{
+   enum retro_pixel_format f = RETRO_PIXEL_FORMAT_XRGB8888;
+   gl_video_clock clock = is_pal ? VIDEO_CLOCK_PAL : VIDEO_CLOCK_NTSC;
+   /* Compile-time profile string - what GL feature set this build
+    * was compiled to assume.  This is independent of the runtime
+    * caps detection in gl_caps_init: this tells you what subset of
+    * GL the build was *targeted at*; gl_caps tells you what the
+    * driver actually exposes.  Useful for triage when a bug report
+    * comes in - confirms which build artifact the user is running. */
+   const char *profile_str =
+#if defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES3)
+      "OpenGL ES 3.x"
+#elif defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES2)
+      "OpenGL ES 2.x"
+#elif defined(CORE)
+      "OpenGL Core 3.3+"
+#else
+      "OpenGL (compatibility)"
+#endif
+      ;
+
+   if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &f))
+      return false;
+
+   /* Register our hardware render context with the libretro
+    * frontend.  This was previously routed through the glsm shim
+    * (GLSM_CTL_STATE_CONTEXT_INIT); the shim mostly maintained an
+    * extensive gl_state mirror that beetle never used, so the
+    * registration is now done directly here.  Compile-time
+    * profile selection follows the conditions glsm used (GLES
+    * builds always force the matching context_type; desktop
+    * builds are configurable but beetle pins to GL Core 3.3). */
+   memset(&hw_render, 0, sizeof(hw_render));
+#if defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES3)
+   hw_render.context_type    = RETRO_HW_CONTEXT_OPENGLES3;
+#elif defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES2)
+   hw_render.context_type    = RETRO_HW_CONTEXT_OPENGLES2;
+#else
+   /* Since RetroArch's October 2020 driver/context pairing change, an
+    * OPENGL_CORE request is served only by the glcore video driver (or
+    * through a driver switch), while the gl driver answers
+    * GET_PREFERRED_HW_RENDER with RETRO_HW_CONTEXT_OPENGL and serves
+    * that. This renderer runs fine on a desktop compatibility context:
+    * every GL 3.3 core feature it uses is a subset of what a
+    * compatibility context exposes, the "#version 330 core" shader
+    * sources are accepted there (the shader's profile qualifier is
+    * independent of the context's), and the gl_caps 3.0 floor check at
+    * context_reset still gates genuinely-too-old drivers. Pinning Core
+    * 3.3 unconditionally - as this code did from the glsm era on -
+    * therefore means the gl driver, with driver switching disabled,
+    * silently drops the whole GL renderer to software. Ask the frontend
+    * which flavour it prefers and request that first; if the first
+    * request is refused, retry once with the other flavour before
+    * giving up. */
+   {
+      unsigned pref = RETRO_HW_CONTEXT_NONE;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &pref) &&
+          pref == RETRO_HW_CONTEXT_OPENGL)
+      {
+         hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
+         profile_str            = "OpenGL (compatibility)";
+      }
+      else
+      {
+         hw_render.context_type  = RETRO_HW_CONTEXT_OPENGL_CORE;
+         hw_render.version_major = 3;
+         hw_render.version_minor = 3;
+      }
+   }
+#endif
+   hw_render.context_reset      = gl_context_reset;
+   hw_render.context_destroy    = gl_context_destroy;
+   hw_render.depth              = true;
+   hw_render.stencil            = false;
+   hw_render.bottom_left_origin = true;
+   hw_render.cache_context      = false;
+
+   log_cb(RETRO_LOG_INFO,
+         "[rhi_gl_open] requesting hardware render context: %s\n",
+         profile_str);
+
+   if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
+   {
+#if !defined(HAVE_OPENGLES)
+      /* Second rung of the ladder: whichever desktop flavour was
+       * refused, offer the other one. Covers frontends that reject
+       * Core on the gl driver but do not implement the preference
+       * query, and frontends whose preference answer was wrong. */
+      const char *retry_str;
+      if (hw_render.context_type == RETRO_HW_CONTEXT_OPENGL_CORE)
+      {
+         hw_render.context_type  = RETRO_HW_CONTEXT_OPENGL;
+         hw_render.version_major = 0;
+         hw_render.version_minor = 0;
+         retry_str               = "OpenGL (compatibility)";
+      }
+      else
+      {
+         hw_render.context_type  = RETRO_HW_CONTEXT_OPENGL_CORE;
+         hw_render.version_major = 3;
+         hw_render.version_minor = 3;
+         retry_str               = "OpenGL Core 3.3+";
+      }
+      log_cb(RETRO_LOG_WARN,
+            "[rhi_gl_open] frontend rejected SET_HW_RENDER for %s; "
+            "retrying as %s\n", profile_str, retry_str);
+      profile_str = retry_str;
+      if (environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
+         goto hw_render_accepted;
+#endif
+      log_cb(RETRO_LOG_ERROR,
+            "[rhi_gl_open] frontend rejected SET_HW_RENDER for %s\n",
+            profile_str);
+      return false;
+   }
+#if !defined(HAVE_OPENGLES)
+hw_render_accepted:
+#endif
+
+   /* No context until 'context_reset' is called */
+   static_renderer.video_clock  = clock;
+
+   return true;
+}
+
+void rhi_gl_close(void)
+{
+   static_renderer.state       = GL_STATE_INVALID;
+   static_renderer.video_clock = VIDEO_CLOCK_NTSC;
+#ifdef HAVE_OPENGLES3
+   gl_upload_scratch_free();
+#endif
+}
+
+void rhi_gl_refresh_variables(void)
+{
+   gl_renderer* renderer = NULL;
+   bool reconfigure_frontend;
+
+   if (!static_renderer.inited)
+      return;
+
+   switch (static_renderer.state)
+   {
+      case GL_STATE_VALID:
+         renderer = static_renderer.state_data;
+         break;
+      case GL_STATE_INVALID:
+         /* Nothing to be done if we don't have a GL context */
+         return;
+   }
+
+   reconfigure_frontend = retro_refresh_variables(renderer);
+
+   if (reconfigure_frontend)
+   {
+      /* The resolution has changed, we must tell the frontend
+       * to change its format */
+      struct retro_variable var = {0};
+      struct retro_system_av_info av_info;
+      bool ok;
+
+      av_info = get_av_info(static_renderer.video_clock);
+
+      /* This call can potentially (but not necessarily) call
+       * 'context_destroy' and 'context_reset' to reinitialize */
+      ok = environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
+
+      if (!ok)
+      {
+         log_cb(RETRO_LOG_WARN, "Couldn't change frontend resolution\n");
+         log_cb(RETRO_LOG_DEBUG, "Try resetting to enable the new configuration\n");
+      }
+   }
+}
+
+void rhi_gl_prepare_frame(void)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      /* Never demote to RHI_SOFTWARE here: a hardware session has no
+       * software surfaces, so the demotion sent GPU_Update's line
+       * renderer through a NULL framebuffer. Log and refuse; the
+       * INVALID state set by the failed context_reset keeps every
+       * other entry point out too. */
+      log_cb(RETRO_LOG_ERROR, "[rhi_gl_prepare_frame] Renderer state marked as valid but state data is null.\n");
+      static_renderer.state = GL_STATE_INVALID;
+      return;
+   }
+
+   gl_normalize_inherited_state();
+
+   /* The HD hotkey does not send a core-option update. Change storage at
+    * the next frame boundary through the VRAM-preserving refresh. A failed
+    * rebuild keeps the working target until the next option refresh. */
+   if (!psx_hdr_active && !renderer->fb_rebuild_failed &&
+       renderer->color_mode == PSX_INTERNAL_COLOR_16BPP &&
+       renderer->filter_type == FILTER_MODE_NEAREST &&
+       gl_use_byte_color_storage(renderer->filter_type) !=
+             renderer->byte_color_storage)
+   {
+      rhi_gl_refresh_variables();
+      /* Refresh may recreate the context; do not retain the old pointer. */
+      if (static_renderer.state == GL_STATE_INVALID ||
+          !static_renderer.state_data)
+         return;
+      renderer = static_renderer.state_data;
+      gl_normalize_inherited_state();
+   }
+
+   /* In case we're upscaling we need to increase the line width
+    * proportionally */
+   glLineWidth((GLfloat)renderer->internal_upscaling);
+   glEnable(GL_SCISSOR_TEST);
+   glEnable(GL_DEPTH_TEST);
+   glDepthFunc(GL_LEQUAL);
+   /* Used for PSX GPU command blending */
+   glBlendColor(0.25, 0.25, 0.25, 0.5);
+
+   apply_scissor(renderer);
+
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
+   glActiveTexture(GL_TEXTURE3);
+   glBindTexture(GL_TEXTURE_2D, renderer->fb_feedback_texture.id ?
+         renderer->fb_feedback_texture.id : renderer->fb_texture.id);
+   glActiveTexture(GL_TEXTURE0);
+}
+
+static void compute_vram_framebuffer_dimensions(gl_renderer *renderer)
+{
+   /* Compute native PSX framebuffer dimensions for current frame
+      and store results in renderer->config.display_resolution */
+
+   uint16_t clock_div;
+   uint16_t fb_width;
+   uint16_t fb_height;
+
+   if (!renderer)
+      return;
+
+   switch (renderer->curr_width_mode)
+   {
+      case WIDTH_MODE_256:
+         clock_div = 10;
+         break;
+
+      case WIDTH_MODE_320:
+         clock_div = 8;
+         break;
+
+      case WIDTH_MODE_512:
+         clock_div = 5;
+         break;
+
+      case WIDTH_MODE_640:
+         clock_div = 4;
+         break;
+
+      case WIDTH_MODE_368:
+         clock_div = 7;
+         break;
+
+      default: /* out-of-range width mode: use the 320 divider so clock_div is
+                  never left uninitialised (the divisions below would otherwise
+                  be undefined / a divide-by-zero) */
+         clock_div = 8;
+         break;
+   } /* First we get the horizontal range in number of pixel clock period */
+   fb_width = (renderer->config.display_area_hrange[1] - renderer->config.display_area_hrange[0]); /* Then we apply the divider */
+   fb_width /= clock_div; /* Then the rounding formula straight outta No$ */
+   fb_width = (fb_width + 2) & ~3;
+
+   fb_height = (renderer->config.display_area_vrange[1] - renderer->config.display_area_vrange[0]);
+   fb_height *= renderer->config.is_480i ? 2 : 1;
+
+   renderer->config.display_resolution[0] = fb_width;
+   renderer->config.display_resolution[1] = fb_height;
+}
+
+void rhi_gl_finalize_frame(const void *fb, unsigned width,
+                           unsigned height, unsigned pitch)
+{
+   gl_renderer      *renderer;
+   struct gl_analog *analog          = NULL;
+   unsigned          analog_native_w = 0;
+   unsigned          analog_native_h = 0;
+   unsigned          analog_out_w    = 0;
+   unsigned          analog_out_h    = 0;
+   int               analog_dst_x    = 0;
+   int               analog_dst_y    = 0;
+   struct gl_post   *post            = NULL;
+   int               post_dst_x      = 0;
+   int               post_dst_y      = 0;
+
+   /* Setup 2 triangles that cover the entire framebuffer
+      then copy the displayed portion of the screen from fb_out */
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return;
+
+   tt_frame_advance();
+
+   /* Draw pending commands */
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   /* Shared HD texture tracker frame boundary: process decoded IO
+    * responses, rebuild dirty fused pages, run the LRU budgets and the
+    * debug hotkeys. Runs after the final flush so every handle handed
+    * out this frame has been consumed. */
+   if (renderer->tracker)
+   {
+      texture_tracker_endFrame(renderer->tracker);
+      renderer->hd_handle = hd_handle_make_none();
+   }
+
+   /* Calculate native PSX framebuffer dimensions to update renderer
+      state before calling bind_libretro_framebuffer */
+   compute_vram_framebuffer_dimensions(renderer);
+
+   /* Analog cable chain. When engaged the display draw is redirected into a
+    * texture and run through the chain, whose resolve draws the result into
+    * the frontend's buffer; the frame the chain wants
+    * is exactly what the output program produces with the HDR encode off, so
+    * the draw below is reused rather than duplicated.
+    *
+    * The VRAM viewer is excluded on purpose: it is a debug view of memory,
+    * not a picture the console ever put on a wire. */
+   analog = gl_analog_get(renderer);
+   if (analog && renderer->display_vram)
+      analog = NULL;
+   if (analog)
+   {
+      /* Geometry must match what bind_libretro_framebuffer would have set up,
+       * not config.display_resolution: the frontend viewport comes from the
+       * display rect, which carries the overscan crop and an x/y offset. Size
+       * the chain from the same rect and blit back into the same place, or
+       * the picture lands at the wrong size in the wrong corner. */
+      gl_display_rect disp_rect = compute_gl_display_rect(renderer);
+
+      analog_native_w = disp_rect.width;
+      analog_native_h = disp_rect.height;
+      analog_out_w    = analog_native_w * renderer->internal_upscaling;
+      analog_out_h    = analog_native_h * renderer->internal_upscaling;
+      analog_dst_x    = disp_rect.x * (int)renderer->internal_upscaling;
+      analog_dst_y    = disp_rect.y * (int)renderer->internal_upscaling;
+
+      if (!gl_analog_begin_extract(analog, analog_native_w, analog_native_h,
+               analog_out_w, analog_out_h))
+         analog = NULL;
+   }
+
+   /* HDR post effects. The display draw - or, with the cable chain, its
+    * resolve - writes scene-linear light into the post scene, sized and
+    * placed from the same display rect, and gl_post_run encodes it into the
+    * frontend's buffer. Not for the VRAM viewer, as above. */
+   post = gl_post_get(renderer);
+   if (post && renderer->display_vram)
+      post = NULL;
+   if (post)
+   {
+      gl_display_rect disp_rect = compute_gl_display_rect(renderer);
+      unsigned        w = disp_rect.width  * renderer->internal_upscaling;
+      unsigned        h = disp_rect.height * renderer->internal_upscaling;
+
+      post_dst_x = disp_rect.x * (int)renderer->internal_upscaling;
+      post_dst_y = disp_rect.y * (int)renderer->internal_upscaling;
+      if (!w || !h)
+         post = NULL;
+      else if (analog ? !gl_post_texture(&post->scene, w, h)
+                      : !gl_post_begin(post, w, h))
+         post = NULL;
+   }
+
+   /* We can now render to the frontend's buffer */
+   if (!analog && !post)
+      bind_libretro_framebuffer(renderer);
+
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_BLEND);
+
+   /* Clear the screen no matter what: prevents possible leftover 
+      pixels from previous frame when loading save state for any 
+      games not using standard framebuffer heights */
+   glClearColor(0.0, 0.0, 0.0, 0.0);
+   glClear(GL_COLOR_BUFFER_BIT);
+
+   if (!renderer->config.display_off || renderer->display_vram)
+   {
+      /* First we draw the visible part of fb_out */
+      uint16_t fb_x_start = renderer->config.display_top_left[0];
+      uint16_t fb_y_start = renderer->config.display_top_left[1];
+      uint16_t fb_width   = renderer->config.display_resolution[0];
+      uint16_t fb_height  = renderer->config.display_resolution[1];
+
+      GLint depth_24bpp   = (GLint) renderer->config.display_24bpp;
+
+      /* Bind 'fb_out' to texture unit 1 */
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, renderer->fb_out.id);
+
+      if (renderer->display_vram)
+      {
+         /* Display the entire VRAM as a 16bpp buffer */
+         fb_x_start = 0;
+         fb_y_start = 0;
+         fb_width = VRAM_WIDTH_PIXELS;
+         fb_height = VRAM_HEIGHT;
+
+         depth_24bpp = 0;
+      }
+
+      if (renderer->output_buffer)
+      {
+         gl_output_vertex slice[4] =
+         {
+            { {-1.0, -1.0}, {0,         fb_height}   },
+            { { 1.0, -1.0}, {fb_width , fb_height}   },
+            { {-1.0,  1.0}, {0,         0} },
+            { { 1.0,  1.0}, {fb_width,  0} }
+         };
+
+         if (renderer->output_buffer)
+         {
+            gl_draw_buffer_push_slice(renderer->output_buffer, &slice, 4,
+                  sizeof(gl_output_vertex));
+
+            if (renderer->output_buffer->program)
+            {
+               glUseProgram(renderer->output_buffer->program->id);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "fb"), 1);
+               glUniform2ui(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "offset"), fb_x_start, fb_y_start);
+
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "depth_24bpp"), depth_24bpp);
+               glUniform1ui(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "color_mode"),
+                     psx_hdr_active ? PSX_INTERNAL_COLOR_32BPP :
+                     (renderer->byte_color_storage && renderer->color_mode == PSX_INTERNAL_COLOR_16BPP ? 3 : renderer->color_mode));
+               glUniform1ui(gl_uniform_map_get(&renderer->output_buffer->program->uniforms,
+                        "byte_color_storage"), renderer->byte_color_storage);
+
+               glUniform1ui(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "internal_upscaling"), renderer->internal_upscaling);
+
+               /* HDR10 output encode parameters. hdr_active follows the
+                * negotiated pixel format, not fb_out_fp16: once the
+                * frontend accepted HDR10_2101010, the presented image
+                * must be PQ Rec.2020 - a non-fp16 fallback merely means
+                * over-white content clamps at reference white. */
+               /* With the chain engaged the resolve emits the final pixel,
+                * HDR included, so this draw must stay in the gamma domain. */
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_active"),
+                     (psx_hdr_active && !analog) ? 1 : 0);
+               glUniform1f(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_paper_white"), psx_hdr_paper_white_nits);
+               glUniform1f(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_max_nits"), psx_hdr_max_nits);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_expand_gamut"), psx_hdr_expand_gamut);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_shoulder"), psx_hdr_shoulder);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_sdr_eotf"), psx_hdr_sdr_eotf);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_src_primaries"), psx_src_primaries);
+               glUniform1f(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_black_pq"), psx_hdr_black_pq);
+               glUniformMatrix3fv(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_to_panel"), 1, GL_FALSE, psx_hdr_to_panel);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_scrgb"), psx_hdr_scrgb);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_linear_out"),
+                     (post && !analog) ? 1 : 0);
+               gl_bind_display_transform(renderer->output_buffer->program);
+            }
+
+            if (!gl_draw_buffer_is_empty(renderer->output_buffer))
+               gl_draw_buffer_draw(renderer->output_buffer, GL_TRIANGLE_STRIP);
+         }
+      }
+   }
+
+   /* Run the chain over the extracted frame and put the result on screen.
+    *
+    * If a pass could not be set up the frame is already drawn into scanout,
+    * so blit that instead of the chain output: an unfiltered picture is a far
+    * better failure than a black one, and the cause is in the log. */
+   if (analog)
+   {
+      if (!gl_analog_run(renderer, analog, analog->scanout.id,
+               analog_native_w, analog_native_h,
+               analog_out_w, analog_out_h, analog_dst_x, analog_dst_y,
+               post ? &post->scene : NULL))
+      {
+         /* Nothing reached the post scene; show the extracted frame. */
+         post = NULL;
+         bind_libretro_framebuffer(renderer);
+         /* As in the resolve: the frame's clear went to the extraction
+          * target, and the blit covers only the display rect. */
+         glClearColor(0.0, 0.0, 0.0, 0.0);
+         glClear(GL_COLOR_BUFFER_BIT);
+         gl_analog_blit(renderer, analog, analog->scanout.id,
+               analog_out_w, analog_out_h, analog_dst_x, analog_dst_y);
+      }
+
+      /* Advance the subcarrier phase by one field. Total lines including
+       * blanking - the carrier does not stop during retrace - and interlaced
+       * fields are half-lines, which is what produces the 4- and 8-field
+       * broadcast sequences. Wrapped so a long session stays exact. */
+      {
+         double lines_per_field = renderer->config.is_pal
+               ? (renderer->config.is_480i ? 312.5 : 314.0)
+               : (renderer->config.is_480i ? 262.5 : 263.0);
+         double adv = renderer->config.is_pal ? 0.75 : 0.5;
+         renderer->analog_phase += lines_per_field * adv;
+         renderer->analog_phase -= floor(renderer->analog_phase);
+      }
+   }
+
+   /* The post effects encode what the display stage left in their scene. */
+   if (post && !gl_post_run(renderer, post, post_dst_x, post_dst_y))
+   {
+      log_cb(RETRO_LOG_WARN, "[gl_post] a bloom target could not be set up; frame dropped\n");
+      bind_libretro_framebuffer(renderer);
+      glClearColor(0.0, 0.0, 0.0, 0.0);
+      glClear(GL_COLOR_BUFFER_BIT);
+   }
+
+   /* Resolve rendered bounds into native VRAM for next-frame sampling.
+    * CPU uploads already update both surfaces. Retain pending bounds if the
+    * draw buffer is unavailable, so a later successful frame can retry. */
+   if (renderer->vram_sync.pending_count)
+   {
+      const GLint *loc = renderer->image_load_loc;
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, renderer->fb_out.id);
+
+      /* GL_SCISSOR_TEST and GL_BLEND were disabled at the top of
+       * the finalize block (a few hundred lines up) for the
+       * frontend output draw, and nothing in the output draw or
+       * gl_draw_buffer_draw modifies either, so they are still off
+       * here.  Two reflexive disables removed. */
+
+      gl_framebuffer_bind(renderer->fb_texture_fbo, &renderer->fb_texture);
+
+      glUseProgram(renderer->image_load_program->id);
+      glUniform1i(loc[GL_LOAD_LOC_FB_TEXTURE], 1);
+      glUniform1ui(loc[GL_LOAD_LOC_UPSCALING], renderer->internal_upscaling);
+      glUniform1ui(loc[GL_LOAD_LOC_CONVERSION],
+            gl_native_mirror_conversion(renderer));
+      gl_vram_sync_draw_pending(renderer, loc[GL_LOAD_LOC_RECT]);
+      gl_vram_sync_clear(renderer);
+
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+   }
+
+   cleanup_gl_state();
+
+   /* When using a hardware renderer we set the data pointer to
+    * -1 to notify the frontend that the frame has been rendered
+    * in the framebuffer. */
+   video_cb(   RETRO_HW_FRAME_BUFFER_VALID,
+         renderer->frontend_resolution[0],
+         renderer->frontend_resolution[1], 0);
+}
+
+void rhi_gl_set_tex_window(uint8_t tww, uint8_t twh, uint8_t twx, uint8_t twy)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      /* Renderer not yet constructed - buffer the call so it lands
+       * once gl_context_reset brings the renderer up. Matches the
+       * Vulkan backend's defer policy for the same entry point. */
+      rhi_defer_push_set_tex_window(&gl_defer_queue, tww, twh, twx, twy);
+      return;
+   }
+
+   renderer->tex_x_mask = ~(tww << 3);
+   renderer->tex_x_or   = (twx & tww) << 3;
+   renderer->tex_y_mask = ~(twh << 3);
+   renderer->tex_y_or   = (twy & twh) << 3;
+}
+
+void rhi_gl_invalidate_clut_cache(void)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return;
+
+   /* Queued draws still address the retained texture; issue them before a
+    * later preserve is allowed to overwrite it. */
+   if (renderer->palette_cache_saved &&
+       !gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   renderer->palette_cache_valid = false;
+   renderer->palette_cache_saved = false;
+}
+
+void rhi_gl_set_mask_setting(uint32_t mask_set_or, uint32_t mask_eval_and)
+{
+   /* No-op for the GL backend.  The PS1 GPU's mask state
+    * (MaskSetOR / MaskEvalAND) is forwarded to the renderer
+    * per-draw via the `mask_test` and `set_mask` parameters on
+    * each push_primitive / rhi_gl_load_image / rhi_gl_copy_rect /
+    * rhi_gl_fill_rect call (see e.g. push_primitive's mask_test
+    * argument).  The GL renderer batches by mask_test value (see
+    * the comparison in gl_renderer_*_finalize) and never reads
+    * any persistent renderer-global mask register, so there's
+    * nothing for this entry point to update.
+    *
+    * The interface exists because the rhi_intf vtable is shared
+    * across SW / GL / Vulkan backends, and at least one backend
+    * (the SW path, kept in sync via the gpu.cpp-side MaskSetOR /
+    * MaskEvalAND fields) does care about the global form of this
+    * state.  For GL the per-draw values are sufficient. */
+   (void)mask_set_or;
+   (void)mask_eval_and;
+}
+
+void rhi_gl_set_draw_offset(int16_t x, int16_t y)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      rhi_defer_push_set_draw_offset(&gl_defer_queue, x, y);
+      return;
+   }
+
+   /* Finish drawing anything with the current offset */
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   renderer->config.draw_offset[0] = x;
+   renderer->config.draw_offset[1] = y;
+}
+
+void rhi_gl_set_draw_area(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      rhi_defer_push_set_draw_area(&gl_defer_queue, x0, y0, x1, y1);
+      return;
+   }
+
+   /* GP0(E3h) and (E4h) each send the whole area, and games resend it
+    * unchanged: only a change ends the batch. */
+   if (renderer->config.draw_area_top_left[0] == x0 &&
+       renderer->config.draw_area_top_left[1] == y0 &&
+       renderer->config.draw_area_bot_right[0] == x1 + 1 &&
+       renderer->config.draw_area_bot_right[1] == y1 + 1)
+      return;
+
+   /* Finish drawing anything in the current area */
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   renderer->config.draw_area_top_left[0] = x0;
+   renderer->config.draw_area_top_left[1] = y0;
+   /* Draw area coordinates are inclusive */
+   renderer->config.draw_area_bot_right[0] = x1 + 1;
+   renderer->config.draw_area_bot_right[1] = y1 + 1;
+
+   apply_scissor(renderer);
+}
+
+void rhi_gl_set_vram_framebuffer_coords(uint32_t xstart, uint32_t ystart)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      rhi_defer_push_set_vram_framebuffer_coords(&gl_defer_queue,
+            xstart, ystart);
+      return;
+   }
+
+   renderer->config.display_top_left[0] = xstart;
+   renderer->config.display_top_left[1] = ystart;
+}
+
+void rhi_gl_set_horizontal_display_range(uint16_t x1, uint16_t x2)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      rhi_defer_push_set_horizontal_display_range(&gl_defer_queue, x1, x2);
+      return;
+   }
+
+   renderer->config.display_area_hrange[0] = x1;
+   renderer->config.display_area_hrange[1] = x2;
+}
+
+void rhi_gl_set_vertical_display_range(uint16_t y1, uint16_t y2)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      rhi_defer_push_set_vertical_display_range(&gl_defer_queue, y1, y2);
+      return;
+   }
+
+   renderer->config.display_area_vrange[0] = y1;
+   renderer->config.display_area_vrange[1] = y2;
+}
+
+void rhi_gl_set_display_mode(bool depth_24bpp,
+                             bool is_pal,
+                             bool is_480i,
+                             int width_mode)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      rhi_defer_push_set_display_mode(&gl_defer_queue,
+            depth_24bpp, is_pal, is_480i, width_mode);
+      return;
+   }
+
+   renderer->config.display_24bpp         = depth_24bpp;
+
+   renderer->config.is_pal  = is_pal;
+   renderer->config.is_480i = is_480i;
+
+   renderer->curr_width_mode = (enum width_modes) width_mode;
+}
+
+/* Draw commands */
+
+
+/* Vertex colour for slot `i`: the precise (pre-saturation) value when the
+ * caller supplied one, else the packed byte unpacked to the same scale.
+ * 1.0 == 0xFF either way, so without precise colour this is bit-identical
+ * to the old byte path. */
+static INLINE float gl_vcol(const float *precise_rgb, int vtx, int chan,
+      uint32_t packed)
+{
+   if (precise_rgb)
+      return precise_rgb[vtx * 3 + chan];
+   return (float)((packed >> (chan * 8)) & 0xFF) / 255.0f;
+}
+
+void rhi_gl_push_triangle(
+      float p0x, float p0y, float p0w,
+      float p1x, float p1y, float p1w,
+      float p2x, float p2y, float p2w,
+      uint32_t c0,
+      uint32_t c1,
+      uint32_t c2,
+      const float *precise_rgb,
+      uint16_t t0x, uint16_t t0y,
+      uint16_t t1x, uint16_t t1y,
+      uint16_t t2x, uint16_t t2y,
+      uint16_t min_u, uint16_t min_v,
+      uint16_t max_u, uint16_t max_v,
+      uint16_t texpage_x, uint16_t texpage_y,
+      uint16_t clut_x, uint16_t clut_y,
+      uint8_t texture_blend_mode,
+      uint8_t depth_shift,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask,
+      bool may_be_2d)
+{
+   gl_renderer *renderer;
+   gl_semi_transparency_mode semi_transparency_mode    = SEMI_TRANSPARENCY_MODE_ADD;
+   bool semi_transparent        = false;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return;
+
+   switch (blend_mode)
+   {
+      case -1:
+         semi_transparent       = false;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD;
+         break;
+      case 0:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_AVERAGE;
+         break;
+      case 1:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD;
+         break;
+      case 2:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE;
+         break;
+      case 3:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD_QUARTER_SOURCE;
+         break;
+      default:
+         break;
+   }
+
+   {
+      gl_command_vertex v[3] =
+      {
+         {
+            {p0x, p0y, 0.95, p0w},   /* position */
+            {
+               gl_vcol(precise_rgb, 0, 0, c0),
+               gl_vcol(precise_rgb, 0, 1, c0),
+               gl_vcol(precise_rgb, 0, 2, c0)
+            }, /* color */
+            {t0x, t0y},   /* texture_coord */
+            {texpage_x, texpage_y},
+            {clut_x, clut_y},
+            texture_blend_mode,
+            depth_shift,
+            (uint8_t) dither,
+            semi_transparent,
+            {min_u, min_v, max_u, max_v},
+         },
+         {
+            {p1x, p1y, 0.95, p1w }, /* position */
+            {
+               gl_vcol(precise_rgb, 1, 0, c1),
+               gl_vcol(precise_rgb, 1, 1, c1),
+               gl_vcol(precise_rgb, 1, 2, c1)
+            }, /* color */
+            {t1x, t1y}, /* texture_coord */
+            {texpage_x, texpage_y},
+            {clut_x, clut_y},
+            texture_blend_mode,
+            depth_shift,
+            (uint8_t) dither,
+            semi_transparent,
+            {min_u, min_v, max_u, max_v},
+         },
+         {
+            {p2x, p2y, 0.95, p2w }, /* position */
+            {
+               gl_vcol(precise_rgb, 2, 0, c2),
+               gl_vcol(precise_rgb, 2, 1, c2),
+               gl_vcol(precise_rgb, 2, 2, c2)
+            }, /* color */
+            {t2x, t2y}, /* texture_coord */
+            {texpage_x, texpage_y},
+            {clut_x, clut_y},
+            texture_blend_mode,
+            depth_shift,
+            (uint8_t) dither,
+            semi_transparent,
+            {min_u, min_v, max_u, max_v},
+         }
+      };
+
+      {
+         uint32_t colors[3] = {c0, c1, c2};
+         unsigned i;
+         if (renderer->internal_upscaling > 1 && renderer->scaled_uv_offset &&
+             !may_be_2d)
+            for (i = 0; i < 3; i++)
+               v[i].native_flags |= 16;
+         push_primitive(renderer, v, 3, colors, GL_TRIANGLES,
+               semi_transparency_mode, mask_test, set_mask);
+      }
+   }
+}
+
+void rhi_gl_push_quad(
+      float p0x, float p0y, float p0w,
+      float p1x, float p1y, float p1w,
+      float p2x, float p2y, float p2w,
+      float p3x, float p3y, float p3w,
+      uint32_t c0,
+      uint32_t c1,
+      uint32_t c2,
+      uint32_t c3,
+      const float *precise_rgb,
+      uint16_t t0x, uint16_t t0y,
+      uint16_t t1x, uint16_t t1y,
+      uint16_t t2x, uint16_t t2y,
+      uint16_t t3x, uint16_t t3y,
+      uint16_t min_u, uint16_t min_v,
+      uint16_t max_u, uint16_t max_v,
+      uint16_t texpage_x, uint16_t texpage_y,
+      uint16_t clut_x, uint16_t clut_y,
+      uint8_t texture_blend_mode,
+      uint8_t depth_shift,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask,
+      bool is_sprite, bool may_be_2d,
+      uint32_t uv_offset)
+{
+   gl_renderer *renderer;
+   gl_semi_transparency_mode semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD;
+   bool semi_transparent     = false;
+   bool is_semi_transparent;
+   bool is_textured;
+   unsigned index;
+   unsigned index_pos;
+   unsigned i;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return;
+
+   switch (blend_mode)
+   {
+      case -1:
+         semi_transparent       = false;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD;
+         break;
+      case 0:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_AVERAGE;
+         break;
+      case 1:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD;
+         break;
+      case 2:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE;
+         break;
+      case 3:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD_QUARTER_SOURCE;
+         break;
+      default:
+         break;
+   }
+
+   {
+      gl_command_vertex v[4] =
+      {
+         {
+            {p0x, p0y, 0.95, p0w},   /* position */
+            {
+               gl_vcol(precise_rgb, 0, 0, c0),
+               gl_vcol(precise_rgb, 0, 1, c0),
+               gl_vcol(precise_rgb, 0, 2, c0)
+            }, /* color */
+            {t0x, t0y},   /* texture_coord */
+            {texpage_x, texpage_y},
+            {clut_x, clut_y},
+            texture_blend_mode,
+            depth_shift,
+            (uint8_t) dither,
+            semi_transparent,
+            {min_u, min_v, max_u, max_v},
+         },
+         {
+            {p1x, p1y, 0.95, p1w }, /* position */
+            {
+               gl_vcol(precise_rgb, 1, 0, c1),
+               gl_vcol(precise_rgb, 1, 1, c1),
+               gl_vcol(precise_rgb, 1, 2, c1)
+            }, /* color */
+            {t1x, t1y}, /* texture_coord */
+            {texpage_x, texpage_y},
+            {clut_x, clut_y},
+            texture_blend_mode,
+            depth_shift,
+            (uint8_t) dither,
+            semi_transparent,
+            {min_u, min_v, max_u, max_v},
+         },
+         {
+            {p2x, p2y, 0.95, p2w }, /* position */
+            {
+               gl_vcol(precise_rgb, 2, 0, c2),
+               gl_vcol(precise_rgb, 2, 1, c2),
+               gl_vcol(precise_rgb, 2, 2, c2)
+            }, /* color */
+            {t2x, t2y}, /* texture_coord */
+            {texpage_x, texpage_y},
+            {clut_x, clut_y},
+            texture_blend_mode,
+            depth_shift,
+            (uint8_t) dither,
+            semi_transparent,
+            {min_u, min_v, max_u, max_v},
+         },
+         {
+            {p3x, p3y, 0.95, p3w }, /* position */
+            {
+               gl_vcol(precise_rgb, 3, 0, c3),
+               gl_vcol(precise_rgb, 3, 1, c3),
+               gl_vcol(precise_rgb, 3, 2, c3)
+            }, /* color */
+            {t3x, t3y}, /* texture_coord */
+            {texpage_x, texpage_y},
+            {clut_x, clut_y},
+            texture_blend_mode,
+            depth_shift,
+            (uint8_t) dither,
+            semi_transparent,
+            { min_u, min_v, max_u, max_v },
+         },
+      };
+
+      is_semi_transparent = v[0].semi_transparent == 1;
+      is_textured         = v[0].texture_blend_mode != 0;
+
+      {
+         /* Per-primitive HD replacement query (see push_primitive). */
+         HdTextureHandle hd = gl_tt_query_hd(renderer, v);
+         uint32_t colors[4] = {c0, c1, c2, c3};
+         if (renderer->internal_upscaling > 1 && renderer->scaled_uv_offset &&
+             !is_sprite && !may_be_2d)
+            for (i = 0; i < 4; i++)
+               v[i].native_flags |= 16;
+         /* Indices 0,1,2 and 1,2,3 have distinct last vertices. Pack
+          * each triangle's flat plane there without expanding the quad. */
+         gl_build_native_triangle_interpolants(renderer, v + 1, colors + 1, hd,
+               uv_offset);
+         gl_build_native_triangle_interpolants(renderer, v, colors, hd,
+               uv_offset);
+         gl_vram_sync_primitive(renderer, v, 4, uv_offset);
+         vertex_preprocessing(renderer, v, 4,
+               GL_TRIANGLES, semi_transparency_mode, mask_test, set_mask, hd);
+      }
+
+      index     = gl_draw_buffer_next_index(renderer->command_buffer);
+      index_pos = renderer->vertex_index_pos;
+
+#ifdef DEBUG
+      /* vertex_preprocessing reserves six indices for a four-vertex quad. */
+      assert(renderer->vertex_index_pos + 6 <= INDEX_BUFFER_LEN);
+#endif
+
+      for (i = 0; i < 6; i++)
+         renderer->vertex_indices[renderer->vertex_index_pos++] = index + indices[i];
+
+      /* Add transparent pass if needed */
+      if (is_semi_transparent && is_textured)
+         vertex_add_blended_pass(renderer, index_pos);
+
+      gl_draw_buffer_push_slice(renderer->command_buffer, v, 4,
+            sizeof(gl_command_vertex));
+   }
+}
+
+/* Expand native-width lines into triangles for enhanced rendering. OpenGL's
+ * native line rasterization uses different endpoint and diagonal coverage
+ * rules than the polygon path, which exposes gaps against PGXP's subpixel
+ * polygons. GP0 line endpoints remain integral. Eligible native draws reuse
+ * this builder, widen the quad and trim it to the original PS1 pixel pattern;
+ * PGXP and upscaled draws keep the untrimmed coverage. */
+static void gl_build_line_quad(gl_command_vertex output[4],
+      const gl_command_vertex input[2])
+{
+   float dx = input[1].position[0] - input[0].position[0];
+   float dy = input[1].position[1] - input[0].position[1];
+   float fill_dx;
+   float fill_dy;
+   float pad_x0 = 0.0f;
+   float pad_x1 = 0.0f;
+   float pad_y0 = 0.0f;
+   float pad_y1 = 0.0f;
+   float x0;
+   float y0;
+   float x1;
+   float y1;
+
+   if (dx == 0.0f && dy == 0.0f)
+   {
+      output[0] = input[0];
+      output[1] = input[0];
+      output[2] = input[0];
+      output[3] = input[0];
+      output[1].position[0] += 1.0f;
+      output[2].position[1] += 1.0f;
+      output[3].position[0] += 1.0f;
+      output[3].position[1] += 1.0f;
+      return;
+   }
+
+   if (fabsf(dx) > fabsf(dy))
+   {
+      float slope = dy / fabsf(dx);
+      fill_dx = 0.0f;
+      fill_dy = 1.0f;
+      if (dx > 0.0f)
+      {
+         pad_x1 = 1.0f;
+         pad_y1 = slope;
+      }
+      else
+      {
+         pad_x0 = 1.0f;
+         pad_y0 = -slope;
+      }
+   }
+   else
+   {
+      float slope = dx / fabsf(dy);
+      fill_dx = 1.0f;
+      fill_dy = 0.0f;
+      if (dy > 0.0f)
+      {
+         pad_y1 = 1.0f;
+         pad_x1 = slope;
+      }
+      else
+      {
+         pad_y0 = 1.0f;
+         pad_x0 = -slope;
+      }
+   }
+
+   x0 = input[0].position[0] + pad_x0;
+   y0 = input[0].position[1] + pad_y0;
+   x1 = input[1].position[0] + pad_x1;
+   y1 = input[1].position[1] + pad_y1;
+
+   output[0] = input[0];
+   output[1] = input[0];
+   output[2] = input[1];
+   output[3] = input[1];
+   output[0].position[0] = x0;
+   output[0].position[1] = y0;
+   output[1].position[0] = x0 + fill_dx;
+   output[1].position[1] = y0 + fill_dy;
+   output[2].position[0] = x1;
+   output[2].position[1] = y1;
+   output[3].position[0] = x1 + fill_dx;
+   output[3].position[1] = y1 + fill_dy;
+}
+
+void rhi_gl_push_line(
+      int16_t p0x, int16_t p0y,
+      int16_t p1x, int16_t p1y,
+      uint32_t c0, uint32_t c1,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask)
+{
+   gl_renderer *renderer;
+   gl_semi_transparency_mode semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD;
+   bool semi_transparent = false;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return;
+
+   switch (blend_mode)
+   {
+      case -1:
+         semi_transparent       = false;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD;
+         break;
+      case 0:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_AVERAGE;
+         break;
+      case 1:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD;
+         break;
+      case 2:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE;
+         break;
+      case 3:
+         semi_transparent       = true;
+         semi_transparency_mode = SEMI_TRANSPARENCY_MODE_ADD_QUARTER_SOURCE;
+         break;
+      default:
+         break;
+   }
+
+   {
+      gl_command_vertex v[2] = {
+         {
+            {(float)p0x, (float)p0y, 0., 1.0}, /* position */
+            {
+               gl_vcol(NULL, 0, 0, c0),
+               gl_vcol(NULL, 0, 1, c0),
+               gl_vcol(NULL, 0, 2, c0)
+            }, /* color */
+            {0, 0}, /* texture_coord */
+            {0, 0}, /* texture_page */
+            {0, 0}, /* clut */
+            0,      /* texture_blend_mode */
+            0,      /* depth_shift */
+            (uint8_t) dither,
+            semi_transparent,
+         },
+         {
+            {(float)p1x, (float)p1y, 0., 1.0}, /* position */
+            {
+               gl_vcol(NULL, 1, 0, c1),
+               gl_vcol(NULL, 1, 1, c1),
+               gl_vcol(NULL, 1, 2, c1)
+            }, /* color */
+            {0, 0}, /* texture_coord */
+            {0, 0}, /* texture_page */
+            {0, 0}, /* clut */
+            0,      /* texture_blend_mode */
+            0,      /* depth_shift */
+            (uint8_t) dither,
+            semi_transparent,
+         }
+      };
+
+      {
+         int32_t x[2], y[2];
+         HdTextureHandle hd = hd_handle_make_none();
+         if (gl_native_positions(renderer, v, 2, x, y))
+         {
+            gl_command_vertex quad[4], triangles[6];
+            uint32_t colors[2] = {c0, c1}, planes[6], coverage[2];
+            unsigned i, anchor = x[0] > x[1] ? 1 : 0;
+            int32_t dx = x[1 - anchor] - x[anchor];
+            int32_t dy = y[1 - anchor] - y[anchor];
+            bool horizontal = abs(dx) > abs(dy);
+            int32_t steps = horizontal ? abs(dx) : abs(dy);
+            bool gouraud = c0 != c1 && gl_native_shading(renderer, hd) &&
+                  rhi_line_color_planes(planes, x, y, colors);
+            rhi_pack_line_coverage(coverage, x, y);
+            gl_build_line_quad(quad, v);
+            for (i = 0; i < 4; i++)
+            {
+               /* Widen the strip conservatively; the fragment shader
+                * selects the exact DDA pixel, including both endpoints. */
+               if (steps)
+                  quad[i].position[horizontal ? 1 : 0] +=
+                        (i & 1) ? 1.0f : -1.0f;
+               if (gouraud)
+                  gl_set_native_color_plane(quad + i, planes, i < 2 ? c0 : c1);
+               quad[i].native_flags |= 4;
+               memcpy(quad[i].native_uv, coverage, sizeof(coverage));
+            }
+            gl_vram_sync_primitive(renderer, quad, 4, 0);
+            triangles[0] = quad[0];
+            triangles[1] = quad[1];
+            triangles[2] = quad[2];
+            triangles[3] = quad[3];
+            triangles[4] = quad[2];
+            triangles[5] = quad[1];
+            push_primitive(renderer, triangles, 6, NULL,
+                  GL_TRIANGLES, semi_transparency_mode, mask_test, set_mask);
+            return;
+         }
+      }
+
+      /* Native draws returned above. Use quads for upscaling and other
+       * enhancements too, while preserving the PGXP compatibility opt-out. */
+      if (psx_pgxp_mode == 0 || psx_pgxp_gl_line_expansion)
+      {
+         gl_command_vertex quad[4];
+         gl_command_vertex triangles[6];
+
+         gl_build_line_quad(quad, v);
+         gl_vram_sync_primitive(renderer, quad, 4, 0);
+         triangles[0] = quad[0];
+         triangles[1] = quad[1];
+         triangles[2] = quad[2];
+         triangles[3] = quad[3];
+         triangles[4] = quad[2];
+         triangles[5] = quad[1];
+         push_primitive(renderer, triangles, 6, NULL,
+               GL_TRIANGLES, semi_transparency_mode, mask_test, set_mask);
+      }
+      else
+      {
+         uint32_t colors[2] = {c0, c1};
+         gl_vram_sync_primitive(renderer, v, 2, 0);
+         push_primitive(renderer, v, 2, colors,
+               GL_LINES, semi_transparency_mode, mask_test, set_mask);
+      }
+   }
+}
+
+void rhi_gl_load_image(
+      uint16_t x, uint16_t y,
+      uint16_t w, uint16_t h,
+      uint16_t *vram,
+      bool mask_test, bool set_mask)
+{
+   gl_renderer *renderer;
+   uint16_t top_left[2];
+   uint16_t dimensions[2];
+   uint16_t x_start;
+   uint16_t x_end;
+   uint16_t y_start;
+   uint16_t y_end;
+   GLboolean scissor_was_enabled;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   x &= VRAM_WIDTH_PIXELS - 1;
+   y &= VRAM_HEIGHT - 1;
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      /* This is the case King's Field on GL was hitting: the game's
+       * boot uploads HUD glyph tiles via this entry point before the
+       * frontend has called gl_context_reset, so without buffering
+       * the glyph VRAM pixels were dropped on the floor and only
+       * appeared after a savestate-load (which replays the entire
+       * 1MiB VRAM blob via GPU_RestoreStateP3()). Defer the upload;
+       * gl_context_reset's drain will replay it on the live
+       * renderer. The captured `vram` pointer aliases GPU.vram,
+       * which lives for the whole core lifetime - safe to hold. */
+      rhi_defer_push_load_image(&gl_defer_queue,
+            x, y, w, h, vram, mask_test, set_mask);
+      return;
+   }
+
+   gl_normalize_inherited_state();
+
+   if ((unsigned)x + w > VRAM_WIDTH_PIXELS ||
+       (unsigned)y + h > VRAM_HEIGHT)
+   {
+      uint16_t widths[2];
+      uint16_t heights[2];
+      unsigned x_parts;
+      unsigned y_parts;
+      unsigned yi;
+      unsigned xi;
+
+      widths[0] = w < (uint16_t)(VRAM_WIDTH_PIXELS - x)
+            ? w : (uint16_t)(VRAM_WIDTH_PIXELS - x);
+      widths[1] = (uint16_t)(w - widths[0]);
+      heights[0] = h < (uint16_t)(VRAM_HEIGHT - y)
+            ? h : (uint16_t)(VRAM_HEIGHT - y);
+      heights[1] = (uint16_t)(h - heights[0]);
+      x_parts = widths[1] ? 2 : 1;
+      y_parts = heights[1] ? 2 : 1;
+
+      for (yi = 0; yi < y_parts; yi++)
+      {
+         for (xi = 0; xi < x_parts; xi++)
+         {
+            rhi_gl_load_image(
+                  xi ? 0 : x,
+                  yi ? 0 : y,
+                  widths[xi],
+                  heights[yi],
+                  vram,
+                  mask_test,
+                  set_mask);
+         }
+      }
+      return;
+   }
+
+   renderer->set_mask     = set_mask;
+   renderer->force_mask   = set_mask;
+   renderer->mask_test    = mask_test;
+
+   if (renderer->tracker && renderer->texture_tracking_enabled)
+   {
+      TTRect _ntu_rect;
+      _ntu_rect.x = x; _ntu_rect.y = y;
+      _ntu_rect.width = w; _ntu_rect.height = h;
+      texture_tracker_upload(renderer->tracker, _ntu_rect, vram);
+   }
+
+   top_left[0]            = x;
+   top_left[1]            = y;
+   dimensions[0]          = w;
+   dimensions[1]          = h;
+
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   gl_palette_cache_preserve(renderer, x, y, w, h);
+
+   gl_texture_set_sub_image_window(
+         &renderer->fb_texture,
+         top_left,
+         dimensions,
+         (size_t) VRAM_WIDTH_PIXELS,
+         GL_RGBA,
+#ifdef HAVE_OPENGLES3
+         GL_UNSIGNED_SHORT_5_5_5_1,
+#else
+         GL_UNSIGNED_SHORT_1_5_5_5_REV,
+#endif
+         vram);
+
+   x_start    = top_left[0];
+   x_end      = x_start + dimensions[0];
+   y_start    = top_left[1];
+   y_end      = y_start + dimensions[1];
+
+   /* fb_texture is always at 1x */
+   glUseProgram(renderer->image_load_program->id);
+   glUniform1i(renderer->image_load_loc[GL_LOAD_LOC_FB_TEXTURE], 0);
+   glUniform1ui(renderer->image_load_loc[GL_LOAD_LOC_UPSCALING], 1);
+   glUniform1ui(renderer->image_load_loc[GL_LOAD_LOC_CONVERSION],
+         gl_upload_color_conversion(renderer));
+
+   /* Save and restore rather than unconditionally re-enabling: this
+    * entry point is also reachable outside a prepare_frame /
+    * finalize_frame pair (the deferred-upload drain in
+    * gl_context_reset, and GPU_RestoreStateP3()'s full-VRAM replay on
+    * savestate load), where scissor is off on entry and forcing it
+    * back on hands the frontend a dirty context. Matches
+    * gl_tt_page_clear, gl_tt_page_blit, rhi_gl_read_vram and
+    * gl_mirror_fb_out_to_fb_texture. GL_BLEND is deliberately left
+    * off: it is per-draw state owned by the command buffer, not a
+    * frame-wide invariant like scissor. */
+   scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+   if (scissor_was_enabled)
+      glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_BLEND);
+
+   /* Bind the output framebuffer */
+   gl_framebuffer_bind(renderer->fb_out_fbo, &renderer->fb_out);
+
+   gl_renderer_upload_color_and_stencil(renderer, x_start, y_start, x_end, y_end);
+
+   if (scissor_was_enabled)
+      glEnable(GL_SCISSOR_TEST);
+
+   /* The CPU upload is applied to both fb_texture and fb_out. */
+   gl_vram_sync_clean_rect(renderer, x, y, w, h);
+   gl_vram_sync_update_gpu_written_rect(renderer, x, y, w, h, false);
+
+#ifdef DEBUG
+   get_error("rhi_gl_load_image");
+#endif
+
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+   /* Diagnostic restore roundtrip: after a full-VRAM upload (the
+    * savestate-restore path), read the framebuffer straight back and
+    * compare to what was just uploaded. The restore draw expands each
+    * 5-bit channel to float and the readback rounds it back, so a
+    * correct stack returns the exact bytes; a mismatch localises the
+    * corruption to the upload/redraw side and names the first pixel. */
+   if (GL_DIAG_ON() && !gl_diag_nested &&
+       x == 0 && y == 0 && w == VRAM_WIDTH_PIXELS && h == VRAM_HEIGHT)
+   {
+      uint16_t *again = (uint16_t *)malloc(
+            (size_t)VRAM_WIDTH_PIXELS * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
+      if (again)
+      {
+         gl_diag_nested = 1;
+         if (rhi_gl_read_vram(0, 0, VRAM_WIDTH_PIXELS, VRAM_HEIGHT, again))
+            gl_diag_compare_vram("RESTORE ROUNDTRIP", vram, again);
+         gl_diag_nested = 0;
+         free(again);
+      }
+   }
+}
+
+/* GP0 0xC0 (FBRead / Image Store): VRAM-to-CPU transfer.  The PS1
+ * GPU returns the contents of a VRAM rectangle to the CPU bus.  In
+ * Beetle the per-frame copy lives in `g->vram`; when the SW renderer
+ * is disabled and we're on a hardware backend, the SW path doesn't
+ * keep that buffer in sync with what the GPU has actually rendered,
+ * so games that use FBRead see stale or all-zero data and draw 
+ * broken / invisible sprites.
+ *
+ * The Vulkan backend implements this via a synchronous device->host
+ * copy.  This is the GL equivalent: read the requested rectangle out
+ * of `fb_out`, with nearest-neighbour sampling, and deposit it into
+ * the caller's `vram` buffer in the same 5/5/5/1 layout the SW path
+ * uses.
+ *
+ * Coordinate convention: `(x, y, w, h)` are PS1-native units
+ * (x in 0..1023, y in 0..511).  `vram` is the engine's upscale-sized
+ * buffer of dimension (1024 << upscale_shift) x (512 << upscale_shift).
+ * For each PS1-native pixel read from `fb_out`, the SW renderer's
+ * `texel_put` duplicates it as an `upscale x upscale` block in `vram`
+ * so that subsequent `texel_fetch` reads return the correct value.
+ *
+ * Internal color depth handling:
+ *   - 16bpp (default): `fb_out` is GL_RGB5_A1.  We read directly with
+ *     GL_UNSIGNED_SHORT_1_5_5_5_REV (desktop) or GL_UNSIGNED_SHORT_5_5_5_1
+ *     (GLES3) which matches the layout `g->vram` expects.
+ *   - 32bpp: `fb_out` is GL_RGBA8.  We read RGBA8 and convert to the
+ *     platform's native 1555 layout per pixel.  This loses the extra
+ *     precision the 32bpp render target was capturing, which is
+ *     unavoidable - PS1 VRAM is 16bpp and any FBRead consumer is
+ *     written to that format.
+ *
+ * Limitations addressed by `return false` (caller keeps prior data):
+ *   - VRAM seam wrap-around (x+w>1024 or y+h>512).  Pre-existing
+ *     limitation shared with `gl_texture_set_sub_image_window`.
+ *   - Upscale > 1 with no glBlitFramebuffer extension.  All modern
+ *     desktop / GLES3 drivers expose it, so this is a fallback rather
+ *     than a hot path.
+ */
+#ifndef HAVE_OPENGLES3
+enum
+{
+   GL_PACK_LOC_RECT = 0,
+   GL_PACK_LOC_SRC,
+   GL_PACK_LOC_ORIGIN,
+   GL_PACK_LOC_SCALE,
+   GL_PACK_LOC_MODE
+};
+
+/* Reads the native rect (x, y, w, h) of a float or byte fb_out as
+ * PlayStation words straight into dst (rows VRAM_WIDTH_PIXELS apart):
+ * vram_pack writes them on the GPU, so 2 bytes a pixel cross and the CPU
+ * converts nothing. mode as vram_pack. The caller has flushed, set
+ * GL_PACK_ALIGNMENT 1 and disabled the scissor, and restores the read and
+ * draw framebuffers. False when the program or target is unavailable. */
+static bool gl_read_vram_packed(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h,
+      uint16_t *dst, int mode)
+{
+   const GLint *loc = renderer->rb_pack_loc;
+   unsigned s = renderer->internal_upscaling ? renderer->internal_upscaling : 1;
+   GLint program, vao, active, unit_tex, viewport[4];
+   GLboolean blend, depth, stencil;
+   bool ok;
+
+   if (renderer->rb_pack_failed)
+      return false;
+   if (!renderer->rb_pack_program)
+   {
+      const struct gl_uniform_map *u;
+      renderer->rb_pack_program = gl_program_build(image_load_vertex,
+            vram_pack_fragment);
+      if (!renderer->rb_pack_program)
+      {
+         renderer->rb_pack_failed = true;
+         return false;
+      }
+      u = &renderer->rb_pack_program->uniforms;
+      renderer->rb_pack_loc[GL_PACK_LOC_RECT]   = gl_uniform_map_get(u, "rect");
+      renderer->rb_pack_loc[GL_PACK_LOC_SRC]    = gl_uniform_map_get(u, "src");
+      renderer->rb_pack_loc[GL_PACK_LOC_ORIGIN] = gl_uniform_map_get(u, "origin");
+      renderer->rb_pack_loc[GL_PACK_LOC_SCALE]  = gl_uniform_map_get(u, "scale");
+      renderer->rb_pack_loc[GL_PACK_LOC_MODE]   = gl_uniform_map_get(u, "mode");
+   }
+
+   glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+   glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+   glGetIntegerv(GL_VIEWPORT, viewport);
+   glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+   glActiveTexture(GL_TEXTURE0 + GL_COPY_UNIT);
+   glGetIntegerv(GL_TEXTURE_BINDING_2D, &unit_tex);
+   blend   = glIsEnabled(GL_BLEND);
+   depth   = glIsEnabled(GL_DEPTH_TEST);
+   stencil = glIsEnabled(GL_STENCIL_TEST);
+
+   if (!renderer->rb_pack_tex)
+   {
+      glGenTextures(1, &renderer->rb_pack_tex);
+      glBindTexture(GL_TEXTURE_2D, renderer->rb_pack_tex);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_R16UI,
+            (GLsizei)VRAM_WIDTH_PIXELS, (GLsizei)VRAM_HEIGHT);
+      glGenFramebuffers(1, &renderer->rb_pack_fbo);
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, renderer->rb_pack_fbo);
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, renderer->rb_pack_tex, 0);
+   }
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, renderer->rb_pack_fbo);
+   ok = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+   if (ok)
+   {
+      glDisable(GL_BLEND);
+      glDisable(GL_DEPTH_TEST);
+      glDisable(GL_STENCIL_TEST);
+      glViewport(0, 0, VRAM_WIDTH_PIXELS, VRAM_HEIGHT);
+      glBindTexture(GL_TEXTURE_2D, renderer->fb_out.id);
+      glUseProgram(renderer->rb_pack_program->id);
+      glUniform1i(loc[GL_PACK_LOC_SRC], GL_COPY_UNIT);
+      /* The texel a NEAREST blit down to 1x picks: the middle one. */
+      glUniform2i(loc[GL_PACK_LOC_ORIGIN],
+            (GLint)(x * s + s / 2), (GLint)(y * s + s / 2));
+      glUniform1i(loc[GL_PACK_LOC_SCALE], (GLint)s);
+      glUniform1i(loc[GL_PACK_LOC_MODE], mode);
+      gl_draw_rect(renderer, loc[GL_PACK_LOC_RECT], 0, 0, w, h);
+
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->rb_pack_fbo);
+      glReadBuffer(GL_COLOR_ATTACHMENT0);
+      glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)VRAM_WIDTH_PIXELS);
+      glReadPixels(0, 0, (GLsizei)w, (GLsizei)h,
+            GL_RED_INTEGER, GL_UNSIGNED_SHORT, dst);
+      ok = glGetError() == GL_NO_ERROR;
+   }
+   if (!ok)
+      renderer->rb_pack_failed = true;
+
+   glBindTexture(GL_TEXTURE_2D, (GLuint)unit_tex);
+   glActiveTexture((GLenum)active);
+   glUseProgram((GLuint)program);
+   glBindVertexArray((GLuint)vao);
+   glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+   if (blend)   glEnable(GL_BLEND);
+   if (depth)   glEnable(GL_DEPTH_TEST);
+   if (stencil) glEnable(GL_STENCIL_TEST);
+   return ok;
+}
+#endif
+
+bool rhi_gl_read_vram(uint16_t x, uint16_t y,
+                      uint16_t w, uint16_t h,
+                      uint16_t *vram)
+{
+   gl_renderer *renderer;
+   int diag_full_read;
+   GLuint   read_fbo    = 0;
+   GLuint   scratch_tex = 0;
+   GLuint   scratch_fbo = 0;
+   unsigned upscale;
+   GLint    prev_pack_alignment  = 4;
+   GLint    prev_pack_row_length = 0;
+   GLint    prev_read_fbo = 0;
+   GLint    prev_draw_fbo = 0;
+   GLboolean scissor_was_enabled;
+   GLenum   err;
+   bool     ok = false;
+   bool     is_32bpp;
+   bool     is_fp16;
+   bool     direct;
+   uint16_t *dst;
+   uint16_t *scratch_pixels = NULL;
+   uint32_t *scratch_rgba8  = NULL;
+   float    *scratch_f      = NULL;
+   size_t   row;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return false;
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return false;
+   if (vram == NULL)
+      return false;
+
+   /* Wrap-around FBReads aren't supported here. */
+   if ((unsigned)x + (unsigned)w > VRAM_WIDTH_PIXELS)
+      return false;
+   if ((unsigned)y + (unsigned)h > VRAM_HEIGHT)
+      return false;
+   if (w == 0 || h == 0)
+      return true;
+
+   diag_full_read = GL_DIAG_ON() && !gl_diag_nested &&
+         x == 0 && y == 0 && w == VRAM_WIDTH_PIXELS && h == VRAM_HEIGHT;
+
+   is_32bpp = renderer->fb_out_internal_format == GL_RGBA8;
+   /* The fp16 HDR target gets its own readback route: transfer the
+    * pixels as plain floats - the one format the spec guarantees for
+    * float color buffers - and quantise to 1555 in C. The previous
+    * route asked glReadPixels (and, upscaled, glBlitFramebuffer) to
+    * convert RGBA16F straight to packed 1555 in the driver: a rarely
+    * exercised conversion pair that Mesa implements correctly but that
+    * produced channel-scrambled VRAM on NVIDIA under savestate-heavy
+    * loads (Preemptive Frames runs this full-frame readback every
+    * frame, and any conversion defect compounds through the
+    * read -> serialize -> restore -> redraw cycle). Owning the
+    * quantisation makes the result deterministic and identical across
+    * drivers: clamp to [0,1], round to 5 bits, alpha at half - the
+    * hardware FBRead behaviour. */
+   is_fp16  = renderer->fb_out_fp16;
+   if (is_fp16)
+      is_32bpp = false;
+   upscale  = renderer->internal_upscaling;
+   if (upscale == 0)
+      upscale = 1;
+   if (upscale > 1 && !gl_caps.fp_glBlitFramebuffer)
+      return false;
+
+   gl_normalize_inherited_state();
+
+   /* Make sure all queued draws have actually landed in fb_out before
+    * we read it back. */
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   /* Save state we're about to clobber. */
+   glGetIntegerv(GL_PACK_ALIGNMENT,           &prev_pack_alignment);
+#ifdef GL_PACK_ROW_LENGTH
+   glGetIntegerv(GL_PACK_ROW_LENGTH,          &prev_pack_row_length);
+#endif
+   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+   scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+   if (scissor_was_enabled)
+      glDisable(GL_SCISSOR_TEST);
+
+   /* A 1555 target is read straight into the rows of vram; 32bpp and
+    * fp16 targets are read into a raw RGBA8 or float scratch and
+    * converted into vram from there. Without a pack row length (GLES2)
+    * a 1555 read goes through a tight scratch too. */
+#ifdef GL_PACK_ROW_LENGTH
+   direct = !is_fp16 && !is_32bpp;
+#else
+   direct = false;
+#endif
+   dst = &vram[(size_t)y * VRAM_WIDTH_PIXELS + (size_t)x];
+
+   glPixelStorei(GL_PACK_ALIGNMENT, 1);
+#ifdef GL_PACK_ROW_LENGTH
+   glPixelStorei(GL_PACK_ROW_LENGTH, direct ? (GLint)VRAM_WIDTH_PIXELS : 0);
+#endif
+
+#ifndef HAVE_OPENGLES3
+   /* Float and byte targets: words packed on the GPU, read into place. */
+   if ((is_fp16 || is_32bpp) &&
+       gl_read_vram_packed(renderer, x, y, w, h, dst,
+             is_fp16 ? 0 : renderer->byte_color_storage ? 1 : 2))
+   {
+      ok = true;
+      goto read_done;
+   }
+#endif
+
+   if (!direct)
+   {
+      size_t n     = (size_t)w * (size_t)h;
+      size_t bytes = is_fp16 ? n * 4u * sizeof(float)
+                   : is_32bpp ? n * sizeof(uint32_t) : n * sizeof(uint16_t);
+      if (bytes > renderer->rb_cpu_len)
+      {
+         void *p = realloc(renderer->rb_cpu, bytes);
+         if (!p)
+            goto cleanup;
+         renderer->rb_cpu     = p;
+         renderer->rb_cpu_len = bytes;
+      }
+      if (is_fp16)
+         scratch_f      = (float *)renderer->rb_cpu;
+      else if (is_32bpp)
+         scratch_rgba8  = (uint32_t *)renderer->rb_cpu;
+      else
+         scratch_pixels = (uint16_t *)renderer->rb_cpu;
+   }
+   else
+      scratch_pixels = dst;
+   if (!renderer->rb_read_fbo)
+      glGenFramebuffers(1, &renderer->rb_read_fbo);
+   read_fbo = renderer->rb_read_fbo;
+
+   if (upscale == 1)
+   {
+      /* Native res: read straight from fb_out into scratch.
+       *
+       * Both draw paths (command_vertex and image_load_vertex) map
+       * PS1 y with the SAME formula, y/256 - 1: PS1 row 0 lands at
+       * GL y = -1, i.e. GL row 0, the bottom. So fb_out's GL row g
+       * simply holds PS1 row g - no inversion. The previous version
+       * of this readback assumed the opposite (read origin at
+       * VRAM_HEIGHT - y - h plus a mirrored row copy), which returned
+       * every full-VRAM read vertically flipped and every partial
+       * FBRead from the wrong band entirely. Full-frame flips are
+       * invisible in normal play - textures sample fb_texture, and
+       * the display region is redrawn every frame - but the savestate
+       * path serializes the flipped image, and savestate-heavy
+       * runahead (Preemptive Frames) re-uploads and re-captures it
+       * every frame, toggling every texture page and CLUT upside down
+       * per cycle: the reported striped VRAM noise on GL only. Read
+       * the rect at GL y = y directly; rows arrive in increasing PS1
+       * order and copy straight. */
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+#ifdef HAVE_OPENGLES3
+      glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+            renderer->fb_out.id, 0);
+#else
+      glFramebufferTexture(GL_READ_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0, renderer->fb_out.id, 0);
+#endif
+      glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+      if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) ==
+            GL_FRAMEBUFFER_COMPLETE)
+      {
+         GLint gl_y = (GLint)y;
+         if (is_fp16)
+         {
+            glReadPixels(
+                  (GLint) x, gl_y,
+                  (GLsizei) w, (GLsizei) h,
+                  GL_RGBA, GL_FLOAT,
+                  scratch_f);
+         }
+         else if (is_32bpp)
+         {
+            glReadPixels(
+                  (GLint) x, gl_y,
+                  (GLsizei) w, (GLsizei) h,
+                  GL_RGBA, GL_UNSIGNED_BYTE,
+                  scratch_rgba8);
+         }
+         else
+         {
+            glReadPixels(
+                  (GLint) x, gl_y,
+                  (GLsizei) w, (GLsizei) h,
+                  GL_RGBA,
+#ifdef HAVE_OPENGLES3
+                  GL_UNSIGNED_SHORT_5_5_5_1,
+#else
+                  GL_UNSIGNED_SHORT_1_5_5_5_REV,
+#endif
+                  scratch_pixels);
+         }
+         ok = (glGetError() == GL_NO_ERROR);
+      }
+   }
+   else
+   {
+      /* Upscaled: blit the upscaled fb_out rect to a 1x scratch
+       * texture (matching fb_out's format so we don't lose precision
+       * at the blit step), then read the scratch.  We use NEAREST
+       * downsampling to match the SW renderer's "no filtering"
+       * behaviour. */
+      /* fp16 blits into an fp16 scratch - a same-format blit, the most
+       * conservative possible - and the float readback below does the
+       * only conversion, in C. */
+      GLenum   scratch_format = is_fp16 ? GL_RGBA16F
+                              : is_32bpp ? GL_RGBA8 : GL_RGB5_A1;
+
+      /* VRAM-sized, so any read fits in its corner; rebuilt only when
+       * the target format changes. */
+      if (!renderer->rb_scratch_tex || renderer->rb_scratch_format != scratch_format)
+      {
+         if (renderer->rb_scratch_tex)
+            glDeleteTextures(1, &renderer->rb_scratch_tex);
+         glGenTextures(1, &renderer->rb_scratch_tex);
+         glBindTexture(GL_TEXTURE_2D, renderer->rb_scratch_tex);
+         glTexStorage2D(GL_TEXTURE_2D, 1, scratch_format,
+               (GLsizei) VRAM_WIDTH_PIXELS, (GLsizei) VRAM_HEIGHT);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+         renderer->rb_scratch_format = scratch_format;
+      }
+      scratch_tex = renderer->rb_scratch_tex;
+      if (!renderer->rb_scratch_fbo)
+         glGenFramebuffers(1, &renderer->rb_scratch_fbo);
+      scratch_fbo = renderer->rb_scratch_fbo;
+
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+#ifdef HAVE_OPENGLES3
+      glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+            renderer->fb_out.id, 0);
+#else
+      glFramebufferTexture(GL_READ_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0, renderer->fb_out.id, 0);
+#endif
+      glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scratch_fbo);
+#ifdef HAVE_OPENGLES3
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+            scratch_tex, 0);
+#else
+      glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0, scratch_tex, 0);
+#endif
+
+      if (   glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE
+          && glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+      {
+         /* Source rect in fb_out (GL bottom-up coords): the PS1
+          * rectangle (x, y, w, h) lives at GL y = VRAM_HEIGHT - y - h
+          * .. VRAM_HEIGHT - y, all multiplied by upscale.  Blit
+          * straight (no Y flip on the dest); the splat below
+          * mirror-flips rows to convert from GL bottom-up (== PS1
+          * bottom-first) to PS1 top-first. */
+         GLint sx0 = (GLint) x        * (GLint) upscale;
+         GLint sx1 = (GLint)(x + w)   * (GLint) upscale;
+         GLint sy0 = (GLint) y        * (GLint) upscale;
+         GLint sy1 = (GLint)(y + h)   * (GLint) upscale;
+
+         gl_caps.fp_glBlitFramebuffer(
+               sx0, sy0, sx1, sy1,
+               0,   0,   (GLint) w, (GLint) h,
+               GL_COLOR_BUFFER_BIT,
+               GL_NEAREST);
+
+         glBindFramebuffer(GL_READ_FRAMEBUFFER, scratch_fbo);
+         glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+         if (is_fp16)
+         {
+            glReadPixels(
+                  0, 0,
+                  (GLsizei) w, (GLsizei) h,
+                  GL_RGBA, GL_FLOAT,
+                  scratch_f);
+         }
+         else if (is_32bpp)
+         {
+            glReadPixels(
+                  0, 0,
+                  (GLsizei) w, (GLsizei) h,
+                  GL_RGBA, GL_UNSIGNED_BYTE,
+                  scratch_rgba8);
+         }
+         else
+         {
+            glReadPixels(
+                  0, 0,
+                  (GLsizei) w, (GLsizei) h,
+                  GL_RGBA,
+#ifdef HAVE_OPENGLES3
+                  GL_UNSIGNED_SHORT_5_5_5_1,
+#else
+                  GL_UNSIGNED_SHORT_1_5_5_5_REV,
+#endif
+                  scratch_pixels);
+         }
+         ok = (glGetError() == GL_NO_ERROR);
+      }
+   }
+
+   /* In 32bpp mode, downsample the RGBA8 scratch into vram.  PS1
+    * VRAM is 16bpp natively so the extra precision the 32bpp render
+    * target captured is unavoidably lost here; any FBRead consumer
+    * is operating in 16bpp anyway.
+    *
+    * CPU VRAM always uses PlayStation ABGR1555, including on GLES. */
+   /* fp16 mode: quantise the float readback to 1555 in C, exactly what
+    * the driver conversion was asked to do before: clamp to [0,1],
+    * round each channel to 5 bits, alpha thresholds at half. Identical
+    * across drivers by construction. */
+   if (ok && is_fp16)
+   {
+      size_t c;
+      for (row = 0; row < h; row++)
+      for (c = 0; c < w; c++)
+      {
+         const float *px = scratch_f + (row * w + c) * 4u;
+         float rf = px[0], gf = px[1], bf = px[2], af = px[3];
+         uint32_t r5 = rf <= 0.0f ? 0u : rf >= 1.0f ? 31u : (uint32_t)(rf * 31.0f + 0.5f);
+         uint32_t g5 = gf <= 0.0f ? 0u : gf >= 1.0f ? 31u : (uint32_t)(gf * 31.0f + 0.5f);
+         uint32_t b5 = bf <= 0.0f ? 0u : bf >= 1.0f ? 31u : (uint32_t)(bf * 31.0f + 0.5f);
+         uint32_t a1 = (af >= 0.5f) ? 1u : 0u;
+         dst[row * VRAM_WIDTH_PIXELS + c] = (uint16_t)(
+               (a1 << 15) | (b5 << 10) | (g5 << 5) | r5);
+      }
+   }
+
+   if (ok && is_32bpp)
+   {
+      size_t c;
+      for (row = 0; row < h; row++)
+      for (c = 0; c < w; c++)
+      {
+         uint32_t px = scratch_rgba8[row * w + c];
+         /* On both desktop and GLES, GL_RGBA + GL_UNSIGNED_BYTE
+          * stores bytes as R, G, B, A in memory.  When reinterpreted
+          * as a host uint32_t this is little-endian R | G<<8 |
+          * B<<16 | A<<24 on x86/ARM little-endian platforms.  The
+          * rest of the codebase already assumes a little-endian
+          * host (e.g. GL_UNSIGNED_SHORT_1_5_5_5_REV interpretation),
+          * so we follow suit. */
+         uint32_t r8 = (px      ) & 0xFFu;
+         uint32_t g8 = (px >>  8) & 0xFFu;
+         uint32_t b8 = (px >> 16) & 0xFFu;
+         uint32_t a8 = (px >> 24) & 0xFFu;
+         /* 8-bit -> 5-bit: SDR byte storage truncates (see
+          * gl_native_mirror_conversion); the HDR RGBA8 fallback rounds
+          * c8 * 31 / 255 to nearest. */
+         uint32_t r5 = renderer->byte_color_storage ? r8 >> 3 :
+               (r8 * 31u + 127u) / 255u;
+         uint32_t g5 = renderer->byte_color_storage ? g8 >> 3 :
+               (g8 * 31u + 127u) / 255u;
+         uint32_t b5 = renderer->byte_color_storage ? b8 >> 3 :
+               (b8 * 31u + 127u) / 255u;
+         uint32_t a1 = (a8 >= 128u) ? 1u : 0u;
+         dst[row * VRAM_WIDTH_PIXELS + c] = (uint16_t)(
+               (a1 << 15) | (b5 << 10) | (g5 << 5) | r5);
+      }
+   }
+
+#ifdef HAVE_OPENGLES3
+   /* ES has no packed ABGR1555 read type. The native RGB5_A1 route
+    * returns RGBA5551; convert before updating the CPU mirror, just as
+    * gl_texture_set_sub_image_window converts in the other direction.
+    * Float and RGBA8 routes already produced PlayStation words above. */
+   if (ok && !is_fp16 && !is_32bpp)
+   {
+      size_t stride = direct ? VRAM_WIDTH_PIXELS : w;
+      size_t c;
+      for (row = 0; row < h; row++)
+      for (c = 0; c < w; c++)
+      {
+         uint16_t color = scratch_pixels[row * stride + c];
+         scratch_pixels[row * stride + c] = (uint16_t)(
+               ((color & 1u) << 15) | ((color & 0x3Eu) << 9) |
+               ((color >> 1) & 0x3E0u) | (color >> 11));
+      }
+   }
+#endif
+
+#ifndef HAVE_OPENGLES3
+read_done:
+#endif
+   if (ok)
+   {
+      /* A 1555 read through the tight scratch: rows of the rect, in
+       * increasing PS1 order (fb_out's GL row g holds PS1 row g). vram
+       * is always the native-resolution 1024 x 512 mirror; an upscaled
+       * fb_out was blitted down to w x h before the read. */
+      if (!direct && !is_fp16 && !is_32bpp)
+         for (row = 0; row < h; row++)
+            memcpy(&dst[row * VRAM_WIDTH_PIXELS],
+                   &scratch_pixels[row * w],
+                   (size_t)w * sizeof(uint16_t));
+
+      /* Shared HD texture tracker: rendered content flowed back into
+       * VRAM - refresh the mirror + invalidate covered rects. */
+      if (renderer->tracker && renderer->texture_tracking_enabled)
+      {
+         TTRect _rb = { x, y, w, h };
+         texture_tracker_notifyReadback(renderer->tracker, _rb, vram);
+      }
+   }
+
+   /* Diagnostic double-read: immediately repeat the full-VRAM read and
+    * compare. Any difference means the GPU-side readback itself is
+    * nondeterministic on this driver. */
+   if (ok && diag_full_read)
+   {
+      uint16_t *again = (uint16_t *)malloc(
+            (size_t)VRAM_WIDTH_PIXELS * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
+      if (again)
+      {
+         gl_diag_nested = 1;
+         if (rhi_gl_read_vram(0, 0, VRAM_WIDTH_PIXELS, VRAM_HEIGHT, again))
+            gl_diag_compare_vram("READBACK DOUBLE-READ", vram, again);
+         gl_diag_nested = 0;
+         free(again);
+      }
+   }
+
+cleanup:
+   /* Detach fb_out so the kept framebuffer does not hold a rebuilt
+    * target's old storage alive. */
+   if (read_fbo)
+   {
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+#ifdef HAVE_OPENGLES3
+      glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+#else
+      glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0);
+#endif
+   }
+
+#ifdef GL_PACK_ROW_LENGTH
+   glPixelStorei(GL_PACK_ROW_LENGTH, prev_pack_row_length);
+#endif
+   glPixelStorei(GL_PACK_ALIGNMENT,  prev_pack_alignment);
+
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint) prev_read_fbo);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint) prev_draw_fbo);
+
+   if (scissor_was_enabled)
+      glEnable(GL_SCISSOR_TEST);
+
+   /* Drain any GL errors caused by the dance so they don't leak into
+    * the next caller's get_error(). */
+   while ((err = glGetError()) != GL_NO_ERROR)
+      (void)err;
+
+   return ok;
+}
+
+
+#ifdef GL_READ_FRAMEBUFFER
+/* SDR bytes encode q*8; HDR byte/float targets keep normalized colors. A plain
+ * UNORM blit can use the wrong scale or choose an adjacent RGB5 code near a
+ * conversion threshold. Match CPU readback explicitly through the existing
+ * image-load buffer. This derived mirror never mutates fb_out or stencil;
+ * HDR keeps its floating render target and only reduces the mirror. */
+static bool gl_resolve_color_rect(gl_renderer *renderer, gl_texture *dst,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   GLint program, vao, array_buffer, active_texture, texture;
+   GLint viewport[4];
+   GLboolean scissor, blend, depth, stencil;
+   const GLint *loc = renderer->image_load_loc;
+   if (!renderer->image_load_program)
+      return false;
+   glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+   glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+   glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
+   glGetIntegerv(GL_VIEWPORT, viewport);
+   glGetIntegerv(GL_ACTIVE_TEXTURE, &active_texture);
+   glActiveTexture(GL_TEXTURE0);
+   glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+   scissor = glIsEnabled(GL_SCISSOR_TEST);
+   blend = glIsEnabled(GL_BLEND);
+   depth = glIsEnabled(GL_DEPTH_TEST);
+   stencil = glIsEnabled(GL_STENCIL_TEST);
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_BLEND);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_STENCIL_TEST);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, renderer->vram_sync_draw_fbo);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, dst->id, 0);
+   glViewport(0, 0, dst->width, dst->height);
+   glBindTexture(GL_TEXTURE_2D, renderer->fb_out.id);
+   glUseProgram(renderer->image_load_program->id);
+   glUniform1i(loc[GL_LOAD_LOC_FB_TEXTURE], 0);
+   glUniform1ui(loc[GL_LOAD_LOC_UPSCALING], renderer->internal_upscaling);
+   glUniform1ui(loc[GL_LOAD_LOC_CONVERSION],
+         gl_native_mirror_conversion(renderer));
+   gl_draw_rect(renderer, loc[GL_LOAD_LOC_RECT], x, y, x + w, y + h);
+   glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
+   glActiveTexture((GLenum)active_texture);
+   /* Same framebuffer exit state as the blit path in gl_blit_fb_out. */
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+   glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+   glUseProgram((GLuint)program);
+   glBindVertexArray((GLuint)vao);
+   glBindBuffer(GL_ARRAY_BUFFER, (GLuint)array_buffer);
+   if (scissor) glEnable(GL_SCISSOR_TEST);
+   if (blend) glEnable(GL_BLEND);
+   if (depth) glEnable(GL_DEPTH_TEST);
+   if (stencil) glEnable(GL_STENCIL_TEST);
+   return true;
+}
+
+static bool gl_blit_fb_out(gl_renderer *renderer, gl_texture *dst,
+      unsigned dst_scale, unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   GLboolean scissor_was_enabled;
+   GLint sx, sy, sw, sh;
+   GLint dx, dy, dw, dh;
+
+   if (!w || !h || !renderer->fb_out.id || !dst->id ||
+       !gl_caps.fp_glBlitFramebuffer)
+      return false;
+
+   if (dst == &renderer->fb_texture &&
+       gl_native_mirror_conversion(renderer) != 0u)
+      return gl_resolve_color_rect(renderer, dst, x, y, w, h);
+
+   sx = (GLint)x * (GLint)renderer->internal_upscaling;
+   sy = (GLint)y * (GLint)renderer->internal_upscaling;
+   sw = (GLint)w * (GLint)renderer->internal_upscaling;
+   sh = (GLint)h * (GLint)renderer->internal_upscaling;
+   dx = (GLint)x * (GLint)dst_scale;
+   dy = (GLint)y * (GLint)dst_scale;
+   dw = (GLint)w * (GLint)dst_scale;
+   dh = (GLint)h * (GLint)dst_scale;
+
+   scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->vram_sync_read_fbo);
+#ifdef HAVE_OPENGLES3
+   glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+         GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderer->fb_out.id, 0);
+#else
+   glFramebufferTexture(GL_READ_FRAMEBUFFER,
+         GL_COLOR_ATTACHMENT0, renderer->fb_out.id, 0);
+#endif
+   glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, renderer->vram_sync_draw_fbo);
+#ifdef HAVE_OPENGLES3
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
+         GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst->id, 0);
+#else
+   glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
+         GL_COLOR_ATTACHMENT0, dst->id, 0);
+#endif
+
+   if (scissor_was_enabled)
+      glDisable(GL_SCISSOR_TEST);
+
+   gl_caps.fp_glBlitFramebuffer(
+         sx, sy, sx + sw, sy + sh,
+         dx, dy, dx + dw, dy + dh,
+         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+   if (scissor_was_enabled)
+      glEnable(GL_SCISSOR_TEST);
+
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+   return true;
+}
+
+/* === Mirror a region of fb_out down into fb_texture ===
+ *
+ * The GL backend keeps two surfaces:
+ *   - fb_out:     upscaled render target (drawn into by all primitives)
+ *   - fb_texture: 1x texture that the command shader samples for textured
+ *                 draws (you can't sample-and-render the same texture in
+ *                 portable GL).
+ *
+ * They are synchronised over rendered bounds by an fb_out -> fb_texture
+ * resolve at end-of-frame (see the bottom of rhi_gl_finalize_frame). That
+ * is sufficient for fb_out mutations whose effect only needs to be
+ * visible to the *next* frame's textured draws. It is NOT sufficient
+ * when the same frame later samples the mutated region as a texture -
+ * fb_texture stays stale until end-of-frame, so the textured draw reads
+ * pre-mutation pixels.
+ *
+ * This helper closes the gap on demand. Call it from any rhi_gl_*
+ * entry point that mutates a region of fb_out and wants subsequent
+ * same-frame textured draws to see the new pixels. The blit goes
+ * through GL_NEAREST (matching the historical 1x-degrade behaviour
+ * the SW path would have produced) and downsamples from upscaled
+ * fb_out to native fb_texture in one call.
+ *
+ * Gating (the same conditions the long-standing rhi_gl_copy_rect
+ * mirror has used since the FF7-swirl fix):
+ *
+ *   - Existing fill/copy callers skip the mirror when has_software_fb is
+ *     true. Dependency-driven resolves pass allow_with_software_fb because
+ *     the shadow renderer does not make a queued GL primitive visible in
+ *     fb_texture before a later draw in the same frame.
+ *
+ *   - gl_caps.fp_glBlitFramebuffer is non-NULL. GL 3.0+ / GLES 3.0+
+ *     have it; GLES 2.0 drivers without GL_NV_framebuffer_blit do
+ *     not, and on those platforms the SW option is the only correct
+ *     mode. (The codebase's GL caps floor is GL/GLES 3.0 anyway, so
+ *     this branch is taken in practice.)
+ *
+ * fb_texture is permanently 1x: the blit downsamples upscaled detail
+ * to native resolution. That is a fundamental consequence of the
+ * dual-surface architecture, not a defect of the mirror.
+ *
+ * Args are PS1 native coords for the destination rect; the source rect
+ * in fb_out is the same rect scaled by internal_upscaling. */
+static bool gl_mirror_fb_out_to_fb_texture(gl_renderer *renderer,
+                                           uint16_t x, uint16_t y,
+                                           uint16_t w, uint16_t h,
+                                           bool allow_with_software_fb)
+{
+   bool mirrored;
+   if ((!allow_with_software_fb && has_software_fb) ||
+       !gl_caps.fp_glBlitFramebuffer)
+      return false;
+
+   mirrored = gl_blit_fb_out(renderer, &renderer->fb_texture, 1, x, y, w, h);
+
+   /* Submit dependency-driven mirrors before following texture fetches. */
+   if (allow_with_software_fb)
+      glFlush();
+   return mirrored;
+}
+
+static bool gl_copy_fb_out_to_feedback(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned scale = renderer->internal_upscaling;
+
+   if (!w || !h || !renderer->fb_out.id ||
+       !renderer->fb_feedback_texture.id)
+      return false;
+
+   if (gl_caps.fp_glCopyImageSubData)
+   {
+      gl_caps.fp_glCopyImageSubData(
+            renderer->fb_out.id, GL_TEXTURE_2D, 0,
+            x * scale, y * scale, 0,
+            renderer->fb_feedback_texture.id, GL_TEXTURE_2D, 0,
+            x * scale, y * scale, 0,
+            w * scale, h * scale, 1);
+      return true;
+   }
+
+   return gl_blit_fb_out(renderer, &renderer->fb_feedback_texture,
+            scale, x, y, w, h);
+}
+
+static void gl_fb_feedback_fail(gl_renderer *renderer, const char *reason)
+{
+   GLint active_texture;
+   bool had_texture = renderer->fb_feedback_texture.id != 0;
+
+   if (!renderer->fb_feedback_texture_failed)
+      log_cb(RETRO_LOG_WARN,
+            "Scaled framebuffer feedback unavailable (%s, %ux%u, format 0x%x); "
+            "falling back to native resolution\n",
+            reason, renderer->fb_out.width, renderer->fb_out.height,
+            (unsigned)renderer->fb_out_internal_format);
+
+   /* Every region resolved through the scaled snapshot skipped its native
+    * mirror and had its pending mask cleaned, so fb_texture is stale there
+    * and nothing would ever refresh it once the shader falls back to it.
+    * Resync the whole native mirror from fb_out now. Primitives still
+    * queued in the command buffer keep their pending marks and are
+    * mirrored on their next sample as usual. */
+   if (had_texture)
+      (void)gl_blit_fb_out(renderer, &renderer->fb_texture, 1,
+            0, 0, VRAM_WIDTH_PIXELS, VRAM_HEIGHT);
+
+   glDeleteTextures(1, &renderer->fb_feedback_texture.id);
+   renderer->fb_feedback_texture.id     = 0;
+   renderer->fb_feedback_texture.width  = 0;
+   renderer->fb_feedback_texture.height = 0;
+   renderer->fb_feedback_texture_failed = true;
+
+   /* Failure can occur while a frame is being built. Restore the native
+    * feedback binding immediately instead of waiting for prepare_frame(). */
+   glGetIntegerv(GL_ACTIVE_TEXTURE, &active_texture);
+   glActiveTexture(GL_TEXTURE3);
+   glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
+   glActiveTexture((GLenum)active_texture);
+}
+
+static bool gl_ensure_fb_feedback_texture(gl_renderer *renderer)
+{
+   GLint active_texture;
+   GLenum texture_storage;
+
+   if (renderer->fb_feedback_texture.id)
+      return true;
+   if (renderer->fb_feedback_texture_failed)
+      return false;
+   if ((renderer->internal_upscaling <= 1 &&
+        (psx_hdr_active || renderer->color_mode != PSX_INTERNAL_COLOR_32BPP)) ||
+       !renderer->fb_out.id || !renderer->fb_out.width || !renderer->fb_out.height)
+      return false;
+
+   texture_storage = renderer->fb_out_internal_format;
+   if (texture_storage != GL_RGB5_A1 &&
+       texture_storage != GL_RGBA8 &&
+       texture_storage != GL_RGBA16F)
+   {
+      gl_fb_feedback_fail(renderer, "unsupported framebuffer format");
+      return false;
+   }
+
+   glGetIntegerv(GL_ACTIVE_TEXTURE, &active_texture);
+   glActiveTexture(GL_TEXTURE3);
+   if (!gl_texture_init(&renderer->fb_feedback_texture,
+             renderer->fb_out.width, renderer->fb_out.height, texture_storage))
+      gl_fb_feedback_fail(renderer, "texture allocation failed");
+   else
+      gl_vram_sync_invalidate_scaled(renderer);
+   glActiveTexture((GLenum)active_texture);
+
+   return renderer->fb_feedback_texture.id != 0;
+}
+
+static bool gl_snapshot_fb_out(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned first_w;
+   unsigned first_h;
+   bool copied;
+
+   if (!w || !h || !renderer->fb_feedback_texture.id)
+      return false;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   first_w = w < VRAM_WIDTH_PIXELS - x ? w : VRAM_WIDTH_PIXELS - x;
+   first_h = h < VRAM_HEIGHT - y ? h : VRAM_HEIGHT - y;
+
+   copied = gl_copy_fb_out_to_feedback(renderer, x, y, first_w, first_h);
+   if (w > first_w)
+      copied &= gl_copy_fb_out_to_feedback(renderer,
+            0, y, w - first_w, first_h);
+   if (h > first_h)
+   {
+      copied &= gl_copy_fb_out_to_feedback(renderer,
+            x, 0, first_w, h - first_h);
+      if (w > first_w)
+         copied &= gl_copy_fb_out_to_feedback(renderer,
+               0, 0, w - first_w, h - first_h);
+   }
+
+   if (!copied)
+   {
+      gl_fb_feedback_fail(renderer, "copy path unavailable");
+      return false;
+   }
+
+   gl_vram_sync_clean_scaled_rect(renderer, x, y, w, h);
+   return true;
+}
+#endif /* GL_READ_FRAMEBUFFER */
+
+
+void rhi_gl_fill_rect(
+      uint32_t color,
+      uint16_t x, uint16_t y,
+      uint16_t w, uint16_t h)
+{
+   gl_renderer *renderer;
+   uint16_t top_left[2];
+   uint16_t dimensions[2];
+   uint8_t col[3];
+   GLfloat clear_color[3];
+   unsigned channel;
+   uint16_t draw_area_top_left[2];
+   uint16_t draw_area_bot_right[2];
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return;
+
+   top_left[0]   = x;
+   top_left[1]   = y;
+   dimensions[0] = w;
+   dimensions[1] = h;
+   col[0]        = (uint8_t) color;
+   col[1]        = (uint8_t) (color >> 8);
+   col[2]        = (uint8_t) (color >> 16);
+
+   /* GP0 fill discards the low three bits. Supplying the resulting RGB5
+    * code directly avoids driver-dependent UNORM rounding on this target. */
+   for (channel = 0; channel < 3; channel++)
+   {
+      unsigned color5 = col[channel] >> 3;
+      if (renderer->fb_out_internal_format == GL_RGB5_A1)
+         clear_color[channel] = (GLfloat)color5 / 31.0f;
+      else if (renderer->byte_color_storage)
+      {
+         unsigned color8 = renderer->color_mode == PSX_INTERNAL_COLOR_32BPP
+               ? (color5 * 255u + 15u) / 31u : color5 * 8u;
+         clear_color[channel] = (GLfloat)color8 / 255.0f;
+      }
+      else
+         clear_color[channel] = psx_hdr_active ? (GLfloat)col[channel] / 255.0f
+               : (GLfloat)color5 / 31.0f;
+   }
+
+   if (renderer->tracker && renderer->texture_tracking_enabled)
+   {
+      /* color is 0x00BBGGRR (8-bit channels, low 3 bits ignored). Pack to
+       * ABGR1555 (R in the low bits, mask/alpha bit cleared) to match how
+       * the VRAM mirror is read back - same conversion as the Vulkan
+       * renderer_clear_rect. */
+      uint16_t fill16 = (uint16_t)(((color >> 3) & 0x1f)
+            | (((color >> 11) & 0x1f) << 5)
+            | (((color >> 19) & 0x1f) << 10));
+      TTRect _cr = { x, y, w, h };
+      texture_tracker_clearRegion(renderer->tracker, _cr, fill16);
+   }
+
+   /* Draw pending commands */
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   gl_palette_cache_preserve(renderer, x, y, w, h);
+
+   /* Fill rect ignores the draw area. Save the previous value
+    * and reconfigure the scissor box to the fill rectangle
+    * instead. */
+   draw_area_top_left[0]  = renderer->config.draw_area_top_left[0];
+   draw_area_top_left[1]  = renderer->config.draw_area_top_left[1];
+   draw_area_bot_right[0] = renderer->config.draw_area_bot_right[0];
+   draw_area_bot_right[1] = renderer->config.draw_area_bot_right[1];
+
+   renderer->config.draw_area_top_left[0]  = top_left[0];
+   renderer->config.draw_area_top_left[1]  = top_left[1];
+   renderer->config.draw_area_bot_right[0] = top_left[0] + dimensions[0];
+   renderer->config.draw_area_bot_right[1] = top_left[1] + dimensions[1];
+
+   apply_scissor(renderer);
+
+   /* This scope is intentional, just like in the Rust version */
+   {
+      /* Bind the out framebuffer */
+      gl_framebuffer_bind(renderer->fb_out_fbo, &renderer->fb_out);
+
+      glClearColor(clear_color[0], clear_color[1], clear_color[2],
+            /* TODO - XXX Not entirely sure what happens to
+               the mask bit in fill_rect commands */
+            0.0);
+      glStencilMask(1);
+      glClearStencil(0);
+      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+   }
+
+   /* Reconfigure the draw area */
+   renderer->config.draw_area_top_left[0]    = draw_area_top_left[0];
+   renderer->config.draw_area_top_left[1]    = draw_area_top_left[1];
+   renderer->config.draw_area_bot_right[0]   = draw_area_bot_right[0];
+   renderer->config.draw_area_bot_right[1]   = draw_area_bot_right[1];
+
+   apply_scissor(renderer);
+
+#ifdef GL_READ_FRAMEBUFFER
+   /* Mirror the cleared region into fb_texture so subsequent
+    * same-frame textured draws sample fresh pixels. Without this,
+    * games that fill a VRAM region and then sample it as a texture
+    * later in the same frame (Dino Crisis 1's character textures
+    * appear to fall in this category) read pre-fill stale pixels
+    * from fb_texture and render garbage. See
+    * gl_mirror_fb_out_to_fb_texture for the gating rationale (only
+    * runs when has_software_fb is off and glBlitFramebuffer is
+    * present). */
+   (void)gl_mirror_fb_out_to_fb_texture(renderer, x, y, w, h, false);
+#endif
+
+#ifdef GL_READ_FRAMEBUFFER
+   if (gl_caps.fp_glBlitFramebuffer)
+   {
+      if (has_software_fb)
+         gl_vram_sync_mark_rect(renderer, x, y, w, h);
+      else
+         gl_vram_sync_clean_rect(renderer, x, y, w, h);
+   }
+#endif
+   gl_vram_sync_update_gpu_written_rect(renderer, x, y, w, h, true);
+}
+
+#ifdef GL_READ_FRAMEBUFFER
+enum
+{
+   GL_COPY_LOC_RECT = 0,
+   GL_COPY_LOC_ORIGIN,
+   GL_COPY_LOC_PERIOD,
+   GL_COPY_LOC_MASK_PASS,
+   GL_COPY_LOC_SET_MASK,
+   GL_COPY_LOC_SNAPSHOT
+};
+
+
+struct gl_copy_piece
+{
+   unsigned x, y, w, h;
+   /* Offset of the piece within its rect. */
+   unsigned ox, oy;
+};
+
+/* Splits a rect at the VRAM edges into up to four pieces inside VRAM. */
+static unsigned gl_copy_split(unsigned x, unsigned y, unsigned w, unsigned h,
+      struct gl_copy_piece *out)
+{
+   unsigned ws[2], hs[2];
+   unsigned n = 0, xi, yi;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   ws[0] = w < VRAM_WIDTH_PIXELS - x ? w : VRAM_WIDTH_PIXELS - x;
+   ws[1] = w - ws[0];
+   hs[0] = h < VRAM_HEIGHT - y ? h : VRAM_HEIGHT - y;
+   hs[1] = h - hs[0];
+   for (yi = 0; yi < 2; yi++)
+      for (xi = 0; xi < 2; xi++)
+         if (ws[xi] && hs[yi])
+         {
+            out[n].x  = xi ? 0 : x;
+            out[n].y  = yi ? 0 : y;
+            out[n].w  = ws[xi];
+            out[n].h  = hs[yi];
+            out[n].ox = xi ? ws[0] : 0;
+            out[n].oy = yi ? hs[0] : 0;
+            n++;
+         }
+   return n;
+}
+
+static void gl_copy_free(gl_renderer *renderer)
+{
+   if (renderer->copy_program)
+   {
+      gl_program_free(renderer->copy_program);
+      free(renderer->copy_program);
+      renderer->copy_program = NULL;
+   }
+   if (renderer->copy_snapshot.id)
+      glDeleteTextures(1, &renderer->copy_snapshot.id);
+   memset(&renderer->copy_snapshot, 0, sizeof(renderer->copy_snapshot));
+   renderer->copy_failed = false;
+}
+
+static bool gl_copy_init(gl_renderer *renderer)
+{
+   gl_program *program;
+   const struct gl_uniform_map *u;
+
+   if (renderer->copy_program)
+      return true;
+   if (renderer->copy_failed)
+      return false;
+
+   program = gl_program_build(vram_copy_vertex, vram_copy_fragment);
+   if (!program)
+   {
+      renderer->copy_failed = true;
+      log_cb(RETRO_LOG_WARN, "[GL] VRAM copy program unavailable; "
+            "overlapping, wrapping and masked copies are approximate\n");
+      return false;
+   }
+
+   u = &program->uniforms;
+   renderer->copy_loc[GL_COPY_LOC_RECT]      = gl_uniform_map_get(u, "rect");
+   renderer->copy_loc[GL_COPY_LOC_ORIGIN]    = gl_uniform_map_get(u, "origin");
+   renderer->copy_loc[GL_COPY_LOC_PERIOD]    = gl_uniform_map_get(u, "period");
+   renderer->copy_loc[GL_COPY_LOC_MASK_PASS] = gl_uniform_map_get(u, "mask_pass");
+   renderer->copy_loc[GL_COPY_LOC_SET_MASK]  = gl_uniform_map_get(u, "set_mask");
+   renderer->copy_loc[GL_COPY_LOC_SNAPSHOT]  = gl_uniform_map_get(u, "snapshot");
+   renderer->copy_program = program;
+   return true;
+}
+
+/* The snapshot follows fb_out's format and grows to the largest step. */
+static bool gl_copy_snapshot_ensure(gl_renderer *renderer,
+      unsigned w, unsigned h)
+{
+   gl_texture *t = &renderer->copy_snapshot;
+   bool ok;
+
+   if (t->id && t->internal_format == renderer->fb_out_internal_format &&
+       t->width >= w && t->height >= h)
+      return true;
+   if (t->id && t->internal_format == renderer->fb_out_internal_format)
+   {
+      if (t->width > w)
+         w = t->width;
+      if (t->height > h)
+         h = t->height;
+   }
+   if (t->id)
+      glDeleteTextures(1, &t->id);
+   memset(t, 0, sizeof(*t));
+   glActiveTexture(GL_TEXTURE0 + GL_COPY_UNIT);
+   ok = gl_texture_init(t, w, h, renderer->fb_out_internal_format);
+   glActiveTexture(GL_TEXTURE0);
+   if (!ok && t->id)
+   {
+      glDeleteTextures(1, &t->id);
+      memset(t, 0, sizeof(*t));
+   }
+   return ok;
+}
+
+static void gl_copy_draw(gl_renderer *renderer,
+      const struct gl_copy_piece *p, unsigned n)
+{
+   unsigned i;
+   for (i = 0; i < n; i++)
+      gl_draw_rect(renderer, renderer->copy_loc[GL_COPY_LOC_RECT],
+            p[i].x, p[i].y, p[i].x + p[i].w, p[i].y + p[i].h);
+}
+
+/* One step: every pixel of the step reads VRAM as it was before the step,
+ * so the source is snapshotted first. Color alpha is the mask bit; the
+ * stencil mirrors it for the mask test. */
+static void gl_copy_step(gl_renderer *renderer,
+      unsigned sx, unsigned sy, unsigned dx, unsigned dy,
+      unsigned w, unsigned h, bool mask_test)
+{
+   struct gl_copy_piece src[4];
+   struct gl_copy_piece dst[4];
+   unsigned s  = renderer->internal_upscaling;
+   unsigned ns = gl_copy_split(sx, sy, w, h, src);
+   unsigned nd = gl_copy_split(dx, dy, w, h, dst);
+   unsigned i;
+
+   if (!gl_caps.fp_glCopyImageSubData)
+   {
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->vram_sync_read_fbo);
+#ifdef HAVE_OPENGLES3
+      glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, renderer->fb_out.id, 0);
+#else
+      glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            renderer->fb_out.id, 0);
+#endif
+      glReadBuffer(GL_COLOR_ATTACHMENT0);
+   }
+   for (i = 0; i < ns; i++)
+   {
+      if (gl_caps.fp_glCopyImageSubData)
+         gl_caps.fp_glCopyImageSubData(
+               renderer->fb_out.id, GL_TEXTURE_2D, 0,
+               src[i].x * s, src[i].y * s, 0,
+               renderer->copy_snapshot.id, GL_TEXTURE_2D, 0,
+               src[i].ox * s, src[i].oy * s, 0,
+               src[i].w * s, src[i].h * s, 1);
+      else
+         glCopyTexSubImage2D(GL_TEXTURE_2D, 0,
+               src[i].ox * s, src[i].oy * s,
+               src[i].x * s, src[i].y * s,
+               src[i].w * s, src[i].h * s);
+   }
+   if (!gl_caps.fp_glCopyImageSubData)
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+   glUniform2i(renderer->copy_loc[GL_COPY_LOC_ORIGIN],
+         (GLint)((dx % VRAM_WIDTH_PIXELS) * s), (GLint)((dy % VRAM_HEIGHT) * s));
+
+   /* Color, where the mask test passes. */
+   glStencilMask(0);
+   glStencilFunc(mask_test ? GL_EQUAL : GL_ALWAYS, 0, 1);
+   glUniform1i(renderer->copy_loc[GL_COPY_LOC_MASK_PASS], 0);
+   gl_copy_draw(renderer, dst, nd);
+
+   /* Stencil from the written mask bit. Under the mask test a protected
+    * pixel already holds 1, and writing 1 again leaves it as it was. */
+   glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+   glStencilMask(1);
+   glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+   if (!mask_test)
+   {
+      glStencilFunc(GL_ALWAYS, 0, 1);
+      gl_copy_draw(renderer, dst, nd);
+   }
+   glStencilFunc(GL_ALWAYS, 1, 1);
+   glUniform1i(renderer->copy_loc[GL_COPY_LOC_MASK_PASS], 1);
+   gl_copy_draw(renderer, dst, nd);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+}
+
+/* GP0(80h) in the hardware's order: rows top to bottom, each row in
+ * 128-pixel chunks read before written. Rows D = dy - sy apart (mod 512)
+ * depend on each other, so bands of D rows run in order; with D = 0 a row
+ * reads only itself and its chunks run in order. Returns false when the
+ * program or its snapshot is unavailable. */
+static bool gl_copy_ordered(gl_renderer *renderer,
+      unsigned sx, unsigned sy, unsigned dx, unsigned dy,
+      unsigned w, unsigned h, bool mask_test, bool set_mask)
+{
+   unsigned s     = renderer->internal_upscaling;
+   unsigned d     = (dy + VRAM_HEIGHT - sy) % VRAM_HEIGHT;
+   bool cols      = ((dx + VRAM_WIDTH_PIXELS - sx) % VRAM_WIDTH_PIXELS) < w ||
+                    ((sx + VRAM_WIDTH_PIXELS - dx) % VRAM_WIDTH_PIXELS) < w;
+   unsigned band  = h;
+   unsigned chunk = w;
+   unsigned i;
+   GLboolean scissor, depth;
+
+   if (cols && d != 0 && d < h)
+      band = d;
+   else if (cols && d == 0 && w > 128)
+      chunk = 128;
+
+   if (!gl_copy_init(renderer) ||
+       !gl_copy_snapshot_ensure(renderer, chunk * s, band * s))
+      return false;
+
+   scissor = glIsEnabled(GL_SCISSOR_TEST);
+   depth   = glIsEnabled(GL_DEPTH_TEST);
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_BLEND);
+   glEnable(GL_STENCIL_TEST);
+   gl_framebuffer_bind(renderer->fb_out_fbo, &renderer->fb_out);
+   glActiveTexture(GL_TEXTURE0 + GL_COPY_UNIT);
+   glBindTexture(GL_TEXTURE_2D, renderer->copy_snapshot.id);
+   glUseProgram(renderer->copy_program->id);
+   glUniform1i(renderer->copy_loc[GL_COPY_LOC_SNAPSHOT], GL_COPY_UNIT);
+   glUniform2i(renderer->copy_loc[GL_COPY_LOC_PERIOD],
+         (GLint)(VRAM_WIDTH_PIXELS * s), (GLint)(VRAM_HEIGHT * s));
+   glUniform1i(renderer->copy_loc[GL_COPY_LOC_SET_MASK], set_mask ? 1 : 0);
+
+   if (band < h)
+      for (i = 0; i < h; i += band)
+         gl_copy_step(renderer, sx, sy + i, dx, dy + i, w,
+               h - i < band ? h - i : band, mask_test);
+   else
+      for (i = 0; i < w; i += chunk)
+         gl_copy_step(renderer, sx + i, sy, dx + i, dy,
+               w - i < chunk ? w - i : chunk, h, mask_test);
+
+   glBindTexture(GL_TEXTURE_2D, 0);
+   glActiveTexture(GL_TEXTURE0);
+   glBindVertexArray(0);
+   glDisable(GL_STENCIL_TEST);
+   if (depth)
+      glEnable(GL_DEPTH_TEST);
+   if (scissor)
+      glEnable(GL_SCISSOR_TEST);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+   return true;
+}
+#endif /* GL_READ_FRAMEBUFFER */
+
+void rhi_gl_copy_rect(
+      uint16_t src_x, uint16_t src_y,
+      uint16_t dst_x, uint16_t dst_y,
+      uint16_t w, uint16_t h,
+      bool mask_test, bool set_mask)
+{
+   gl_renderer *renderer;
+   uint32_t upscale;
+   bool inside;
+   bool apart;
+#ifdef GL_READ_FRAMEBUFFER
+   struct gl_copy_piece dst[4];
+   unsigned nd;
+   unsigned i;
+#endif
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return;
+
+   src_x &= VRAM_WIDTH_PIXELS - 1;
+   src_y &= VRAM_HEIGHT - 1;
+   dst_x &= VRAM_WIDTH_PIXELS - 1;
+   dst_y &= VRAM_HEIGHT - 1;
+   if (!w || !h || (src_x == dst_x && src_y == dst_y))
+     return;
+
+   renderer->set_mask          = set_mask;
+   renderer->force_mask        = set_mask;
+   renderer->mask_test         = mask_test;
+
+   if (renderer->tracker && renderer->texture_tracking_enabled)
+   {
+      TTRect _dst = { dst_x, dst_y, w, h };
+      TTRect _src = { src_x, src_y, w, h };
+      texture_tracker_blit(renderer->tracker, _dst, _src);
+   }
+
+   /* Draw pending commands */
+   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   gl_palette_cache_preserve(renderer, dst_x, dst_y, w, h);
+
+   upscale = renderer->internal_upscaling;
+   inside  = (unsigned)src_x + w <= VRAM_WIDTH_PIXELS &&
+             (unsigned)dst_x + w <= VRAM_WIDTH_PIXELS &&
+             (unsigned)src_y + h <= VRAM_HEIGHT &&
+             (unsigned)dst_y + h <= VRAM_HEIGHT;
+   apart   = (unsigned)src_x + w <= dst_x || (unsigned)dst_x + w <= src_x ||
+             (unsigned)src_y + h <= dst_y || (unsigned)dst_y + h <= src_y;
+
+   /* A plain copy between disjoint rects inside VRAM is one direct copy of
+    * color and of the stencil mirroring its mask bit. Everything else is
+    * drawn in the hardware's order (glCopyImageSubData is undefined on
+    * overlap and cannot apply the mask bits). */
+   if (inside && apart && !mask_test && !set_mask &&
+       gl_caps.fp_glCopyImageSubData)
+   {
+      gl_caps.fp_glCopyImageSubData(
+            renderer->fb_out.id, GL_TEXTURE_2D, 0,
+            src_x * upscale, src_y * upscale, 0,
+            renderer->fb_out.id, GL_TEXTURE_2D, 0,
+            dst_x * upscale, dst_y * upscale, 0,
+            w * upscale, h * upscale, 1);
+      gl_caps.fp_glCopyImageSubData(
+            renderer->fb_out_depth.id, GL_TEXTURE_2D, 0,
+            src_x * upscale, src_y * upscale, 0,
+            renderer->fb_out_depth.id, GL_TEXTURE_2D, 0,
+            dst_x * upscale, dst_y * upscale, 0,
+            w * upscale, h * upscale, 1);
+   }
+#ifdef GL_READ_FRAMEBUFFER
+   else if (!gl_copy_ordered(renderer, src_x, src_y, dst_x, dst_y,
+            w, h, mask_test, set_mask) &&
+         inside && gl_caps.fp_glCopyImageSubData)
+   {
+      /* No program: the direct copy is the closest left. */
+      gl_caps.fp_glCopyImageSubData(
+            renderer->fb_out.id, GL_TEXTURE_2D, 0,
+            src_x * upscale, src_y * upscale, 0,
+            renderer->fb_out.id, GL_TEXTURE_2D, 0,
+            dst_x * upscale, dst_y * upscale, 0,
+            w * upscale, h * upscale, 1);
+      gl_caps.fp_glCopyImageSubData(
+            renderer->fb_out_depth.id, GL_TEXTURE_2D, 0,
+            src_x * upscale, src_y * upscale, 0,
+            renderer->fb_out_depth.id, GL_TEXTURE_2D, 0,
+            dst_x * upscale, dst_y * upscale, 0,
+            w * upscale, h * upscale, 1);
+   }
+
+   /* Mirror the result into fb_texture for same-frame sampling, piece by
+    * piece since the mirror does not wrap. */
+   nd = gl_copy_split(dst_x, dst_y, w, h, dst);
+   for (i = 0; i < nd; i++)
+   {
+      (void)gl_mirror_fb_out_to_fb_texture(renderer,
+            dst[i].x, dst[i].y, dst[i].w, dst[i].h, false);
+      if (gl_caps.fp_glBlitFramebuffer)
+      {
+         if (has_software_fb)
+            gl_vram_sync_mark_rect(renderer, dst[i].x, dst[i].y, dst[i].w, dst[i].h);
+         else
+            gl_vram_sync_clean_rect(renderer, dst[i].x, dst[i].y, dst[i].w, dst[i].h);
+      }
+   }
+#endif
+   gl_vram_sync_update_gpu_written_rect(renderer, dst_x, dst_y, w, h, true);
+
+#ifdef DEBUG
+   get_error("rhi_gl_copy_rect");
+#endif
+}
+
+void rhi_gl_toggle_display(bool status)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+   {
+      rhi_defer_push_toggle_display(&gl_defer_queue, status);
+      return;
+   }
+
+   renderer->config.display_off = status;
+}
+
+bool rhi_gl_has_software_renderer(void)
+{
+   if (!static_renderer.inited)
+      return false;
+   return has_software_fb;
+}
+
+/* The GL HW context is only usable once gl_context_reset has brought the
+ * renderer up (state != GL_STATE_INVALID with valid state_data) and before a
+ * context_destroy tears it down. While it is down the renderer must not be
+ * driven and no display/scanout state may be written. */
+bool rhi_gl_context_ready(void)
+{
+   return static_renderer.state != GL_STATE_INVALID
+      && static_renderer.state_data != NULL;
+}

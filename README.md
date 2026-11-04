@@ -8,7 +8,7 @@ This branch is a work-in-progress separation of the reusable engine from individ
 - `updates/client/android/`: reusable optional Android update client and a buildable example.
 - `tools/nes_disassembler.py`: NES ROM inspection tool.
 
-**This branch is not yet a usable multi-platform game packager.** The builds check core compilation and exported libretro symbols only. They do not provide a generic frontend, package applications, or prove game compatibility. Additional integration, homebrew ROM tests, Android/desktop builds, per-system updates and packaging must pass before replacing the existing main branch. Core sources are fetched from their pinned upstream revisions during the probe and are not yet vendored here.
+**This branch is not yet a usable multi-platform game packager.** The builds check core compilation and exported libretro symbols only. They do not provide a generic frontend, package applications, or prove game compatibility. Additional integration, homebrew ROM tests, Android/desktop builds, per-system updates and packaging must pass before replacing the existing main branch. The three PlayStation 1 core sources are vendored; other probe sources are fetched from pinned upstream revisions.
 
 ## Desktop frontend decision
 

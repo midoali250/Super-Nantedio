@@ -4,7 +4,7 @@ This inventory distinguishes a pinned build probe from a usable game packager. O
 
 ## PlayStation family
 
-- **PlayStation 1:** PCSX ReARMed, Beetle PSX and SwanStation libretro core builds are being probed separately.
+- **PlayStation 1:** PCSX ReARMed, Beetle PSX and SwanStation source snapshots are stored in `engine/cores/vendor/`, and their libretro builds are probed separately.
 - **PSP:** PPSSPP libretro build is being probed; its runtime assets and GPU frontend still need integration and testing.
 - **PS2:** [PCSX2](https://github.com/PCSX2/pcsx2) is a candidate standalone emulator, not yet integrated or built by this repository. Platform and hardware support vary.
 - **PS3:** [RPCS3](https://github.com/RPCS3/rpcs3) is a candidate standalone emulator, not yet integrated or built here.
@@ -19,4 +19,4 @@ This inventory distinguishes a pinned build probe from a usable game packager. O
 - **GameCube / Wii:** [Dolphin](https://github.com/dolphin-emu/dolphin), standalone candidate only.
 - **Nintendo 64:** [Mupen64Plus-Next](https://github.com/libretro/mupen64plus-libretro-nx), libretro candidate only.
 
-Firmware/BIOS and games are not supplied. Some systems require user-provided system files. Respect the individual project's licenses and evaluate redistribution, dependencies and compatibility before packaging. Complex standalone emulators do not automatically conform to the libretro host interface and may require a different integration strategy.
+Games and proprietary firmware/BIOS are not supplied. Some vendored cores contain their upstream open-source OpenBIOS; other system files may need to be provided by the user. Respect the individual project's licenses and evaluate redistribution, dependencies and compatibility before packaging. Complex standalone emulators do not automatically conform to the libretro host interface and may require a different integration strategy.

@@ -22,14 +22,19 @@ jobs:
           python3 - '${{ matrix.core }}' <<'PYCODE'
           import json,os,subprocess,sys
           c=json.load(open('engine/cores/registry.json'))['cores'][int(sys.argv[1])]
-          os.mkdir('core-source')
-          subprocess.run(['git','init','-q','core-source'],check=True)
-          subprocess.run(['git','-C','core-source','remote','add','origin','https://github.com/'+c['repository']+'.git'],check=True)
-          subprocess.run(['git','-C','core-source','fetch','--depth=1','origin',c['revision']],check=True)
-          subprocess.run(['git','-C','core-source','checkout','--detach','FETCH_HEAD'],check=True)
-          assert subprocess.check_output(['git','-C','core-source','rev-parse','HEAD'],text=True).strip()==c['revision']
-          if os.path.isfile('core-source/.gitmodules'):
-              subprocess.run(['git','-C','core-source','submodule','update','--init','--recursive'],check=True)
+          if c.get('vendor_dir'):
+              import shutil
+              shutil.copytree(c['vendor_dir'], 'core-source', symlinks=True)
+              print('Using source committed in the engine repository:',c['vendor_dir'],flush=True)
+          else:
+              os.mkdir('core-source')
+              subprocess.run(['git','init','-q','core-source'],check=True)
+              subprocess.run(['git','-C','core-source','remote','add','origin','https://github.com/'+c['repository']+'.git'],check=True)
+              subprocess.run(['git','-C','core-source','fetch','--depth=1','origin',c['revision']],check=True)
+              subprocess.run(['git','-C','core-source','checkout','--detach','FETCH_HEAD'],check=True)
+              assert subprocess.check_output(['git','-C','core-source','rev-parse','HEAD'],text=True).strip()==c['revision']
+              if os.path.isfile('core-source/.gitmodules'):
+                  subprocess.run(['git','-C','core-source','submodule','update','--init','--recursive'],check=True)
           print('Pinned core:',c['name'],c['system'],flush=True)
           PYCODE
       - name: Install PSP graphics build dependencies

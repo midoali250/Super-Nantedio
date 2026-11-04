@@ -1,0 +1,7621 @@
+/* ============================================================
+ * rhi_tt.c - shared HD-texture replacement / tracking engine.
+ *
+ * Extracted from rhi_lib_vulkan.c (the folded parallel-psx
+ * custom-textures/ + texture_tracker.hpp content) and made
+ * renderer-agnostic: every GPU operation goes through the
+ * TTGpuBackend vtable supplied by the active RHI backend (GL or
+ * Vulkan), and image decode/encode goes through libretro-common's
+ * image_texture / image_transfer front end (PNG, JPEG, BMP, TGA,
+ * WEBP, DDS in; PNG out via rpng) instead of stb_image.
+ *
+ * See rhi_tt.h for the public API and HD_TEXTURE_CACHE.md /
+ * PAGE_ALIGN.md for the design. MSVC C89: no // comments, no
+ * declarations after statements.
+ * ============================================================ */
+
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+#include <boolean.h>
+#include <retro_inline.h>
+#include <retro_miscellaneous.h>
+
+#include <rthreads/rthreads.h>
+#include <streams/file_stream.h>
+#include <file/file_path.h>
+#include <formats/image.h>
+#include <formats/rpng.h>
+
+#include <retro_atomic.h>
+#include <retro_spsc.h>
+#include <rthreads/retro_eventcount.h>
+
+#include "rhi_tt.h"
+#include "tt_io_channel.h"
+
+/* Tracker-internal forward typedefs (subset of the old rhi_lib_vulkan.c
+ * typedef block; the shared types now come from rhi_tt.h). */
+typedef struct RectMatch RectMatch;
+typedef struct DumpedMode DumpedMode;
+typedef struct HdTexEntry HdTexEntry;
+typedef struct HdTexMap HdTexMap;
+typedef struct TextureUpload TextureUpload;
+typedef struct IORequest IORequest;
+typedef struct IOResponse IOResponse;
+typedef struct IOThread IOThread;
+typedef struct Palette Palette;
+typedef struct CachedPaletteHash CachedPaletteHash;
+typedef struct TextureRect TextureRect;
+typedef struct EnduringTextureRect EnduringTextureRect;
+typedef struct EnduringRectArr EnduringRectArr;
+typedef struct OwnedRectVec OwnedRectVec;
+typedef struct RectIndexSet RectIndexSet;
+typedef struct LookupGrid LookupGrid;
+typedef struct RectTracker RectTracker;
+typedef struct FusionRects FusionRects;
+typedef struct FusedPage FusedPage;
+typedef struct FusedPageVec FusedPageVec;
+typedef struct FusedPages FusedPages;
+typedef struct RestorableRect RestorableRect;
+typedef struct RestorableRectVec RestorableRectVec;
+typedef struct DbgHotkey DbgHotkey;
+typedef struct CacheEntry CacheEntry;
+typedef struct HandleCacheResult HandleCacheResult;
+typedef struct HandleLRUCache HandleLRUCache;
+typedef struct UploadOwningMap UploadOwningMap;
+typedef struct TextureRectSaveState TextureRectSaveState;
+typedef struct TextureRectSaveStateVec TextureRectSaveStateVec;
+typedef struct RestorableRectSaveState RestorableRectSaveState;
+typedef struct RestorableRectSaveStateVec RestorableRectSaveStateVec;
+typedef struct RGBAImage RGBAImage;
+typedef struct SRectResult SRectResult;
+typedef struct TextureRectResult TextureRectResult;
+typedef struct CellBounds CellBounds;
+typedef struct UploadPtrEntry UploadPtrEntry;
+
+
+   /* POD match rule from dump.cfg: a value of -1 means "wildcard" (matches any)
+    * for that field. Was a class with a initialiser + NSDMI + matches() method. */
+   struct RectMatch {
+      int x;
+      int y;
+      int w;
+      int h;
+   };
+
+static bool rect_match_matches(const RectMatch *m, TTRect r) {
+      return (m->x == -1 || m->x == r.x) && (m->y == -1 || m->y == r.y) &&
+         (m->w == -1 || m->w == (int)r.width) && (m->h == -1 || m->h == (int)r.height);
+   }
+
+/* Maximum number of "ignore" rules read from dump.cfg. A fixed cap keeps the
+ * list a plain inline array (no heap / no teardown); real dump configs have
+ * a handful of entries, so this is never approached. */
+#define DUMP_IGNORE_MAX 256
+
+/* Maximum number of "pageignore" rules read from dump.cfg (regions whose
+ * pages are excluded from page-aligned dumping). */
+#define PAGE_IGNORE_MAX 64
+
+/* ------------------------------------------------------------------
+ * GPU backend shims. One tracker instance exists per process (the
+ * core runs exactly one RHI renderer at a time), so the backend is
+ * file-scope state installed by texture_tracker_new. The ImageHandle
+ * struct + ih_* helpers preserve the refcounted-handle idiom the
+ * extracted code was written against, now delegating to the vtable.
+ * ------------------------------------------------------------------ */
+
+static TTGpuBackend tt_backend;
+static bool tt_backend_set = false;
+
+static INLINE TTGpuImage *tt_upload_levels(LoadedLevels *levels)
+{
+   return tt_backend.upload_levels(tt_backend.ctx, levels);
+}
+static INLINE void tt_staging_release(TTStaging *staging)
+{
+   tt_backend.staging_release(tt_backend.ctx, staging);
+}
+static INLINE void tt_img_addref(TTGpuImage *img)
+{
+   tt_backend.image_addref(tt_backend.ctx, img);
+}
+static INLINE void tt_img_release(TTGpuImage *img)
+{
+   tt_backend.image_release(tt_backend.ctx, img);
+}
+static INLINE unsigned tt_img_width(TTGpuImage *img)
+{
+   return tt_backend.image_width(tt_backend.ctx, img);
+}
+static INLINE unsigned tt_img_height(TTGpuImage *img)
+{
+   return tt_backend.image_height(tt_backend.ctx, img);
+}
+static INLINE size_t tt_img_vram_bytes(TTGpuImage *img)
+{
+   return tt_backend.image_vram_bytes(tt_backend.ctx, img);
+}
+
+struct ImageHandle { TTGpuImage *data; };
+typedef struct ImageHandle ImageHandle;
+
+static struct ImageHandle ih_make(TTGpuImage *p) { struct ImageHandle h; h.data = p; return h; }
+static void ih_reset(struct ImageHandle *h) { if (h->data) tt_img_release(h->data); h->data = NULL; }
+static TTGpuImage *ih_get(const struct ImageHandle *h) { return h->data; }
+static int ih_is_valid(const struct ImageHandle *h) { return h->data != NULL; }
+static void ih_copy(struct ImageHandle *dst, const struct ImageHandle *src) {
+   dst->data = src->data;
+   if (dst->data)
+      tt_img_addref(dst->data);
+}
+static void ih_assign(struct ImageHandle *dst, const struct ImageHandle *src) {
+   if (dst == src)
+      return;
+   ih_reset(dst);
+   ih_copy(dst, src);
+}
+static void ih_move(struct ImageHandle *dst, struct ImageHandle produced) {
+   ih_reset(dst);
+   dst->data = produced.data;
+}
+static void ih_steal(struct ImageHandle *dst, struct ImageHandle *src) { dst->data = src->data; src->data = NULL; }
+
+/* Copy an owned (+1) raw reference out of a handle - the HdTexture
+ * producer paths hand these to the renderer, which releases them once
+ * the bind is recorded. */
+static TTGpuImage *tt_ih_owned_copy(const ImageHandle *h)
+{
+   if (h->data)
+      tt_img_addref(h->data);
+   return h->data;
+}
+
+
+   /* DumpedMode: plain POD (was a value type whose only method was equality
+    * helper, now the free function dumpedmode_eq). */
+   struct DumpedMode {
+      TextureMode mode;
+      uint32_t palette_hash;
+   };
+
+   static INLINE bool dumpedmode_eq(const struct DumpedMode *a,
+         const struct DumpedMode *b)
+   {
+      return a->mode == b->mode && a->palette_hash == b->palette_hash;
+   }
+
+
+   /* -------------------------------------------------------------------------
+    * * HdTexMap - palette_hash -> (Vulkan image, alpha flags), MSVC C89.
+    *
+    * A uint32_t -> HdImageHandle map on TextureUpload. Backed by a sorted,
+    * malloc'd array of POD entries keyed by palette hash (binary-search lookup,
+    * insert keeps it sorted). The image is held as a raw TTGpuImage * (so the array
+    * can realloc) with the intrusive refcount managed by hand: a reference is
+    * taken when an entry is stored and released on replace/erase/clear/free -
+    * matching the raw-pointer scheme already used by the GPU image cache.
+    * Entries are POD, so TextureUpload can be a plain malloc-backed value once
+    * this and the other members are converted.
+    * ------------------------------------------------------------------------- */
+   struct HdTexEntry {
+      uint32_t       key;          /* palette hash */
+      TTGpuImage *image;        /* owns one reference while stored */
+      int            alpha_flags;
+   };
+   struct HdTexMap {
+      HdTexEntry *entries;
+      int         count;
+      int         cap;
+   };
+
+   static void hd_tex_map_init(HdTexMap *m)
+   {
+      m->entries = NULL;
+      m->count = 0;
+      m->cap = 0;
+   }
+   static int hd_tex_map_lower_bound(const HdTexMap *m, uint32_t key)
+   {
+      int lo = 0, hi = m->count;
+      while (lo < hi) {
+         int mid = lo + ((hi - lo) >> 1);
+         if (m->entries[mid].key < key)
+            lo = mid + 1;
+         else
+            hi = mid;
+      }
+      return lo;
+   }
+   /* Returns the entry for key, or NULL. */
+   static HdTexEntry *hd_tex_map_find(HdTexMap *m, uint32_t key)
+   {
+      int i = hd_tex_map_lower_bound(m, key);
+      if (i < m->count && m->entries[i].key == key)
+         return &m->entries[i];
+      return NULL;
+   }
+   static int hd_tex_map_contains(const HdTexMap *m, uint32_t key)
+   {
+      int i = hd_tex_map_lower_bound(m, key);
+      return i < m->count && m->entries[i].key == key;
+   }
+   /* Insert or replace key -> (image, alpha). Takes a reference on `image`;
+    * releases any image previously stored at this key. */
+   static void hd_tex_map_set(HdTexMap *m,
+         uint32_t key,
+         TTGpuImage *image,
+         int alpha_flags)
+   {
+      int i = hd_tex_map_lower_bound(m, key);
+      if (i < m->count && m->entries[i].key == key) {
+         if (image) tt_img_addref(image);
+         if (m->entries[i].image) tt_img_release(m->entries[i].image);
+         m->entries[i].image = image;
+         m->entries[i].alpha_flags = alpha_flags;
+         return;
+      }
+      if (m->count == m->cap) {
+         int ncap = m->cap ? m->cap * 2 : 8;
+         HdTexEntry *ne = (HdTexEntry *)realloc(m->entries, (size_t)ncap * sizeof(HdTexEntry));
+         if (!ne)
+            return;
+         m->entries = ne;
+         m->cap = ncap;
+      }
+      memmove(&m->entries[i + 1], &m->entries[i], (size_t)(m->count - i) * sizeof(HdTexEntry));
+      if (image) tt_img_addref(image);
+      m->entries[i].key = key;
+      m->entries[i].image = image;
+      m->entries[i].alpha_flags = alpha_flags;
+      m->count++;
+   }
+   /* Release all image refs and reset to empty (keeps allocation). */
+   static void hd_tex_map_clear(HdTexMap *m)
+   {
+      int i;
+      for (i = 0; i < m->count; i++)
+         if (m->entries[i].image)
+            tt_img_release(m->entries[i].image);
+      m->count = 0;
+   }
+   static void hd_tex_map_free(HdTexMap *m)
+   {
+      hd_tex_map_clear(m);
+      free(m->entries);
+      m->entries = NULL;
+      m->cap = 0;
+   }
+   /* Deep-copy src into dst (dst assumed empty/inited); re-acquires image refs. */
+   static void hd_tex_map_copy(HdTexMap *dst, const HdTexMap *src)
+   {
+      int i;
+      dst->entries = NULL;
+      dst->count = src->count;
+      dst->cap = src->count;
+      if (src->count) {
+         dst->entries = (HdTexEntry *)malloc((size_t)src->count * sizeof(HdTexEntry));
+         if (!dst->entries) {
+            /* OOM: keep the map consistently empty rather than leaving count/cap
+             * advertising entries over a NULL buffer (which the copy loop and
+             * every later entries[] access would dereference). */
+            dst->count = 0;
+            dst->cap = 0;
+            return;
+         }
+         for (i = 0; i < src->count; i++) {
+            dst->entries[i] = src->entries[i];
+            if (dst->entries[i].image)
+               tt_img_addref(dst->entries[i].image);
+         }
+      }
+   }
+
+   struct TextureUpload {
+      /* Intrusive refcount for shared ownership across TextureRects (replaces a
+       * refcounted TextureUpload). A freshly created upload starts at 0;
+       * texture_upload_new() bumps it to 1. Copies (deep-copy
+       * initialiser/assignment, used by the by-value save-state map) get their
+       * OWN fresh count - the refcount is deliberately not copied. */
+      int refcount;
+      /* VRAM source pixels (owned). Owned uint16_t array; filled once at
+       * creation and thereafter read-only. */
+      uint16_t *image;
+      int       image_count;
+      bool dumpable;
+      int width;
+      int height;
+      uint32_t hash;
+      /* Modes already dumped to disk (owned growable array, append-only).
+       * Owned DumpedMode array. */
+      DumpedMode *dumped_modes;
+      int         dumped_modes_count;
+      int         dumped_modes_cap;
+      HdTexMap textures; /* palette hash -> (image, alpha) */
+      /* Reduce Palette Range memo: the [min,max] CLUT indices this upload's index
+       * data references, cached per sampling mode (recomputed when reduce_pal_mode
+       * changes). reduce_pal_min < 0 = no valid range (use the full-palette hash). */
+      int reduce_pal_min;
+      int reduce_pal_max;
+      int reduce_pal_mode;
+               /* (HD load bookkeeping lives on the TextureTracker: hd_gpu_cache
+                * / hd_cache / requested / pending_attach, keyed by
+                * (hash,palette) so it survives this upload being recreated as
+                * the sprite animation churns VRAM.) */
+   };
+
+   /* TextureUpload owns malloc'd buffers (image, dumped_modes) and an HdTexMap,
+    * but is a plain struct: it is created, copied
+    * and destroyed only through the explicit helpers below. texture_upload_init
+    * mirrors the former default initialiser, texture_upload_destroy the former
+    * teardown, and texture_upload_copy_contents the former deep copy (a fresh
+    * refcount is NOT taken from the source - the destination keeps its own). */
+   static void texture_upload_init(TextureUpload *u)
+   {
+      u->refcount = 0;
+      u->image = NULL;
+      u->image_count = 0;
+      u->dumpable = false;
+      u->width = 0;
+      u->height = 0;
+      u->hash = 0;
+      u->dumped_modes = NULL;
+      u->dumped_modes_count = 0;
+      u->dumped_modes_cap = 0;
+      u->reduce_pal_min = -1;
+      u->reduce_pal_max = -1;
+      u->reduce_pal_mode = -1;
+      hd_tex_map_init(&u->textures);
+   }
+   static void texture_upload_destroy(TextureUpload *u)
+   {
+      free(u->image);
+      free(u->dumped_modes);
+      hd_tex_map_free(&u->textures);
+      free(u);
+   }
+   /* Deep-copy the owned contents of src into dst, releasing dst's existing
+    * buffers/texmap first. dst->refcount is left untouched (matching the old
+    * copy-assignment, which never copied the refcount). */
+   static void texture_upload_copy_contents(TextureUpload *dst,
+         const TextureUpload *src)
+   {
+      if (dst == src)
+         return;
+      free(dst->image);
+      free(dst->dumped_modes);
+      hd_tex_map_free(&dst->textures);
+      dst->image = NULL;
+      dst->dumped_modes = NULL;
+      dst->image_count = src->image_count;
+      dst->dumped_modes_count = src->dumped_modes_count;
+      dst->dumped_modes_cap = src->dumped_modes_count;
+      dst->dumpable = src->dumpable;
+      dst->width = src->width;
+      dst->height = src->height;
+      dst->hash = src->hash;
+      dst->reduce_pal_min = -1; /* memo: force recompute on the copy */
+      dst->reduce_pal_max = -1;
+      dst->reduce_pal_mode = -1;
+      if (dst->image_count) {
+         dst->image = (uint16_t *)malloc((size_t)dst->image_count * sizeof(uint16_t));
+         if (!dst->image)
+            dst->image_count = 0; /* OOM: stay consistent (no buffer, no count) */
+         else
+            memcpy(dst->image, src->image, (size_t)dst->image_count * sizeof(uint16_t));
+      }
+      if (dst->dumped_modes_count) {
+         dst->dumped_modes = (DumpedMode *)malloc((size_t)dst->dumped_modes_count * sizeof(DumpedMode));
+         if (!dst->dumped_modes) {
+            dst->dumped_modes_count = 0; /* OOM: stay consistent */
+            dst->dumped_modes_cap = 0;
+         } else
+            memcpy(dst->dumped_modes, src->dumped_modes, (size_t)dst->dumped_modes_count * sizeof(DumpedMode));
+      }
+      hd_tex_map_copy(&dst->textures, &src->textures);
+   }
+
+   /* Allocate a new TextureUpload with refcount 1 (the caller owns that ref). */
+   static TextureUpload *texture_upload_new()
+   {
+      TextureUpload *u = (TextureUpload *)malloc(sizeof(TextureUpload));
+      texture_upload_init(u);
+      u->refcount = 1;
+      return u;
+   }
+   static void texture_upload_acquire(TextureUpload *u)
+   {
+      if (u)
+         u->refcount++;
+   }
+   static void texture_upload_release(TextureUpload *u)
+   {
+      if (u && --u->refcount == 0)
+         texture_upload_destroy(u); /* frees image/dumped_modes and releases the texmap refs */
+   }
+
+   /* byte buffer plus its size, rather than a managed byte vector. This is a
+    * POD (trivially copyable) struct - copying it copies the pointer, NOT the
+    * bytes, so ownership is by convention: exactly one LoadedLevels owns each
+    * buffer and frees it. Ownership transfers are explicit pointer-steals
+    * (push_move / move-assign helpers below); there is no implicit deep copy
+    * and no teardown. This keeps it storable in plain arrays and
+    * realloc-movable. */
+
+   /* Allocate the RGBA buffer for a level (width*height*4). Frees any prior
+    * buffer. Returns 0 on success, -1 on allocation failure (buffer left NULL). */
+static int loaded_image_alloc(LoadedImage *img, int width, int height)
+   {
+      size_t bytes = (size_t)width * (size_t)height * 4u;
+      free(img->owned_data);
+      img->owned_data = (uint8_t *)malloc(bytes ? bytes : 1);
+      img->owned_size = img->owned_data ? bytes : 0;
+      img->width  = width;
+      img->height = height;
+      return img->owned_data ? 0 : -1;
+   }
+
+   /* Zero-initialise a level (no buffer). Use before loaded_image_alloc. */
+static void loaded_image_init(LoadedImage *img)
+   {
+      img->owned_data = NULL;
+      img->owned_size = 0;
+      img->width      = 0;
+      img->height     = 0;
+   }
+
+   /* A decoded texture as a set of mip levels. C-style dynamic array: `levels`
+    * is a malloc'd array of `count` LoadedImage, owning all buffers. Replaces a
+    * dynamic array of LoadedImage. POD/trivially-copyable: a copy aliases the
+    * same buffers, so callers move ownership explicitly (loaded_levels_move)
+    * and free explicitly (loaded_levels_reset). Initialise with
+    * loaded_levels_init or zero-init before first use. */
+
+   /* Total owned bytes across all levels. */
+   static size_t loaded_levels_byte_size(const LoadedLevels *l)
+   {
+      size_t b = 0;
+      int i;
+      for (i = 0; i < l->count; i++)
+         b += l->levels[i].owned_size;
+      return b;
+   }
+
+   /* Append by stealing *src's buffer (src left empty). Grows with realloc.
+    * Returns the stored level, or NULL on alloc failure. */
+   static LoadedImage *loaded_levels_push_move(LoadedLevels *l,
+         LoadedImage *src)
+   {
+      LoadedImage *grown = (LoadedImage *)realloc(l->levels, (size_t)(l->count + 1) * sizeof(LoadedImage));
+      if (!grown)
+         return NULL;
+      l->levels = grown;
+      l->levels[l->count] = *src; /* POD: copies the pointer (steal) */
+      loaded_image_init(src);
+      return &l->levels[l->count++];
+   }
+
+   /* Free all buffers + the array, return to empty state. Levels in upload
+    * memory give it back to the backend, which is the render thread's to do. */
+   static void loaded_levels_reset(LoadedLevels *l)
+   {
+      int i;
+      if (l->staging)
+         tt_staging_release(l->staging);
+      else
+         for (i = 0; i < l->count; i++)
+            free(l->levels[i].owned_data);
+      free(l->levels);
+      l->levels  = NULL;
+      l->count   = 0;
+      l->staging = NULL;
+   }
+
+   /* Zero-initialise (no allocation). */
+static void loaded_levels_init(LoadedLevels *l)
+   {
+      l->levels  = NULL;
+      l->count   = 0;
+      l->staging = NULL;
+   }
+
+   /* Move ownership src -> dst (dst's prior contents freed; src left empty). */
+static void loaded_levels_move(LoadedLevels *dst, LoadedLevels *src)
+   {
+      if (dst == src)
+         return;
+      loaded_levels_reset(dst);
+      dst->levels  = src->levels;
+      dst->count   = src->count;
+      dst->staging = src->staging;
+      src->levels  = NULL;
+      src->count   = 0;
+      src->staging = NULL;
+   }
+
+
+   /* Max length for HD texture file paths built by the path helpers below.
+    * Defined here so both IORequest and the path helpers can use it. */
+   enum { PATH_MAX_TT = 4096 + 256 };
+
+   enum IORequestKind {
+      IORequestKind_Load,
+      IORequestKind_Dump,
+   };
+   typedef enum IORequestKind IORequestKind;
+
+   struct IORequest {
+      tt_io_node node;               /* first: the channel's link (tt_io_channel.h) */
+      IORequestKind kind;
+      /* Load payload (valid when kind == Load): */
+      uint32_t hash;
+      uint32_t palette_hash;
+      bool     pages;                /* page-aligned experiment: load/dump in the -pages folder */
+      /* Dump payload (valid when kind == Dump): */
+      char     path[PATH_MAX_TT];
+      int      width;
+      int      height;
+      /* Raw VRAM source + palette snapshot; the palette->RGBA->tri-alpha decode is
+       * deferred to the IO worker (decode_dump_rgba) so it doesn't burst on the
+       * render thread - the render thread only takes these cheap copies. */
+      uint16_t *src;                 /* VRAM source words, row-major (owned; NULL if none) */
+      size_t    src_len;             /* element count */
+      uint16_t *palette;             /* CLUT copy (owned; NULL = no palette) */
+      size_t    palette_len;         /* element count */
+      int       dump_mode;           /* TextureMode as int (distinguishes ABGR1555 direct colour) */
+      int       ppp;                 /* texels packed per 16-bit source word (1/2/4) */
+   };
+
+   static void io_request_free(IORequest *r)
+   {
+      if (r) {
+         free(r->src);
+         free(r->palette);
+         free(r);
+      }
+   }
+
+   const int ALPHA_FLAG_OPAQUE = 1;
+   const int ALPHA_FLAG_SEMI_TRANSPARENT = 2;
+   const int ALPHA_FLAG_TRANSPARENT = 4;
+
+   enum IOResponseKind {
+      IOResponseKind_Load,
+      /* Not a response: a worker asking for upload memory to decode into
+       * (staging_* below). The render thread answers on the worker's lane. */
+      IOResponseKind_Staging
+   };
+   typedef enum IOResponseKind IOResponseKind;
+
+   struct IOResponse {
+      tt_io_node node;               /* first: the channel's link (tt_io_channel.h) */
+      IOResponseKind kind;
+      uint32_t hash;
+      uint32_t palette_hash;
+      int alpha_flags;
+      bool pages;                    /* page-aligned experiment: routes to the page attach pass */
+      LoadedLevels levels;
+      /* Upload memory the worker was given and did not use (the file was not
+       * the size its header said); the render thread gives it back. */
+      TTStaging *spare;
+      /* Staging request: which worker, and the chain it wants room for. */
+      int staging_worker;
+      int staging_width;
+      int staging_height;
+      int staging_levels;
+   };
+
+   static void io_response_free(IOResponse *r)
+   {
+      if (r) {
+         loaded_levels_reset(&r->levels);
+         if (r->spare)
+            tt_staging_release(r->spare);
+         free(r);
+      }
+   }
+
+   /* The channel to the IO workers is rhi/tt_io_channel.c: no lock, the
+    * render thread keeps the requests the workers have not been shown and
+    * can reorder them freely. These hand it the two node types. */
+   static void io_request_node_free(tt_io_node *n)  { io_request_free((IORequest *)n); }
+   static void io_response_node_free(tt_io_node *n) { io_response_free((IOResponse *)n); }
+
+   /* A queued low-priority Load for (hash, palette, pages). */
+   struct IOLoadKey { uint32_t hash; uint32_t palette_hash; bool pages; };
+   static bool io_request_is_load(const tt_io_node *n, void *ctx) {
+      const IORequest *r = (const IORequest *)n;
+      const struct IOLoadKey *k = (const struct IOLoadKey *)ctx;
+      return r->kind == IORequestKind_Load && r->hash == k->hash &&
+            r->palette_hash == k->palette_hash && r->pages == k->pages;
+   }
+
+   /* Owns the IO worker thread pool. Formerly a class with a initialiser
+    * (create the channel, spin up NUM_IO_THREADS detached workers each holding
+    * a channel reference) and teardown (signal done, wake the workers, drop
+    * this thread's reference); now a plain struct driven by io_thread_init /
+    * io_thread_deinit. The single member is the refcounted channel pointer.
+    * TextureTracker embeds one by value and drives its init/deinit. */
+   /* Upload memory for the workers. A worker that has opened a replacement
+    * asks the render thread for room to decode it into, by pushing an
+    * IOResponseKind_Staging node with its responses, and the render thread
+    * answers on that worker's lane: a retro_spsc of IOStagingReply that only
+    * the render thread writes and only the worker reads, with an eventcount
+    * the worker parks on. Each worker has at most one question open, so a
+    * lane holds at most one answer plus the closing one. */
+   enum { TT_IO_WORKERS_MAX = 4, TT_STAGING_LEVELS_MAX = 16 };
+
+   struct IOStagingReply {
+      TTStaging *staging;   /* NULL: none, decode to malloc'd memory */
+      uint8_t   *level_data[TT_STAGING_LEVELS_MAX];
+      bool       closed;    /* no more answers will come; stop asking */
+   };
+   typedef struct IOStagingReply IOStagingReply;
+
+   struct IOWorker {
+      struct IOPool     *pool;
+      int                index;
+      retro_spsc_t       lane;     /* render thread -> this worker */
+      retro_eventcount_t answered;
+      /* The worker's own: */
+      bool               asked;    /* a question is open */
+      bool               closed;   /* the render thread has stopped answering */
+   };
+   typedef struct IOWorker IOWorker;
+
+   /* What the workers share: the channel and their lanes. Detached workers,
+    * so it is reference counted like the channel: one for the render thread
+    * and one per worker, the last release frees it. */
+   struct IOPool {
+      retro_atomic_int_t refs;
+      tt_io_channel     *channel;
+      bool               staging;  /* the backend has upload memory to give */
+      int                count;
+      IOWorker           workers[TT_IO_WORKERS_MAX];
+   };
+   typedef struct IOPool IOPool;
+
+   struct IOThread {
+      tt_io_channel *channel; /* refcounted; one ref held here, one per worker */
+      IOPool        *pool;    /* refcounted; one ref held here, one per worker */
+      int            lent;    /* answers holding upload memory not yet back */
+      bool           closed;  /* the workers have been told: no more answers */
+   };
+
+   static void io_thread_init(IOThread *t);
+   static void io_thread_deinit(IOThread *t);
+
+   struct Palette {
+      uint16_t *data;
+      uint32_t hash;
+   };
+
+   struct CachedPaletteHash {
+      TTRect rect;
+      uint32_t hash;
+   };
+
+   /* ============
+    * RectTracker */
+
+   /* TextureRect is a trivially-copyable POD: a borrowed view of an upload plus
+    * a subrect. It does NOT manage the refcount in special members (so it
+    * relocates with a bitwise move - no per-copy acquire/release, no exception
+    * scaffolding in the containers that hold it). Ownership lives at container
+    * boundaries instead: a container retains on insert and releases on
+    * erase/clear/destroy via texture_rect_retain / texture_rect_release.
+    * Transient TextureRect values (subTexture results, clip pairs, scratch
+    * arrays) are borrowing and need no ref ops. */
+   /* TextureRect: plain C struct (was a value type with texture_subrect() /
+    * equality helper / inequality helper). The accessor becomes
+    * texture_rect_subrect, the comparison texture_rect_eq; inequality helper
+    * was unused and is dropped. */
+   struct TextureRect {
+      TextureUpload *upload;
+      /* the offset into the original upload rect (offset_x + vram_rect.width <= upload->width) */
+      int offset_x;
+      int offset_y;
+      SRect vram_rect;
+   };
+
+   /* in vram size (not hd), local to the uploaded data, different hd textures
+    * for different palettes could have different sizes anyway */
+   static INLINE struct SRect texture_rect_subrect(const struct TextureRect *t)
+   {
+      return make_srect(t->offset_x, t->offset_y, t->vram_rect.width, t->vram_rect.height);
+   }
+   static INLINE bool texture_rect_eq(const struct TextureRect *a,
+         const struct TextureRect *b)
+   {
+      return a->upload == b->upload && a->offset_x == b->offset_x && a->offset_y == b->offset_y && srect_eq(&a->vram_rect, &b->vram_rect);
+   }
+
+   /* Build a TextureRect (borrowing - does not take a reference). */
+static TextureRect make_texture_rect(TextureUpload *upload,
+      int offset_x,
+      int offset_y,
+      SRect vram_rect)
+   {
+      TextureRect t;
+      t.upload = upload;
+      t.offset_x = offset_x;
+      t.offset_y = offset_y;
+      t.vram_rect = vram_rect;
+      return t;
+   }
+   /* Ownership transfer helpers, used by owning containers only. */
+static void texture_rect_retain(const TextureRect *t)  { texture_upload_acquire(t->upload); }
+static void texture_rect_release(const TextureRect *t) { texture_upload_release(t->upload); }
+
+   /* Borrowing scratch array of (POD) TextureRects - no ownership, used for the
+    * blit/clear_rect transients that are immediately re-placed into owning
+    * containers. Trivially relocatable, so push is a bare realloc/append. */
+   POD_VEC_DECLARE(TextureRectVec, TextureRect);
+
+
+   /* TODO: better name */
+   struct EnduringTextureRect {
+      TextureRect texture_rect;
+      bool alive;
+   };
+
+   /* Owning, trivially-relocatable array of EnduringTextureRect (replaces a
+    * dynamic array of EnduringTextureRect). Because TextureRect is POD, growth
+    * is a realloc (bitwise relocation, no per-element move step or exception
+    * scaffolding). Ownership is explicit: push retains the upload, and any slot
+    * that leaves the array (compaction drop, clear, free) releases it. */
+   struct EnduringRectArr {
+      EnduringTextureRect *a;
+      int count;
+      int cap;
+   };
+static void enduring_arr_init(EnduringRectArr *v) { v->a = NULL; v->count = 0; v->cap = 0; }
+static void enduring_arr_push(EnduringRectArr *v, TextureRect tr, bool alive) {
+      if (v->count == v->cap) {
+         int ncap = v->cap ? v->cap * 2 : 16;
+         EnduringTextureRect *na = (EnduringTextureRect *)realloc(v->a, (size_t)ncap * sizeof(EnduringTextureRect));
+         if (!na)
+            return;
+         v->a = na;
+         v->cap = ncap;
+      }
+      texture_rect_retain(&tr);            /* the array now owns a reference */
+      v->a[v->count].texture_rect = tr;
+      v->a[v->count].alive = alive;
+      v->count++;
+   }
+   /* Drop !alive slots, releasing their refs; survivors relocate by bitwise move. */
+static void enduring_arr_compact(EnduringRectArr *v) {
+      int w = 0, i;
+      for (i = 0; i < v->count; i++) {
+         if (v->a[i].alive) {
+            if (w != i) v->a[w] = v->a[i];
+            w++;
+         } else {
+            texture_rect_release(&v->a[i].texture_rect);
+         }
+      }
+      v->count = w;
+   }
+static void enduring_arr_clear(EnduringRectArr *v) {
+      int i;
+      for (i = 0; i < v->count; i++)
+         texture_rect_release(&v->a[i].texture_rect);
+      v->count = 0;
+   }
+static void enduring_arr_free(EnduringRectArr *v) {
+      enduring_arr_clear(v);
+      free(v->a);
+      v->a = NULL;
+      v->cap = 0;
+   }
+
+   /* Owning vector of (POD) TextureRects, used where the rect list is itself
+    * value-copied/compared (FusionRects, RestorableRect). The element is
+    * trivially relocatable so the backing array relocates cheaply, but
+    * ownership must be explicit: this wrapper retains on push and on copy, and
+    * releases on destroy/clear/assign. */
+   /* OwnedRectVec: plain C struct (copyable with retain-on-copy
+    * / release-on-destroy refcount management). The element TextureRect is POD
+    * but owns a refcounted upload, so ownership is explicit: ownedrects_push
+    * retains, ownedrects_copy / ownedrects_assign deep-copy then retain each
+    * element, and ownedrects_destroy releases each element then frees storage.
+    * ownedrects_move steals storage (no refcount change). No implicit copy
+    * exists -- structs holding one must call ownedrects_copy /
+    * ownedrects_destroy explicitly. */
+   struct OwnedRectVec {
+      TextureRectVec v;
+   };
+
+   static INLINE void ownedrects_init(struct OwnedRectVec *r)
+   {
+      r->v.items = NULL; r->v.count = 0; r->v.cap = 0;
+   }
+
+   static INLINE void ownedrects_destroy(struct OwnedRectVec *r)
+   {
+      int i;
+      for (i = 0; i < r->v.count; i++) texture_rect_release(&r->v.items[i]);
+      TextureRectVec_free_storage(&r->v);
+   }
+
+   /* Deep-copy the POD elements of src->v into dst->v (replacing dst's
+    * storage). Refcounts are adjusted by the caller (release before, retain
+    * after). */
+   static INLINE void ownedrects_copy_storage(struct OwnedRectVec *dst,
+         const struct OwnedRectVec *src)
+   {
+      dst->v.count = 0;
+      if (src->v.count <= 0)
+         return;
+      {
+         size_t n = (size_t)src->v.count;
+         if (src->v.count > dst->v.cap) {
+            TextureRect *ni = (TextureRect *)realloc(dst->v.items, n * sizeof(TextureRect));
+            if (!ni)
+               return;
+            dst->v.items = ni;
+            dst->v.cap = src->v.count;
+         }
+         memcpy(dst->v.items, src->v.items, n * sizeof(TextureRect));
+         dst->v.count = src->v.count;
+      }
+   }
+
+   /* Copy-construct: dst must be uninitialized; deep-copy src and retain each element. */
+   static INLINE void ownedrects_copy(struct OwnedRectVec *dst,
+         const struct OwnedRectVec *src)
+   {
+      int i;
+      ownedrects_init(dst);
+      ownedrects_copy_storage(dst, src);
+      for (i = 0; i < dst->v.count; i++) texture_rect_retain(&dst->v.items[i]);
+   }
+
+   /* Copy-assign: release dst's current elements, deep-copy src, retain each. */
+   static INLINE void ownedrects_assign(struct OwnedRectVec *dst,
+         const struct OwnedRectVec *src)
+   {
+      int i;
+      if (dst == src) return;
+      for (i = 0; i < dst->v.count; i++) texture_rect_release(&dst->v.items[i]);
+      ownedrects_copy_storage(dst, src);
+      for (i = 0; i < dst->v.count; i++) texture_rect_retain(&dst->v.items[i]);
+   }
+
+   /* Move: steal src's storage into dst (dst must be empty/initialized), leave src empty. */
+   static INLINE void ownedrects_move(struct OwnedRectVec *dst,
+         struct OwnedRectVec *src)
+   {
+      dst->v = src->v;
+      src->v.items = NULL; src->v.count = 0; src->v.cap = 0;
+   }
+
+   static INLINE void ownedrects_push(struct OwnedRectVec *r, TextureRect t)
+   {
+      texture_rect_retain(&t);
+      TextureRectVec_push(&r->v, &t);
+   }
+
+   static INLINE int ownedrects_size(const struct OwnedRectVec *r) { return r->v.count; }
+
+   static INLINE bool ownedrects_eq(const struct OwnedRectVec *a,
+         const struct OwnedRectVec *b)
+   {
+      int i;
+      if (a->v.count != b->v.count) return false;
+      for (i = 0; i < a->v.count; i++)
+         if (!texture_rect_eq(&a->v.items[i], &b->v.items[i])) return false;
+      return true;
+   }
+
+   enum { LOOKUP_GRID_COLUMNS = 16 };
+   enum { LOOKUP_GRID_ROWS = 2 };
+   enum { LOOKUP_CELL_WIDTH = 64 };
+   enum { LOOKUP_CELL_HEIGHT = 256 };
+
+   /* Sorted set of RectIndex (int), MSVC C89. A sorted set of RectIndex for the
+    * overlap-dedup scratch set: a malloc'd sorted int array with binary-search
+    * insert (dedups), cleared and refilled each query, then iterated in order.
+    * Order differs from the old unordered_set (now ascending by index), which
+    * only affects iteration order of overlapping rects - the consumers don't
+    * depend on it. */
+   struct RectIndexSet {
+      RectIndex *items;
+      int        count;
+      int        cap;
+   };
+   static void rect_index_set_clear(RectIndexSet *s) { s->count = 0; }
+   static int rect_index_set_lower_bound(const RectIndexSet *s, RectIndex v) {
+      int lo = 0, hi = s->count;
+      while (lo < hi) { int mid = lo + ((hi - lo) >> 1); if (s->items[mid] < v) lo = mid + 1; else hi = mid; }
+      return lo;
+   }
+   static void rect_index_set_insert(RectIndexSet *s, RectIndex v) {
+      int i = rect_index_set_lower_bound(s, v);
+      if (i < s->count && s->items[i] == v) return;
+      if (s->count == s->cap) {
+         int ncap = s->cap ? s->cap * 2 : 16;
+         RectIndex *ni = (RectIndex *)realloc(s->items, (size_t)ncap * sizeof(RectIndex));
+         if (!ni)
+            return;
+         s->items = ni;
+         s->cap = ncap;
+      }
+      memmove(&s->items[i + 1], &s->items[i], (size_t)(s->count - i) * sizeof(RectIndex));
+      s->items[i] = v;
+      s->count++;
+   }
+
+   /* Spatial lookup grid over psx texture pages. Formerly a class with a
+    * initialiser/teardown managing the per-cell malloc'd arrays; now a plain
+    * struct driven by lookup_grid_init / lookup_grid_deinit. Each Cell is a
+    * growable array of POD LookupEntry; insert/get/clear are unchanged methods.
+    * RectTracker embeds one by value and drives its init/deinit. */
+   struct LookupEntry {
+      SRect rect;
+      RectIndex index;
+   };
+   typedef struct LookupEntry LookupEntry;
+   struct Cell {
+      LookupEntry *entries;
+      int count;
+      int cap;
+   };
+   typedef struct Cell Cell;
+   struct LookupGrid {
+      /* Each cell is a psx texture page (64x256); a dynamic array of
+       * LookupEntry. Now a malloc'd growable array per cell (POD entries). */
+      Cell cells[LOOKUP_GRID_COLUMNS * LOOKUP_GRID_ROWS];
+   };
+
+   static void lookup_grid_init(LookupGrid *g);
+   static void lookup_grid_deinit(LookupGrid *g);
+   static void lookup_grid_insert(LookupGrid *self, SRect r, RectIndex index);
+   static void lookup_grid_get(LookupGrid *self,
+         SRect r,
+         RectIndexSet *results);
+   static void lookup_grid_clear(LookupGrid *self);
+
+   /* RectTracker: tracks placed/uploaded texture rects with a spatial lookup
+    * grid. A plain C struct + rect_tracker_* free
+    * functions. The init/teardown (which init/free the EnduringRectArr and
+    * LookupGrid) become rect_tracker_init / rect_tracker_deinit, called by the
+    * embedding TextureTracker's initialiser/teardown. */
+   struct RectTracker {
+      EnduringRectArr textures; /* owning trivially-relocatable array */
+      LookupGrid lookup_grid;
+      bool lookup_grid_dirty;
+   };
+
+static void rect_tracker_init(struct RectTracker *self)
+   {
+      enduring_arr_init(&self->textures);
+      lookup_grid_init(&self->lookup_grid);
+      self->lookup_grid_dirty = false;
+   }
+static void rect_tracker_deinit(struct RectTracker *self)
+   {
+      enduring_arr_free(&self->textures);
+      lookup_grid_deinit(&self->lookup_grid);
+   }
+
+   static void rect_tracker_place(struct RectTracker *self,
+         TextureRect texture);
+   static void rect_tracker_upload(struct RectTracker *self,
+         SRect rect,
+         TextureUpload *upload);
+   static void rect_tracker_blit(struct RectTracker *self,
+         SRect dst,
+         SRect src);
+   static void rect_tracker_clear_rect(struct RectTracker *self, SRect *rect);
+static void rect_tracker_clear(struct RectTracker *self, SRect rect)
+   {
+      rect_tracker_clear_rect(self, &rect);
+      self->lookup_grid_dirty = true;
+   }
+   static void rect_tracker_releaseDeadHandles(struct RectTracker *self);
+   /* Returns results by pointer (was a reference). */
+   static RectIndexSet *rect_tracker_overlapping(struct RectTracker *self,
+         TTRect rect,
+         RectIndexSet *results);
+
+   /* This pointer will be valid until the next upload/blit/clear/endFrame, so
+    * use it immediately. Returns NULL when index is out of range. */
+   static TextureRect *rect_tracker_get_index(struct RectTracker *self,
+         RectIndex index);
+
+   /* Returns NULL if no texture with the given hash can be found. */
+   static TextureUpload *rect_tracker_find_upload(struct RectTracker *self,
+         uint32_t hash);
+
+   static void rect_tracker_rebuild_lookup_grid(struct RectTracker *self);
+   /* RectTracker
+    * ============ */
+
+   /* FusionRects: plain C struct.
+    *  Embeds an OwnedRectVec (refcounted), so init/destroy/move/eq are
+    * explicit free functions; the scaleX/scaleY default-zero NSDMIs move into
+    * fusionrects_init. */
+   struct FusionRects {
+      OwnedRectVec rects;
+      TTRect vram_rect;
+      unsigned int scaleX;
+      unsigned int scaleY;
+   };
+
+   static INLINE void fusionrects_init(struct FusionRects *f)
+   {
+      ownedrects_init(&f->rects);
+      f->vram_rect.x = 0; f->vram_rect.y = 0; f->vram_rect.width = 0; f->vram_rect.height = 0;
+      f->scaleX = 0;
+      f->scaleY = 0;
+   }
+   static INLINE void fusionrects_destroy(struct FusionRects *f)
+   {
+      ownedrects_destroy(&f->rects);
+   }
+   /* Move src into dst (dst must be initialized): steal rects, copy POD fields. */
+   static INLINE void fusionrects_move(struct FusionRects *dst,
+         struct FusionRects *src)
+   {
+      ownedrects_move(&dst->rects, &src->rects);
+      dst->vram_rect = src->vram_rect;
+      dst->scaleX = src->scaleX;
+      dst->scaleY = src->scaleY;
+   }
+   static INLINE bool fusionrects_eq(const struct FusionRects *a,
+         const struct FusionRects *b)
+   {
+      return rect_eq(&a->vram_rect, &b->vram_rect) && a->scaleX == b->scaleX && a->scaleY == b->scaleY && ownedrects_eq(&a->rects, &b->rects);
+   }
+
+   struct FusedPage {
+      ImageHandle texture;
+
+      uint32_t palette;
+      TTRect full_page_rect;
+
+      bool dirty;
+      bool dead;
+
+      size_t   bytes;      /* approx VRAM footprint of texture (w*h*4); for the LRU budget */
+      uint64_t last_used;  /* LRU tick (higher = more recently used) */
+
+      /* Frame stamp of the last rebuild (tracker frame counter). Guards the
+       * serve-time rebuild to at most once per page per frame: streaming
+       * content (typewriter dialogue, credits lines building letter by letter)
+       * dirties a page many times per frame, and rebuilding an in-place-reused
+       * image while earlier draws of the same frame reference it produced
+       * transient partial composites (visible flicker in exactly those
+       * scenes). (uint64_t)-1 = never rebuilt. */
+      uint64_t rebuilt_frame;
+
+      FusionRects fusion;
+
+      /* Reduce Palette Range: snapshot of the draw's gathered CLUT contents at
+       * page creation (`palette` identifies it, so equal hash = equal contents).
+       * Rebuilds use it to resolve each upload's REDUCED-range hash - the hash
+       * the draw path bound its image under - instead of only the full-palette
+       * `palette`. Only the first pal_count entries are meaningful; pal_count 0
+       * = no snapshot (option off / palette ungathered). */
+      unsigned pal_count;
+      uint16_t pal_data[256];
+   };
+
+   /* Copy/destroy helpers for FusedPage's ImageHandle member, replacing the
+    * implicit copy step incref / teardown decref the macro used to provide.
+    * The remaining fields are trivially copyable. */
+static void fp_copy(FusedPage *dst, const FusedPage *src) {
+      /* Copy the trivially-copyable fields explicitly (NOT a blanket *dst=*src,
+       * which would shallow-alias the OwnedRectVec inside fusion and break its
+       * refcount). dst->fusion.rects must already be in a valid state -- empty
+       * (fp_init_raw) for raw storage, or live for in-place compaction -- so
+       * ownedrects_assign releases dst's current elements then
+       * deep-copies+retains src's. */
+      dst->palette         = src->palette;
+      dst->full_page_rect  = src->full_page_rect;
+      dst->dirty           = src->dirty;
+      dst->dead            = src->dead;
+      dst->bytes           = src->bytes;
+      dst->last_used       = src->last_used;
+      dst->rebuilt_frame   = src->rebuilt_frame;
+      dst->pal_count       = src->pal_count;
+      /* Only the populated prefix: fp_init_raw leaves the tail indeterminate,
+       * and copying all 512 bytes propagated that through every vector growth
+       * and compaction. */
+      if (src->pal_count)
+         memcpy(dst->pal_data, src->pal_data, (size_t)src->pal_count * sizeof(uint16_t));
+      dst->fusion.vram_rect = src->fusion.vram_rect;
+      dst->fusion.scaleX    = src->fusion.scaleX;
+      dst->fusion.scaleY    = src->fusion.scaleY;
+      ownedrects_assign(&dst->fusion.rects, &src->fusion.rects);
+      dst->texture.data = src->texture.data;
+      if (dst->texture.data) tt_img_addref(dst->texture.data);  /* retain */
+   }
+   /* Seed a raw (uninitialised) FusedPage slot's only heap-owning member --
+    * fusion.rects (an OwnedRectVec) -- to the empty state, so the subsequent
+    * fp_copy's ownedrects_assign releases against a valid (empty) dst rather
+    * than through the slot's indeterminate items/count. Required before fp_copy
+    * into malloc'd storage (grow/push); the in-place compaction path already
+    * has a live dst and must NOT use this. */
+static void fp_init_raw(FusedPage *p) {
+      ownedrects_init(&p->fusion.rects);
+      p->bytes = 0;
+      p->last_used = 0;
+      p->pal_count = 0;
+      p->rebuilt_frame = (uint64_t)-1;
+   }
+static void fp_destroy(FusedPage *p) {
+      ih_reset(&p->texture);
+      ownedrects_destroy(&p->fusion.rects);
+   }
+
+   /* Owning array of FusedPage. A dynamic array of FusedPage. FusedPage owns an
+    * ImageHandle and a FusionRects (whose OwnedRectVec retains/releases its
+    * TextureRects), and is used by copy (append page, and the compaction's
+    * element copy-assign), so this container copies/-assigns elements rather
+    * than moving: growth copies each element into new storage into new storage
+    * and clears the old slot. push() copy-inserts; indexed access and
+    * pointer-range iteration keep the existing size()/ indexing and iteration
+    * uses. truncate(n) clears the tail [n, count) and is how remove_dead()
+    * drops compacted-out entries (replacing erase(it, end())). Ownership lives
+    * at the container level. */
+   /* FusedPageVec: owning growable array of FusedPage (each holds a refcounted
+    * ImageHandle, so growth/teardown go through fp_copy/fp_destroy). Converted
+    * from a container is a plain struct with + fused_page_vec_* free functions;
+    * the embedding FusedPages drives init_empty/deinit. */
+   struct FusedPageVec {
+      FusedPage *items;
+      int count;
+      int cap;
+   };
+
+   static void fused_page_vec_grow(struct FusedPageVec *v, int ncap)
+   {
+      FusedPage *nitems = (FusedPage *)malloc((size_t)ncap * sizeof(FusedPage));
+      int i;
+      if (!nitems)
+         return; /* OOM: leave the vector unchanged */
+      for (i = 0; i < v->count; i++) {
+         fp_init_raw(&nitems[i]);
+         fp_copy(&nitems[i], &v->items[i]);
+         fp_destroy(&v->items[i]);
+      }
+      free(v->items);
+      v->items = nitems;
+      v->cap = ncap;
+   }
+static void fused_page_vec_init_empty(struct FusedPageVec *v)
+   {
+      v->items = NULL; v->count = 0; v->cap = 0;
+   }
+static void fused_page_vec_deinit(struct FusedPageVec *v)
+   {
+      int i;
+      for (i = 0; i < v->count; i++)
+         fp_destroy(&v->items[i]);
+      free(v->items);
+      v->items = NULL; v->count = 0; v->cap = 0;
+   }
+static void fused_page_vec_push(struct FusedPageVec *v, const FusedPage *e)
+   {
+      if (v->count >= v->cap)
+         fused_page_vec_grow(v, v->cap ? v->cap * 2 : 8);
+      fp_init_raw(&v->items[v->count]);
+      fp_copy(&v->items[v->count], e);
+      v->count++;
+   }
+static int fused_page_vec_size(const struct FusedPageVec *v) { return v->count; }
+static FusedPage *fused_page_vec_at(struct FusedPageVec *v, int i) { return &v->items[i]; }
+   /* Destroy elements [n, count); used to drop the compacted-out tail. */
+static void fused_page_vec_truncate(struct FusedPageVec *v, int n)
+   {
+      int i;
+      for (i = n; i < v->count; i++)
+         fp_destroy(&v->items[i]);
+      v->count = n;
+   }
+
+   struct FusedPages {
+      FusedPageVec pages;
+      /* LRU budget: composited page images are unbudgeted otherwise and grow without
+       * bound (they are the dominant HD VRAM sink in heavy-overlap games). Evicted at
+       * the on_queues_reset safe point (no fused handles live). */
+      size_t   budget_bytes;
+      uint64_t tick;        /* monotonic LRU clock (bumped on each page access) */
+   };
+
+static void fused_pages_init(struct FusedPages *self) {
+      fused_page_vec_init_empty(&self->pages);
+      self->budget_bytes = 0;
+      self->tick = 0;
+   }
+static void fused_pages_set_budget(struct FusedPages *self, size_t bytes) { self->budget_bytes = bytes; }
+static void fused_pages_deinit(struct FusedPages *self) { fused_page_vec_deinit(&self->pages); }
+   static HdTextureHandle fused_pages_get_or_make(struct FusedPages *self,
+         TTRect page_rect,
+         uint32_t palette,
+         struct RectTracker *tracker,
+         TextureTracker *tt,               /* for Reduce Palette Range resolution */
+         const uint16_t *pal_data,         /* draw's gathered CLUT (NULL if none) */
+         unsigned pal_count);
+   static HdTexture fused_pages_get_from_handle(struct FusedPages *self,
+         HdTextureHandle handle,
+         ImageHandle *default_hd_texture);
+   static void fused_pages_mark_dirty(struct FusedPages *self, TTRect rect); /* For blit dst, upload, and hd texture load */
+   static void fused_pages_mark_dead(struct FusedPages *self, TTRect rect); /* For clear */
+   static void fused_pages_rebuild_dirty(struct FusedPages *self,
+         struct RectTracker *tracker,
+         TextureTracker *tt);
+   static void fused_pages_remove_dead(struct FusedPages *self);
+   static void fused_pages_evict(struct FusedPages *self); /* LRU-evict live pages to the budget */
+   static int64_t page_bytes(FusionRects *fusion); /* approx VRAM footprint of a fused page */
+
+   struct RestorableRect {
+      TTRect rect;
+      uint32_t hash;
+      OwnedRectVec to_restore;
+   };
+
+   /* RestorableRect holds an OwnedRectVec, so its copy/destroy must run the
+    * OwnedRectVec refcount logic explicitly (it is a plain C struct). */
+   static INLINE void restorablerect_init(struct RestorableRect *r)
+   {
+      ownedrects_init(&r->to_restore);
+   }
+   static INLINE void restorablerect_destroy(struct RestorableRect *r)
+   {
+      ownedrects_destroy(&r->to_restore);
+   }
+   /* Copy-construct dst (uninitialized) from src: POD fields bitwise, to_restore deep. */
+   static INLINE void restorablerect_copy(struct RestorableRect *dst,
+         const struct RestorableRect *src)
+   {
+      dst->rect = src->rect;
+      dst->hash = src->hash;
+      ownedrects_copy(&dst->to_restore, &src->to_restore);
+   }
+   /* Copy-assign dst (initialized) from src. */
+   static INLINE void restorablerect_assign(struct RestorableRect *dst,
+         const struct RestorableRect *src)
+   {
+      dst->rect = src->rect;
+      dst->hash = src->hash;
+      ownedrects_assign(&dst->to_restore, &src->to_restore);
+   }
+   /* Move src into dst (uninitialized): POD fields bitwise, steal to_restore. */
+
+   /* Owning array of RestorableRect. A dynamic array of RestorableRect.
+    * RestorableRect holds an OwnedRectVec (retain/release on copy, move
+    * suppressed), so it is copyable but not movable - the backing array
+    * relocated it by copy. This container therefore copies/-assigns
+    * elements: growth copies each into new storage
+    * and destroys the old slot; push() copy-inserts (matching the old
+    * an append, which is a copy);
+    * clear()/the teardown run each element's teardown (releasing its rect
+    * refs). erase_at(i) removes one element by copy-assigning the tail down and
+    * destroying the now-duplicated last slot. */
+   /* RestorableRectVec: plain C struct. Its element RestorableRect owns an
+    * OwnedRectVec (refcounted), so element relocation / insertion / removal go
+    * through restorablerect_copy / _assign / _destroy / _move rather than
+    * placement-new and explicit teardown calls. The container itself is moved
+    * by stealing storage; no copy exists. */
+   struct RestorableRectVec {
+      RestorableRect *items;
+      int count;
+      int cap;
+   };
+
+   /* Move o into v (v must be initialized): free v's elements, steal o's storage. */
+   static INLINE void rrvec_grow(struct RestorableRectVec *v, int ncap)
+   {
+      int i;
+      RestorableRect *nitems = (RestorableRect *)malloc((size_t)ncap * sizeof(RestorableRect));
+      if (!nitems)
+         return; /* OOM: leave the vector unchanged */
+      for (i = 0; i < v->count; i++) {
+         restorablerect_copy(&nitems[i], &v->items[i]);
+         restorablerect_destroy(&v->items[i]);
+      }
+      free(v->items);
+      v->items = nitems;
+      v->cap = ncap;
+   }
+   /* Copy-insert v (which, move being
+    * suppressed, was a copy). */
+   static INLINE void rrvec_push(struct RestorableRectVec *vec,
+         const struct RestorableRect *val)
+   {
+      if (vec->count >= vec->cap)
+         rrvec_grow(vec, vec->cap ? vec->cap * 2 : 8);
+      restorablerect_copy(&vec->items[vec->count], val);
+      vec->count++;
+   }
+   static INLINE int rrvec_size(const struct RestorableRectVec *v) { return v->count; }
+   static INLINE void rrvec_clear(struct RestorableRectVec *v)
+   {
+      int i;
+      for (i = 0; i < v->count; i++)
+         restorablerect_destroy(&v->items[i]);
+      v->count = 0;
+   }
+   /* Remove element i by copy-assigning the tail down and destroying the
+    * duplicated last slot. */
+   static INLINE void rrvec_erase_at(struct RestorableRectVec *v, int i)
+   {
+      int j;
+      for (j = i; j + 1 < v->count; j++)
+         restorablerect_assign(&v->items[j], &v->items[j + 1]);
+      restorablerect_destroy(&v->items[v->count - 1]);
+      v->count--;
+   }
+
+   /* Edge-triggered debug keyboard hotkey. Formerly a class with an int
+    * initialiser; now a plain struct driven by dbg_hotkey_init. query() does
+    * the rising-edge detection. TextureTracker embeds three of these by value
+    * and initialises them in its initialiser. */
+   struct DbgHotkey {
+      enum retro_key key;
+      bool was_key_down;
+   };
+
+   static void dbg_hotkey_init(DbgHotkey *h, enum retro_key key)
+   {
+      h->key = key;
+      h->was_key_down = false;
+   }
+   static bool dbg_hotkey_query(struct DbgHotkey *self);
+
+   struct CacheEntry {
+      TTRect rect;
+      /* Lookup key (the draw's full palette hash). Kept separate from
+       * handle.palette_hash because with Reduce Palette Range the bound handle may
+       * carry a reduced palette hash, while the cache is keyed by the full hash. */
+      uint32_t key_palette_hash;
+      HdTextureHandle handle;
+   };
+
+   /* Result of a handle-cache lookup (handle plus a found flag). */
+   struct HandleCacheResult {
+      HdTextureHandle handle;
+      bool found;
+   };
+
+   /* Small fixed-capacity move-to-front cache of recently-used HD texture
+    * handles. CacheEntry is POD, so the entries live in an inline array
+    * (capacity HANDLE_LRU_MAX) with a count - no dynamic array, no heap. */
+   enum { HANDLE_LRU_MAX = 4 };
+
+   /* Small fixed-capacity move-to-front cache of recently-used HD texture
+    * handles. Formerly a class with a initialiser; now a plain struct driven by
+    * handle_lru_cache_init. CacheEntry is POD (its defensive default-init is
+    * never read before being written - get only scans entries[0..count) and
+    * insert writes entries[0] within that range), so the entries live in an
+    * inline array (capacity HANDLE_LRU_MAX) with a count - no dynamic array, no
+    * heap. */
+   struct HandleLRUCache {
+      int64_t dbg_hits;
+      int64_t dbg_misses;
+      int max_size;
+      int count;
+      CacheEntry entries[HANDLE_LRU_MAX];
+
+   };
+
+   static void handle_lru_cache_init(HandleLRUCache *c, int max_size)
+   {
+      if (max_size > HANDLE_LRU_MAX)
+         max_size = HANDLE_LRU_MAX;
+      c->max_size = max_size;
+      c->count = 0;
+      /* The former initialiser left these uninitialised (they were only ever
+       * zeroed inside a TT_LOG_VERBOSE block after first use); zero them here
+       * so the hit/miss counters start from a defined value. */
+      c->dbg_hits = 0;
+      c->dbg_misses = 0;
+   }
+
+   /* ========================================
+    * Save State */
+   /* Owning hash -> TextureUpload map for the texture-tracker save state.
+    * A uint32_t -> TextureUpload map: each entry owns a heap
+    * TextureUpload (deep-copied in on insert, deleted on destroy). The values
+    * are non-trivially-copyable (owned image/dumped_modes/textures), so the
+    * backing array holds pointers - trivially relocatable - and ownership is
+    * explicit alloc/free. The type is moved (not copied): it is moved up out
+    * of save_state() and move-assigned into the file-static save_state across
+    * renderer recreations, so move-assign must free any entries it already
+    * holds before adopting the source's. Copying is deleted to prevent any
+    * accidental double-ownership. */
+   /* UploadOwningMap: plain C struct. The entries are owning pointers to
+    * heap-allocated TextureUploads; ownership moves via uploadmap_move (steal,
+    * source emptied) and is released by uploadmap_destroy. No copy operation
+    * exists -- callers must move, never copy. */
+   struct UploadOwningMapEntry { uint32_t key; TextureUpload *val; };
+   typedef struct UploadOwningMapEntry UploadOwningMapEntry;
+   struct UploadOwningMap {
+      struct UploadOwningMapEntry *items;
+      int count;
+      int cap;
+   };
+
+   static INLINE void uploadmap_init(struct UploadOwningMap *m)
+   {
+      m->items = NULL; m->count = 0; m->cap = 0;
+   }
+
+   static INLINE void uploadmap_destroy(struct UploadOwningMap *m)
+   {
+      int i;
+      for (i = 0; i < m->count; i++)
+         texture_upload_destroy(m->items[i].val);
+      free(m->items);
+      m->items = NULL; m->count = 0; m->cap = 0;
+   }
+
+   /* Move: steal o's storage into m (which must be empty/initialized), leave o empty. */
+   static INLINE void uploadmap_move(struct UploadOwningMap *m,
+         struct UploadOwningMap *o)
+   {
+      m->items = o->items; m->count = o->count; m->cap = o->cap;
+      o->items = NULL; o->count = 0; o->cap = 0;
+   }
+
+   static INLINE bool uploadmap_contains(const struct UploadOwningMap *m,
+         uint32_t key)
+   {
+      int i;
+      for (i = 0; i < m->count; i++)
+         if (m->items[i].key == key)
+            return true;
+      return false;
+   }
+
+   /* Takes ownership of an already-heap-allocated upload under key. Caller must
+    * have ensured the key is absent (mirrors the old map's insert-if-absent
+    * guard). */
+   static INLINE void uploadmap_insert(struct UploadOwningMap *m,
+         uint32_t key,
+         TextureUpload *val)
+   {
+      if (m->count >= m->cap) {
+         int ncap = m->cap ? m->cap * 2 : 8;
+         UploadOwningMapEntry *nitems = (UploadOwningMapEntry *)realloc(m->items, (size_t)ncap * sizeof(UploadOwningMapEntry));
+         if (!nitems)
+            return;
+         m->items = nitems;
+         m->cap = ncap;
+      }
+      m->items[m->count].key = key;
+      m->items[m->count].val = val;
+      m->count++;
+   }
+
+   struct TextureRectSaveState {
+      uint32_t upload_hash;
+      int offset_x;
+      int offset_y;
+      SRect vram_rect;
+   };
+
+   /* Owning array of (POD) TextureRectSaveState. Replaces A dynamic array of
+    * TextureRectSaveState. Elements are trivially relocatable, so grow is a
+    * plain realloc; the type owns its buffer (free on destroy) and is moved
+    * (not copied) so it can live inside the save-state structs. */
+   struct TextureRectSaveStateVec {
+      TextureRectSaveState *items;
+      int count;
+      int cap;
+   };
+static void TextureRectSaveStateVec_init(struct TextureRectSaveStateVec *v) { v->items = NULL; v->count = 0; v->cap = 0; }
+static void TextureRectSaveStateVec_free_storage(struct TextureRectSaveStateVec *v) { free(v->items); v->items = NULL; v->count = 0; v->cap = 0; }
+static int  TextureRectSaveStateVec_size(const struct TextureRectSaveStateVec *v) { return v->count; }
+static TextureRectSaveState *TextureRectSaveStateVec_at(struct TextureRectSaveStateVec *v, int i) { return &v->items[i]; }
+static void TextureRectSaveStateVec_push(struct TextureRectSaveStateVec *v,
+      const TextureRectSaveState *valp){
+      if (v->count >= v->cap) {
+         int ncap = v->cap ? v->cap * 2 : 8;
+         TextureRectSaveState *nitems = (TextureRectSaveState *)realloc(v->items, (size_t)ncap * sizeof(TextureRectSaveState));
+         if (!nitems)
+            return;
+         v->items = nitems;
+         v->cap = ncap;
+      }
+      v->items[v->count++] = *valp;
+   }
+   /* Move src into dst (steal buffer), leaving src empty - replaces the
+    * implicit move of the container. */
+static void TextureRectSaveStateVec_move(struct TextureRectSaveStateVec *dst,
+      struct TextureRectSaveStateVec *src){
+      dst->items = src->items; dst->count = src->count; dst->cap = src->cap;
+      src->items = NULL; src->count = 0; src->cap = 0;
+   }
+
+   struct RestorableRectSaveState {
+      TTRect rect;
+      uint32_t hash;
+      TextureRectSaveStateVec to_restore;
+   };
+static void rrss_init(struct RestorableRectSaveState *r) {
+      r->rect.x = 0; r->rect.y = 0; r->rect.width = 0; r->rect.height = 0;
+      r->hash = 0;
+      TextureRectSaveStateVec_init(&r->to_restore);
+   }
+static void rrss_destroy(struct RestorableRectSaveState *r) {
+      TextureRectSaveStateVec_free_storage(&r->to_restore);
+   }
+
+   /* Move src into dst (steal to_restore), leaving src empty. */
+   static void rrss_move(struct RestorableRectSaveState *dst,
+      struct RestorableRectSaveState *src)
+   {
+      dst->rect = src->rect;
+      dst->hash = src->hash;
+      TextureRectSaveStateVec_move(&dst->to_restore, &src->to_restore);
+   }
+
+   /* Owning array of RestorableRectSaveState. The element owns a heap array
+    * (to_restore) and is not trivially relocatable, so growth moves
+    * each element into the new storage and clears the old
+    * one, rather than memcpy. Moved (not copied) so it composes inside the
+    * save-state structs. */
+   struct RestorableRectSaveStateVec {
+      RestorableRectSaveState *items;
+      int count;
+      int cap;
+   };
+static void RestorableRectSaveStateVec_init(struct RestorableRectSaveStateVec *v) { v->items = NULL; v->count = 0; v->cap = 0; }
+static int  RestorableRectSaveStateVec_size(const struct RestorableRectSaveStateVec *v) { return v->count; }
+static RestorableRectSaveState *RestorableRectSaveStateVec_at(struct RestorableRectSaveStateVec *v, int i) { return &v->items[i]; }
+static void RestorableRectSaveStateVec_grow(struct RestorableRectSaveStateVec *v,
+      int ncap){
+      RestorableRectSaveState *nitems =
+         (RestorableRectSaveState *)malloc((size_t)ncap * sizeof(RestorableRectSaveState));
+      int i;
+      if (!nitems)
+         return; /* OOM: leave the vector unchanged */
+      for (i = 0; i < v->count; i++) {
+         rrss_move(&nitems[i], &v->items[i]);
+         rrss_destroy(&v->items[i]);
+      }
+      free(v->items);
+      v->items = nitems;
+      v->cap = ncap;
+   }
+   /* Takes ownership of *v's contents by move (src left empty). */
+static void RestorableRectSaveStateVec_push_move(struct RestorableRectSaveStateVec *v,
+      struct RestorableRectSaveState *src){
+      if (v->count >= v->cap)
+         RestorableRectSaveStateVec_grow(v, v->cap ? v->cap * 2 : 8);
+      rrss_move(&v->items[v->count], src);
+      v->count++;
+   }
+static void RestorableRectSaveStateVec_free_storage(struct RestorableRectSaveStateVec *v) {
+      int i;
+      for (i = 0; i < v->count; i++)
+         rrss_destroy(&v->items[i]);
+      free(v->items);
+      v->items = NULL; v->count = 0; v->cap = 0;
+   }
+
+   /* TextureTrackerSaveState: plain C struct. Owns two save-state vectors and
+    * an UploadOwningMap; managed explicitly through tts_init / tts_destroy /
+    * tts_move. No copy exists -- callers must move (steal), never copy. */
+   struct TextureTrackerSaveState {
+      TextureRectSaveStateVec rects;
+      RestorableRectSaveStateVec restorable;
+      UploadOwningMap uploads;
+      /* Copy of the tracker's CPU VRAM mirror (FB_WIDTH x FB_HEIGHT), or
+       * NULL. Page-aligned hashes and the CLUT fallback read the mirror, and
+       * a rebuilt tracker starts with a zeroed one. */
+      uint16_t *vram_mirror;
+   };
+
+   static INLINE void tts_init(struct TextureTrackerSaveState *s)
+   {
+      TextureRectSaveStateVec_init(&s->rects);
+      RestorableRectSaveStateVec_init(&s->restorable);
+      uploadmap_init(&s->uploads);
+      s->vram_mirror = NULL;
+   }
+
+   static INLINE void tts_destroy(struct TextureTrackerSaveState *s)
+   {
+      TextureRectSaveStateVec_free_storage(&s->rects);
+      RestorableRectSaveStateVec_free_storage(&s->restorable);
+      uploadmap_destroy(&s->uploads);
+      free(s->vram_mirror);
+      s->vram_mirror = NULL;
+   }
+
+   /* Move o into s (which must already be initialized): free s's current
+    * storage, steal o's, and leave o empty/initialized. Mirrors the old
+    * move-assignment. */
+   static INLINE void tts_move(struct TextureTrackerSaveState *s,
+         struct TextureTrackerSaveState *o)
+   {
+      if (s == o)
+         return;
+      TextureRectSaveStateVec_free_storage(&s->rects);
+      RestorableRectSaveStateVec_free_storage(&s->restorable);
+      uploadmap_destroy(&s->uploads);
+      free(s->vram_mirror);
+      TextureRectSaveStateVec_move(&s->rects, &o->rects);
+      s->restorable = o->restorable;
+      RestorableRectSaveStateVec_init(&o->restorable);
+      uploadmap_move(&s->uploads, &o->uploads);
+      s->vram_mirror = o->vram_mirror;
+      o->vram_mirror = NULL;
+   }
+   /* End of Save State
+    * ======================================== */
+
+   /* Tunable HD-texture cache budgets. hd_cache = system RAM (decoded CPU
+    * levels); hd_gpu_cache = VRAM (uploaded Vulkan images). The VRAM budget
+    * targets 8 GB cards - lower it if you see VRAM-pressure "QueuePresent
+    * failed" / swapchain churn, raise it on larger cards. */
+   static const size_t HD_CACHE_RAM_BUDGET  = (size_t)2 * 1024 * 1024 * 1024; /* 2 GB */
+   static const size_t HD_CACHE_VRAM_BUDGET = (size_t)3 * 1024 * 1024 * 1024; /* 3 GB */
+
+   /* (hash, palette_hash) packed into one 64-bit key. The caches below are
+    * keyed by this single integer instead of HdTextureId, so lookups compare
+    * one int with no comparator / tree descent. */
+#define TT_PAGE_KEY_SALT (UINT64_C(0x9E3779B97F4A7C15))
+
+   static uint64_t hd_pack_key(HdTextureId id)
+   {
+      uint64_t k = ((uint64_t)id.hash << 32) | (uint64_t)id.palette_hash;
+      /* Namespace page-aligned combos away from upload-rect combos in the SHARED
+       * structures (requested / hd_cache / hd_gpu_cache). The C key has no spare
+       * bit (hash + palette fill all 64), so fold the page flag in with a fixed
+       * 64-bit salt rather than the C++ struct's extra comparison field. The
+       * shared structures are point-access only (never unpacked back to a hash),
+       * so the salt is safe; page-only sets that ARE unpacked (pending_attach_pages)
+       * store the un-salted base key instead. (The prefetch journal DOES unpack
+       * salted keys - it stores the pages flag beside each value, which is what
+       * makes the XOR reversible for it; see hd_unpack_key.) */
+      if (id.pages)
+         k ^= TT_PAGE_KEY_SALT;
+      return k;
+   }
+
+   /* Reverse hd_pack_key given the pages flag. Only valid when the flag is
+    * known out-of-band (the journal stores it per entry). */
+   static HdTextureId hd_unpack_key(uint64_t key, bool pages)
+   {
+      HdTextureId id;
+      uint64_t base = pages ? (key ^ TT_PAGE_KEY_SALT) : key;
+      id.hash = (uint32_t)(base >> 32);
+      id.palette_hash = (uint32_t)base;
+      id.pages = pages;
+      return id;
+   }
+
+   /* -------------------------------------------------------------------------
+    * * Byte-budgeted LRU cache, MSVC C89.
+    *
+    * Built from an intrusive list of entries plus an id -> entry map design -
+    * two heap node allocations per insert and an O(log n) red-black descent per
+    * lookup - with a contiguous index-LRU + open-addressed (linear-probe) flat
+    * hash table, all held in malloc'd arrays. No generics, no classes, no
+    * virtual, no STL. The two cache variants (RAM levels, VRAM images) are
+    * produced by macro instantiation: HD_LRU_DECLARE emits the struct and
+    * prototypes, HD_LRU_DEFINE emits the bodies, with a DISPOSE callback that
+    * frees payload-owned resources when a live entry leaves the cache.
+    * ------------------------------------------------------------------------- */
+
+   /* fmix64 - cheap, strong avalanche for integer keys. The multipliers are
+    * built from 32-bit halves so no C99 long-long (ULL) literals appear. */
+   static uint64_t hd_lru_mix(uint64_t x)
+   {
+      uint64_t k1 = ((uint64_t)0xff51afd7u << 32) | (uint64_t)0xed558ccdu;
+      uint64_t k2 = ((uint64_t)0xc4ceb9feu << 32) | (uint64_t)0x1a85ec53u;
+      x ^= x >> 33;
+      x *= k1;
+      x ^= x >> 33;
+      x *= k2;
+      x ^= x >> 33;
+      return x;
+   }
+
+#define HD_LRU_DECLARE(NAME, PAYLOAD_T)                                        \
+   typedef struct NAME##_slot {                                                   \
+      uint64_t  key;                                                             \
+      int       prev;   /* LRU links by arena index (-1 = none) */               \
+      int       next;                                                            \
+      size_t    bytes;  /* cached payload footprint */                           \
+      PAYLOAD_T payload;                                                         \
+   } NAME##_slot;                                                                 \
+   \
+   typedef struct NAME {                                                          \
+      NAME##_slot *slots;                                                        \
+      int          slots_len;                                                    \
+      int          slots_cap;                                                    \
+      int         *table;        /* open-addressed slot indices; -1 = empty */   \
+      size_t       table_len;    /* power of two, 0 if unallocated */            \
+      size_t       mask;         /* table_len - 1 */                             \
+      int          head, tail;   /* MRU / LRU ends */                            \
+      int          free_head;    /* recycled-slot free list head */              \
+      int          live;                                                         \
+      size_t       total_bytes;                                                  \
+      size_t       budget_bytes;                                                 \
+   } NAME;                                                                        \
+   \
+   static void   NAME##_init(NAME *c, size_t budget_bytes);                       \
+   static int    NAME##_contains(const NAME *c, uint64_t key);                    \
+   static PAYLOAD_T *NAME##_get(NAME *c, uint64_t key);                           \
+   static PAYLOAD_T *NAME##_put_slot(NAME *c, uint64_t key, int *created);        \
+   static void   NAME##_account(NAME *c, size_t old_bytes, size_t new_bytes);     \
+   static void   NAME##_erase(NAME *c, uint64_t key);                             \
+   static void   NAME##_clear(NAME *c);                                           \
+   static void   NAME##_set_entry_bytes(NAME *c, uint64_t key, size_t bytes);     \
+   static void   NAME##_set_budget(NAME *c, size_t bytes);                        \
+   static size_t NAME##_size_bytes(const NAME *c);                                \
+   static size_t NAME##_count(const NAME *c);                                     \
+   static size_t NAME##_budget(const NAME *c)
+
+#define HD_LRU_DEFINE(NAME, PAYLOAD_T, DISPOSE)                                \
+   static int NAME##_find_slot(const NAME *c, uint64_t key)                       \
+   {                                                                              \
+      size_t i;                                                                  \
+      if (c->table_len == 0)                                                     \
+      return -1;                                                             \
+      i = (size_t)hd_lru_mix(key) & c->mask;                                     \
+      for (;;) {                                                                 \
+         int s = c->table[i];                                                   \
+         if (s < 0)                                                             \
+         return -1;                                                         \
+         if (c->slots[s].key == key)                                            \
+         return s;                                                          \
+         i = (i + 1) & c->mask;                                                 \
+      }                                                                          \
+   }                                                                              \
+   static void NAME##_raw_insert(NAME *c, uint64_t key, int s)                    \
+   {                                                                              \
+      size_t i = (size_t)hd_lru_mix(key) & c->mask;                             \
+      while (c->table[i] >= 0)                                                   \
+      i = (i + 1) & c->mask;                                                 \
+      c->table[i] = s;                                                           \
+   }                                                                              \
+   static void NAME##_ensure_table(NAME *c, size_t want)                          \
+   {                                                                              \
+      size_t need = 8;                                                           \
+      size_t i;                                                                  \
+      int s;                                                                     \
+      while (need < want * 2)                                                    \
+      need <<= 1;                                                            \
+      if (c->table_len != 0 && need <= c->table_len)                             \
+      return;                                                                \
+      {                                                                          \
+         int *nt = (int *)realloc(c->table, need * sizeof(int));                \
+         if (!nt)                                                               \
+         return;                                                            \
+         c->table = nt;                                                         \
+      }                                                                          \
+      c->table_len = need;                                                       \
+      c->mask = need - 1;                                                        \
+      for (i = 0; i < need; i++)                                                 \
+      c->table[i] = -1;                                                      \
+      for (s = c->head; s >= 0; s = c->slots[s].next)                           \
+      NAME##_raw_insert(c, c->slots[s].key, s);                             \
+   }                                                                              \
+   static void NAME##_hash_remove(NAME *c, uint64_t key)                          \
+   {                                                                              \
+      size_t i = (size_t)hd_lru_mix(key) & c->mask;                             \
+      size_t j;                                                                  \
+      for (;;) {                                                                 \
+         int s = c->table[i];                                                   \
+         if (s >= 0 && c->slots[s].key == key)                                  \
+         break;                                                             \
+         i = (i + 1) & c->mask;                                                 \
+      }                                                                          \
+      j = i;                                                                     \
+      c->table[i] = -1;                                                          \
+      for (;;) {                                                                 \
+         int sj;                                                                \
+         size_t home;                                                          \
+         int can_move;                                                          \
+         j = (j + 1) & c->mask;                                                 \
+         sj = c->table[j];                                                      \
+         if (sj < 0)                                                            \
+         break;                                                             \
+         home = (size_t)hd_lru_mix(c->slots[sj].key) & c->mask;               \
+         if (i <= j)                                                            \
+         can_move = !(home > i && home <= j);                               \
+         else                                                                   \
+         can_move = !(home > i || home <= j);                               \
+         if (can_move) {                                                        \
+            c->table[i] = sj;                                                  \
+            c->table[j] = -1;                                                  \
+            i = j;                                                             \
+         }                                                                      \
+      }                                                                          \
+   }                                                                              \
+   static int NAME##_alloc_slot(NAME *c)                                          \
+   {                                                                              \
+      int s;                                                                     \
+      if (c->free_head >= 0) {                                                   \
+         s = c->free_head;                                                      \
+         c->free_head = c->slots[s].next;                                       \
+         return s;                                                              \
+      }                                                                          \
+      if (c->slots_len == c->slots_cap) {                                        \
+         int ncap = c->slots_cap ? c->slots_cap * 2 : 16;                       \
+         c->slots = (NAME##_slot *)realloc(c->slots,                            \
+               (size_t)ncap * sizeof(NAME##_slot));                    \
+         c->slots_cap = ncap;                                                   \
+      }                                                                          \
+      s = c->slots_len++;                                                        \
+      c->slots[s].key = 0;                                                       \
+      c->slots[s].prev = -1;                                                     \
+      c->slots[s].next = -1;                                                     \
+      c->slots[s].bytes = 0;                                                     \
+      return s;                                                                  \
+   }                                                                              \
+   static void NAME##_free_slot(NAME *c, int s)                                   \
+   {                                                                              \
+      c->slots[s].next = c->free_head;                                          \
+      c->free_head = s;                                                          \
+   }                                                                              \
+   static void NAME##_link_front(NAME *c, int s)                                  \
+   {                                                                              \
+      c->slots[s].prev = -1;                                                     \
+      c->slots[s].next = c->head;                                                \
+      if (c->head >= 0)                                                          \
+      c->slots[c->head].prev = s;                                            \
+      c->head = s;                                                               \
+      if (c->tail < 0)                                                           \
+      c->tail = s;                                                           \
+   }                                                                              \
+   static void NAME##_unlink(NAME *c, int s)                                      \
+   {                                                                              \
+      int p = c->slots[s].prev;                                                  \
+      int n = c->slots[s].next;                                                  \
+      if (p >= 0) c->slots[p].next = n; else c->head = n;                        \
+      if (n >= 0) c->slots[n].prev = p; else c->tail = p;                        \
+   }                                                                              \
+   static void NAME##_touch(NAME *c, int s)                                       \
+   {                                                                              \
+      if (c->head == s)                                                          \
+      return;                                                                \
+      NAME##_unlink(c, s);                                                       \
+      NAME##_link_front(c, s);                                                   \
+   }                                                                              \
+   static void NAME##_evict(NAME *c)                                              \
+   {                                                                              \
+      while (c->total_bytes > c->budget_bytes && c->tail >= 0) {                 \
+         int s = c->tail;                                                       \
+         uint64_t key = c->slots[s].key;                                        \
+         c->total_bytes -= c->slots[s].bytes;                                   \
+         DISPOSE(&c->slots[s].payload);                                         \
+         NAME##_unlink(c, s);                                                   \
+         NAME##_hash_remove(c, key);                                            \
+         NAME##_free_slot(c, s);                                                \
+         c->live--;                                                             \
+      }                                                                          \
+   }                                                                              \
+   static void NAME##_init(NAME *c, size_t budget_bytes)                          \
+   {                                                                              \
+      c->slots = NULL; c->slots_len = 0; c->slots_cap = 0;                       \
+      c->table = NULL; c->table_len = 0; c->mask = 0;                            \
+      c->head = c->tail = c->free_head = -1;                                     \
+      c->live = 0; c->total_bytes = 0; c->budget_bytes = budget_bytes;           \
+   }                                                                              \
+   static int NAME##_contains(const NAME *c, uint64_t key)                        \
+   {                                                                              \
+      return NAME##_find_slot(c, key) >= 0;                                      \
+   }                                                                              \
+   static PAYLOAD_T *NAME##_get(NAME *c, uint64_t key)                            \
+   {                                                                              \
+      int s = NAME##_find_slot(c, key);                                          \
+      if (s < 0)                                                                 \
+      return NULL;                                                           \
+      NAME##_touch(c, s);                                                        \
+      return &c->slots[s].payload;                                               \
+   }                                                                              \
+   static PAYLOAD_T *NAME##_put_slot(NAME *c, uint64_t key, int *created)         \
+   {                                                                              \
+      int s = NAME##_find_slot(c, key);                                          \
+      if (s >= 0) {                                                              \
+         *created = 0;                                                          \
+         NAME##_touch(c, s);                                                    \
+         return &c->slots[s].payload;                                           \
+      }                                                                          \
+      *created = 1;                                                              \
+      NAME##_ensure_table(c, (size_t)c->live + 1);                               \
+      s = NAME##_alloc_slot(c);                                                  \
+      c->slots[s].key = key;                                                     \
+      NAME##_link_front(c, s);                                                   \
+      NAME##_raw_insert(c, key, s);                                              \
+      c->live++;                                                                 \
+      return &c->slots[s].payload;                                               \
+   }                                                                              \
+   static void NAME##_account(NAME *c, size_t old_bytes, size_t new_bytes)        \
+   {                                                                              \
+      c->total_bytes = c->total_bytes - old_bytes + new_bytes;                   \
+      NAME##_evict(c);                                                           \
+   }                                                                              \
+   static void NAME##_erase(NAME *c, uint64_t key)                                \
+   {                                                                              \
+      int s = NAME##_find_slot(c, key);                                          \
+      if (s < 0)                                                                 \
+      return;                                                                \
+      c->total_bytes -= c->slots[s].bytes;                                       \
+      DISPOSE(&c->slots[s].payload);                                             \
+      NAME##_unlink(c, s);                                                       \
+      NAME##_hash_remove(c, key);                                                \
+      NAME##_free_slot(c, s);                                                    \
+      c->live--;                                                                 \
+   }                                                                              \
+   static void NAME##_clear(NAME *c)                                              \
+   {                                                                              \
+      int s;                                                                     \
+      for (s = c->head; s >= 0; s = c->slots[s].next)                           \
+      DISPOSE(&c->slots[s].payload);                                         \
+      free(c->slots); free(c->table);                                            \
+      c->slots = NULL; c->slots_len = 0; c->slots_cap = 0;                       \
+      c->table = NULL; c->table_len = 0; c->mask = 0;                            \
+      c->head = c->tail = c->free_head = -1;                                     \
+      c->live = 0; c->total_bytes = 0;                                           \
+   }                                                                              \
+   static void NAME##_set_entry_bytes(NAME *c, uint64_t key, size_t bytes)        \
+   {                                                                              \
+      int s = NAME##_find_slot(c, key);                                          \
+      if (s >= 0)                                                                \
+      c->slots[s].bytes = bytes;                                             \
+   }                                                                              \
+   static void NAME##_set_budget(NAME *c, size_t bytes)                           \
+   {                                                                              \
+      c->budget_bytes = bytes;                                                   \
+      NAME##_evict(c);                                                           \
+   }                                                                              \
+   static size_t NAME##_size_bytes(const NAME *c) { return c->total_bytes; }      \
+   static size_t NAME##_count(const NAME *c)      { return (size_t)c->live; }     \
+   static size_t NAME##_budget(const NAME *c)     { return c->budget_bytes; }
+
+   /* --- RAM cache: decoded CPU levels, keyed by (hash, palette) -------------
+    * * Lives independent of TextureUpload lifetime, so images survive the rapid
+    * VRAM upload churn of animated sprites. Decode-once: a combo is
+    * read+decoded from disk at most once until evicted. CPU-side only - the GPU
+    * upload happens on attach via renderer_upload_texture, so it survives
+    * device/swapchain resets. The disposer frees the decoded levels. */
+   typedef struct CachedHdImage {
+      LoadedLevels levels; /* decoded RGBA + mips (CPU side) */
+      int    alpha_flags;
+      size_t bytes;
+   } CachedHdImage;
+
+   static void cached_hd_image_dispose(CachedHdImage *p)
+   {
+      loaded_levels_reset(&p->levels);
+   }
+
+   HD_LRU_DECLARE(HdImageCache, CachedHdImage);
+   HD_LRU_DEFINE(HdImageCache, CachedHdImage, cached_hd_image_dispose)
+
+      /* Insert/replace a combo's decoded levels; takes ownership of *levels
+       * (left empty on return). */
+      static void hd_image_cache_put(HdImageCache *c, HdTextureId id,
+            LoadedLevels *levels, int alpha_flags)
+      {
+         uint64_t key = hd_pack_key(id);
+         int created = 0;
+         CachedHdImage *e = HdImageCache_put_slot(c, key, &created);
+         size_t old_bytes = created ? 0 : e->bytes;
+         if (created)
+            loaded_levels_init(&e->levels); /* fresh slot: payload is indeterminate */
+         loaded_levels_move(&e->levels, levels);
+         e->alpha_flags = alpha_flags;
+         e->bytes = loaded_levels_byte_size(&e->levels);
+         HdImageCache_set_entry_bytes(c, key, e->bytes);
+         HdImageCache_account(c, old_bytes, e->bytes);
+      }
+
+   /* --- VRAM cache: uploaded Vulkan images, keyed by (hash, palette) --------
+    * * Sits above the RAM cache. Re-attaching a combo to a recreated
+    * TextureUpload becomes a ref-counted handle copy instead of a fresh
+    * upload_texture. The image is held as a RAW TTGpuImage * (trivially relocatable,
+    * so the malloc arena can realloc it) with the refcount managed by hand: a
+    * reference is taken on insert and released by the disposer on
+    * eviction/clear, freeing VRAM once no live draw still holds the image. */
+   typedef struct CachedGpuImage {
+      TTGpuImage *image; /* owns one reference while resident (NULL = empty) */
+      int    alpha_flags;
+      size_t bytes;         /* approximate VRAM footprint (== decoded levels size) */
+   } CachedGpuImage;
+
+   static void cached_gpu_image_dispose(CachedGpuImage *p)
+   {
+      if (p->image)
+      {
+         tt_img_release(p->image);
+         p->image = NULL;
+      }
+   }
+
+   HD_LRU_DECLARE(HdGpuCache, CachedGpuImage);
+   HD_LRU_DEFINE(HdGpuCache, CachedGpuImage, cached_gpu_image_dispose)
+
+      /* Take a counted reference to a cached image and return it as an
+       * ImageHandle the caller can store/copy/destroy normally.
+       * IntrusivePtr(T*) adopts without bumping, so add the reference
+       * explicitly first. */
+      static ImageHandle hd_gpu_image_handle(CachedGpuImage *g)
+      {
+         tt_img_addref(g->image);
+         return ih_make(g->image);
+      }
+
+   /* Insert/replace a combo's GPU image. Adds a reference to `handle`'s image
+    * (held until eviction); a prior image at this key is released first. */
+   static void hd_gpu_cache_put(HdGpuCache *c, HdTextureId id,
+         ImageHandle handle, int alpha_flags, size_t bytes)
+   {
+      uint64_t key = hd_pack_key(id);
+      int created = 0;
+      CachedGpuImage *e = HdGpuCache_put_slot(c, key, &created);
+      size_t old_bytes = created ? 0 : e->bytes;
+      if (!created && e->image)
+         tt_img_release(e->image); /* drop the image we're replacing */
+      e->image = ih_get(&handle);
+      if (e->image)
+         tt_img_addref(e->image);      /* cache holds its own reference */
+      e->alpha_flags = alpha_flags;
+      e->bytes = bytes;
+      HdGpuCache_set_entry_bytes(c, key, bytes);
+      HdGpuCache_account(c, old_bytes, bytes);
+   }
+
+   /* -------------------------------------------------------------------------
+    * * HdKeySet - an ordered set of packed (hash, palette) uint64_t keys, MSVC
+    * C89.
+    *
+    * A set of HdTextureId. Backed by a single sorted, malloc'd uint64_t array:
+    * membership is O(log n) binary search, insert/erase keep it sorted (O(n)
+    * shift, fine for these small sets). Because the key packs (hash << 32) |
+    * palette, the array is ordered by hash then palette, so all combos of one
+    * hash form a contiguous run - found with lower_bound over the half-open key
+    * range [hash<<32, (hash+1)<<32), which is exactly what the old a range
+    * query over [{hash,0}, {hash,0xFFFFFFFF}] gives.
+    * ------------------------------------------------------------------------- */
+   typedef struct HdKeySet {
+      uint64_t *keys;
+      int       count;
+      int       cap;
+   } HdKeySet;
+
+   static void hd_key_set_init(HdKeySet *s)
+   {
+      s->keys = NULL;
+      s->count = 0;
+      s->cap = 0;
+   }
+   static void hd_key_set_free(HdKeySet *s)
+   {
+      free(s->keys);
+      s->keys = NULL;
+      s->count = 0;
+      s->cap = 0;
+   }
+   static void hd_key_set_clear(HdKeySet *s)
+   {
+      s->count = 0; /* keep the allocation for reuse */
+   }
+   /* First index with keys[i] >= key (lower bound). */
+   static int hd_key_set_lower_bound(const HdKeySet *s, uint64_t key)
+   {
+      int lo = 0, hi = s->count;
+      while (lo < hi) {
+         int mid = lo + ((hi - lo) >> 1);
+         if (s->keys[mid] < key)
+            lo = mid + 1;
+         else
+            hi = mid;
+      }
+      return lo;
+   }
+   static int hd_key_set_contains(const HdKeySet *s, uint64_t key)
+   {
+      int i = hd_key_set_lower_bound(s, key);
+      return i < s->count && s->keys[i] == key;
+   }
+   /* Insert key; returns 1 if newly added, 0 if already present. */
+   static int hd_key_set_insert(HdKeySet *s, uint64_t key)
+   {
+      int i = hd_key_set_lower_bound(s, key);
+      if (i < s->count && s->keys[i] == key)
+         return 0;
+      if (s->count == s->cap) {
+         int ncap = s->cap ? s->cap * 2 : 16;
+         uint64_t *nk = (uint64_t *)realloc(s->keys, (size_t)ncap * sizeof(uint64_t));
+         if (!nk)
+            return 0;
+         s->keys = nk;
+         s->cap = ncap;
+      }
+      memmove(&s->keys[i + 1], &s->keys[i], (size_t)(s->count - i) * sizeof(uint64_t));
+      s->keys[i] = key;
+      s->count++;
+      return 1;
+   }
+   /* Bulk build: append_unsorted + finalize_sorted, for callers that produce
+    * many keys at once (a directory scan). Sorted insertion memmoves the tail
+    * per key, which is O(n^2) over a large pack; one qsort at the end is not.
+    * The set is NOT queryable between the two calls. */
+   static int hd_key_u64_cmp(const void *a, const void *b)
+   {
+      uint64_t ka = *(const uint64_t *)a;
+      uint64_t kb = *(const uint64_t *)b;
+      if (ka < kb) return -1;
+      if (ka > kb) return 1;
+      return 0;
+   }
+   /* Returns 0 if the allocation failed (key not stored). */
+   static int hd_key_set_append_unsorted(HdKeySet *s, uint64_t key)
+   {
+      if (s->count == s->cap) {
+         int ncap = s->cap ? s->cap * 2 : 16;
+         uint64_t *nk = (uint64_t *)realloc(s->keys, (size_t)ncap * sizeof(uint64_t));
+         if (!nk)
+            return 0;
+         s->keys = nk;
+         s->cap = ncap;
+      }
+      s->keys[s->count++] = key;
+      return 1;
+   }
+   static void hd_key_set_finalize_sorted(HdKeySet *s)
+   {
+      int r, w;
+      if (s->count < 2)
+         return;
+      qsort(s->keys, (size_t)s->count, sizeof(uint64_t), hd_key_u64_cmp);
+      /* dedup in place (the same combo present under several extensions) */
+      w = 1;
+      for (r = 1; r < s->count; r++)
+         if (s->keys[r] != s->keys[w - 1])
+            s->keys[w++] = s->keys[r];
+      s->count = w;
+   }
+   static void hd_key_set_erase(HdKeySet *s, uint64_t key)
+   {
+      int i = hd_key_set_lower_bound(s, key);
+      if (i >= s->count || s->keys[i] != key)
+         return;
+      memmove(&s->keys[i], &s->keys[i + 1], (size_t)(s->count - i - 1) * sizeof(uint64_t));
+      s->count--;
+   }
+
+   /* -------------------------------------------------------------------------
+    * * HdCountMap - HdKeySet plus a per-key uint32 counter, MSVC C89.
+    *
+    * Same sorted-array/binary-search shape as HdKeySet; the sets it counts are
+    * small (only keys currently misbehaving live in one). Used to put a hard
+    * ceiling on two otherwise open-ended retry loops: disk loads that keep
+    * failing, and attach markers whose upload never comes back.
+    * ------------------------------------------------------------------------- */
+   /* Failed disk loads per combo before it is written off permanently. Three
+    * gives a transient error (an antivirus or indexer sharing violation, handle
+    * pressure during a four-worker burst) several frames to clear while keeping
+    * a deterministic failure cheap. */
+#define TT_LOAD_MAX_ATTEMPTS 3
+   /* Attach passes a pending_attach marker survives without its upload becoming
+    * resident. Text rows recycle within a few frames, so a marker still waiting
+    * after two seconds of gameplay is waiting on VRAM that is not coming back;
+    * dropping it costs nothing, since the next draw re-requests the combo and
+    * the cache hit re-arms the marker. */
+#define TT_ATTACH_MAX_RETRIES 120
+
+   typedef struct HdCountEntry {
+      uint64_t key;
+      uint32_t count;
+   } HdCountEntry;
+
+   typedef struct HdCountMap {
+      HdCountEntry *entries;
+      int           count;
+      int           cap;
+   } HdCountMap;
+
+   static void hd_count_map_init(HdCountMap *m)
+   {
+      m->entries = NULL;
+      m->count = 0;
+      m->cap = 0;
+   }
+   static void hd_count_map_free(HdCountMap *m)
+   {
+      free(m->entries);
+      m->entries = NULL;
+      m->count = 0;
+      m->cap = 0;
+   }
+   static void hd_count_map_clear(HdCountMap *m)
+   {
+      m->count = 0; /* keep the allocation for reuse */
+   }
+   static int hd_count_map_lower_bound(const HdCountMap *m, uint64_t key)
+   {
+      int lo = 0, hi = m->count;
+      while (lo < hi) {
+         int mid = lo + ((hi - lo) >> 1);
+         if (m->entries[mid].key < key)
+            lo = mid + 1;
+         else
+            hi = mid;
+      }
+      return lo;
+   }
+   /* Increment key's counter (inserting it at 1 if absent) and return the new
+    * value. Returns 0 only if the allocation failed, which reads as "not yet at
+    * the limit" - a lost counter must never escalate to a permanent give-up. */
+   static uint32_t hd_count_map_bump(HdCountMap *m, uint64_t key)
+   {
+      int i = hd_count_map_lower_bound(m, key);
+      if (i < m->count && m->entries[i].key == key)
+         return ++m->entries[i].count;
+      if (m->count == m->cap) {
+         int ncap = m->cap ? m->cap * 2 : 16;
+         HdCountEntry *ne = (HdCountEntry *)realloc(m->entries, (size_t)ncap * sizeof(HdCountEntry));
+         if (!ne)
+            return 0;
+         m->entries = ne;
+         m->cap = ncap;
+      }
+      memmove(&m->entries[i + 1], &m->entries[i], (size_t)(m->count - i) * sizeof(HdCountEntry));
+      m->entries[i].key = key;
+      m->entries[i].count = 1;
+      m->count++;
+      return 1;
+   }
+   static void hd_count_map_erase(HdCountMap *m, uint64_t key)
+   {
+      int i = hd_count_map_lower_bound(m, key);
+      if (i >= m->count || m->entries[i].key != key)
+         return;
+      memmove(&m->entries[i], &m->entries[i + 1], (size_t)(m->count - i - 1) * sizeof(HdCountEntry));
+      m->count--;
+   }
+
+   /* -------------------------------------------------------------------------
+    * Prefetch journal - a persisted successor map for demand-fetch misses.
+    *
+    * Demand fetch discovers a needed (hash,palette) combo only at draw time -
+    * too late for content that mints new combos every frame (SotN's intro
+    * crawl typewrites roughly a glyph per frame into its text pages, so every
+    * page state is a first-seen hash used exactly once; the 3-tier cache never
+    * helps there by construction). The journal records, across sessions, which
+    * combo was FIRST SEEN right after which ("X -> Y"); on later runs, seeing X
+    * queues background loads for Y, Z, ... (a chain walk), so deterministic
+    * streams arrive decoded before they are drawn. A wrong prediction costs
+    * one wasted low-priority background load, bounded by the cache budgets.
+    *
+    * Storage: open-addressed (linear probe, fmix64 hash) uint64 -> {uint64,
+    * pages flag} map. Keys and values are hd_pack_key values; the successor's
+    * pages flag rides beside the value because the key salt is only reversible
+    * when the flag is known (hd_unpack_key). Persisted as prefetch.journal in
+    * the -texture-replacements folder (it travels with the pack).
+    * ------------------------------------------------------------------------- */
+   struct TTJournalSlot {
+      uint64_t key;
+      uint64_t next_key;
+      uint8_t  next_pages;
+      uint8_t  used;
+   };
+   typedef struct TTJournalSlot TTJournalSlot;
+   struct TTJournal {
+      TTJournalSlot *slots;
+      size_t cap;   /* power of two; 0 = unallocated */
+      size_t count;
+      bool dirty;   /* has changes not yet persisted */
+   };
+   typedef struct TTJournal TTJournal;
+
+   static void tt_journal_init(TTJournal *j)
+   {
+      j->slots = NULL;
+      j->cap = 0;
+      j->count = 0;
+      j->dirty = false;
+   }
+   static void tt_journal_free(TTJournal *j)
+   {
+      free(j->slots);
+      tt_journal_init(j);
+   }
+   /* Slot for key: its live entry, or the empty slot where it would insert. */
+   static TTJournalSlot *tt_journal_probe(TTJournal *j, uint64_t key)
+   {
+      size_t i = (size_t)hd_lru_mix(key) & (j->cap - 1);
+      for (;;) {
+         TTJournalSlot *s = &j->slots[i];
+         if (!s->used || s->key == key)
+            return s;
+         i = (i + 1) & (j->cap - 1);
+      }
+   }
+   static bool tt_journal_grow(TTJournal *j)
+   {
+      TTJournalSlot *old = j->slots;
+      size_t old_cap = j->cap;
+      size_t ncap = old_cap ? old_cap * 2 : 256;
+      size_t i;
+      TTJournalSlot *ns = (TTJournalSlot *)calloc(ncap, sizeof(TTJournalSlot));
+      if (!ns)
+         return false;
+      j->slots = ns;
+      j->cap = ncap;
+      for (i = 0; i < old_cap; i++) {
+         if (old[i].used)
+            *tt_journal_probe(j, old[i].key) = old[i];
+      }
+      free(old);
+      return true;
+   }
+   /* Recorded successor of key -> *next_key and *next_pages; false if none. */
+   static bool tt_journal_lookup(TTJournal *j, uint64_t key, uint64_t *next_key, bool *next_pages)
+   {
+      TTJournalSlot *s;
+      if (j->cap == 0)
+         return false;
+      s = tt_journal_probe(j, key);
+      if (!s->used)
+         return false;
+      *next_key = s->next_key;
+      *next_pages = s->next_pages != 0;
+      return true;
+   }
+   /* Record key -> next (the last observation wins, so occasionally
+    * nondeterministic content converges on its dominant successor). */
+   static void tt_journal_record(TTJournal *j, uint64_t key, uint64_t next_key, bool next_pages)
+   {
+      TTJournalSlot *s;
+      if (j->cap == 0 || j->count * 4 >= j->cap * 3) {
+         if (!tt_journal_grow(j))
+            return;
+      }
+      s = tt_journal_probe(j, key);
+      if (!s->used) {
+         s->used = 1;
+         s->key = key;
+         s->next_key = 0;
+         s->next_pages = 0;
+         j->count++;
+      }
+      if (s->next_key != next_key || (s->next_pages != 0) != next_pages) {
+         s->next_key = next_key;
+         s->next_pages = next_pages ? 1 : 0;
+         j->dirty = true;
+      }
+   }
+
+   /* Page-aligned experiment: memoized page CRC keyed by the page rect (VRAM
+    * words). dirty = the page's VRAM was written since we last hashed it;
+    * hashed_frame caps re-hashing to once per page per frame (busy VRAM regions
+    * otherwise re-CRC a 256-row page on nearly every draw). */
+   struct CachedPageHash {
+      TTRect rect;
+      uint32_t hash;
+      bool dirty;
+      uint64_t hashed_frame;
+   };
+   typedef struct CachedPageHash CachedPageHash;
+
+   /* Reduce Palette Range memo for the page path: the [min,max] CLUT indices a
+    * page's index data references. Keyed by (rect, hash) - content-addressed, so it
+    * self-invalidates when the page content (and thus its hash) changes; no dirty
+    * coupling with CachedPageHash. pal_min < 0 means "no palette / no range". */
+   struct CachedPageBounds {
+      TTRect rect;
+      uint32_t hash;
+      int pal_min;
+      int pal_max;
+   };
+   typedef struct CachedPageBounds CachedPageBounds;
+
+   /* Page-aligned experiment: a resolved page replacement ready to bind for one
+    * draw. Built each frame in get_hd_texture_index from a loaded page image; the
+    * page HdTextureHandle indexes the tracker's ephemeral page_bindings vector
+    * (cleared at on_queues_reset, exactly like handle_cache). page_rect is the
+    * page in VRAM 16-bit words {page_x, page_y, page_w, 256}; the shader maps it
+    * to the full image via (vram_rect, texel_rect={0,0,img_w,img_h}).
+    * (PAGE_ALIGN.md section 6.) */
+   struct ReplacedPage {
+      TTRect page_rect;        /* VRAM words */
+      ImageHandle texture;
+      int alpha_flags;
+   };
+   typedef struct ReplacedPage ReplacedPage;
+
+   /* TextureTracker: the HD-texture replacement engine -- tracks VRAM rects,
+    * resolves (hash,palette) combos to HD textures, and drives the disk/CPU/GPU
+    * cache tiers and the IO worker thread. A
+    * plain C struct + texture_tracker_* free functions. The init/teardown
+    * become texture_tracker_init / texture_tracker_fini; the embedded
+    * RectTracker / FusedPages are init'd/deinit'd there (already converted).
+    * Default member initializers move into texture_tracker_init. */
+   struct TextureTracker {
+      bool dump_enabled;
+      bool hd_textures_enabled;
+      bool eager_textures; /* true = prefetch all palettes of a hash on upload (master-consistent); false = lazy per-draw */
+
+      IOThread iothread;
+
+      ImageHandle default_hd_texture;
+
+      RectMatch dump_ignore[DUMP_IGNORE_MAX];
+      int       dump_ignore_count;
+
+      HdKeySet known_files;
+      /* Palette-hash cache: a plain growable array (append-only until cleared,
+       * no eviction/order). */
+      CachedPaletteHash *cached_palette_hashes;
+      int cached_palette_hashes_count;
+      int cached_palette_hashes_cap;
+      RestorableRectVec restorable_rects;
+      FusedPages fused_pages;
+      uint64_t frame;
+
+      RectTracker tracker;
+      HandleLRUCache handle_cache;
+
+      /* HD image caches, independent of upload lifetime. Tier 1 = GPU (VRAM,
+       * ready-to-bind Vulkan images); tier 2 = CPU (RAM, decoded levels); tier
+       * 3 = disk. Initialised via HdGpuCache_init / HdImageCache_init. */
+      HdGpuCache hd_gpu_cache;
+      HdImageCache hd_cache;
+      HdKeySet requested; /* disk load in flight, or known to have no file (negative cache) */
+      HdKeySet inflight;  /* combos with an IORequest ACTUALLY queued or decoding right now.
+                           * Render-thread bookkeeping for the pooled Lazy-sync wait: unlike
+                           * `requested` (which also holds permanent negatives), membership
+                           * here guarantees a response is coming, so a bounded wait on the
+                           * response cond can never hang on a no-file combo. Inserted after
+                           * a request is pushed; erased when its response is drained. */
+      HdKeySet pending_attach; /* cached combos drawn/decoded this frame, awaiting GPU attach at on_queues_reset */
+      /* Consecutive failed disk loads per combo. At TT_LOAD_MAX_ATTEMPTS the
+       * combo goes back into `requested` as a permanent negative, so a file
+       * that fails deterministically (unreadable, or a pack whose on-disk
+       * spelling the loader cannot reconstruct) costs a bounded number of open
+       * attempts instead of one per draw forever. Cleared with `requested`. */
+      HdCountMap load_attempts;
+      /* Consecutive attach passes a pending_attach marker has been retained
+       * without its upload being resident. Retained markers are exactly the
+       * keys that miss texture_tracker_find_upload, whose miss path walks every
+       * restorable rect, so the retained set has to have a ceiling. */
+      HdCountMap attach_retries;
+
+      /* Prefetch journal (persisted successor map) + its session state.
+       * journal_seen gates RECORDING to the first sighting of each combo per
+       * session (so replays don't rewrite the chain in re-encounter order);
+       * journal_walked gates the PREDICTION walk to once per origin combo
+       * (cleared periodically so replayed content re-predicts);
+       * journal_prev_* is the tail of the chain being recorded. */
+      TTJournal journal;
+      HdKeySet journal_seen;
+      HdKeySet journal_walked;
+      uint64_t journal_prev_key;
+      bool journal_prev_valid;
+      uint64_t journal_saved_frame;   /* frame of the last periodic save */
+      uint32_t journal_save_backoff;  /* extra frames to wait after a failed background save */
+      bool     journal_loaded;        /* prefetch.journal read from disk yet (lazily, on first use) */
+
+      /* Per-frame budget for inline (mid-draw) GPU uploads of already-decoded
+       * combos on the async Lazy path. Uploading is cheap next to decode, so a
+       * budgeted inline upload+bind removes the guaranteed 1-frame native
+       * flicker of the deferred attach - while the budget stops a burst of
+       * CPU-cache hits (e.g. right after a GPU-cache flush) from turning into
+       * a Lazy-synchronous-style stall. Reset each endFrame. */
+      int inline_uploads_this_frame;
+
+      /* Diagnostics (logged every 300 frames by endFrame). */
+      uint64_t dbg_responses_received;
+      uint64_t dbg_responses_received_last;
+      uint64_t dbg_gpu_uploads;
+      uint64_t dbg_gpu_uploads_last;
+      uint64_t dbg_attaches;
+      uint64_t dbg_attaches_last;
+
+      DbgHotkey frame_dump_key;
+      RFILE *frame_dump;
+      bool frame_dump_need_comma;
+
+      DbgHotkey hd_toggle_key;
+      DbgHotkey reload_key;
+      DbgHotkey fastpath_key;
+      bool fastpath_enabled;
+
+      /* ---- Page-aligned experiment + HD QoL (see PAGE_ALIGN.md). ---- */
+      /* HD Dump Mode: rect -> -texture-dump/, pages -> -texture-dump-pages/.
+       * Both can be set ("Both" mode). Default = upload-rect (master-consistent). */
+      bool dump_mode_rect;
+      bool dump_mode_pages;
+      bool replacement_mode_pages;  /* HD Replacement Mode = Page-aligned */
+      bool replacement_fallback;    /* on a miss in the active mode, also try the other pack */
+      bool lazy_sync;               /* Lazy mode only: load+upload synchronously on the render thread */
+      bool reduce_palette_range;    /* opt-in: hash only the CLUT entries a texture uses */
+
+      /* dump.cfg `clutrows a,b`: VRAM rows holding live in-page CLUTs that some
+       * games animate (e.g. SotN keeps stage palettes in the bottom rows of its
+       * tile pages). These rows are hashed as zeros so palette writes can't churn
+       * the page hash for unchanged art. Active purely from dump.cfg (like the
+       * `ignore` directive) - inert when clut_rows_count == 0. */
+      uint8_t clut_rows[FB_HEIGHT];
+      int     clut_rows_count;
+
+      /* dump.cfg `pageignore x,y,w,h`: VRAM regions the game composites at runtime
+       * (sprite frames, menu text, icon slots); a page intersecting one is skipped
+       * by page-aligned DUMPING. Replacement matching is unaffected. */
+      RectMatch page_ignore[PAGE_IGNORE_MAX];
+      int       page_ignore_count;
+
+      /* dump.cfg `pagemindump w,h` (VRAM halfwords; 0,0 = off): a page dump only
+       * fires when it overlaps a dumpable upload at least this large - suppresses
+       * page dumps triggered by tiny composite writes (glyphs, icons, map pixels). */
+      int page_min_dump_w;
+      int page_min_dump_h;
+
+      /* CPU mirror of 16-bit VRAM (FB_WIDTH x FB_HEIGHT), kept current by every
+       * VRAM mutation hook. Page hashing/dumping reads page bytes from here
+       * because the draw path carries no CPU VRAM pointer (PAGE_ALIGN.md sec 3). */
+      uint16_t *vram_mirror;
+
+      /* Scratch CLUT buffer for palette reads that fall back to the VRAM mirror
+       * (see texture_tracker_get_palette). One 8bpp CLUT = 256 entries. Filled
+       * and consumed synchronously on the render thread, so one reused buffer is
+       * safe. */
+      uint16_t palette_scratch[256];
+
+      /* Last dump/replacement folders ensure_directories() created (skip re-mkdir
+       * unless the target path changes - game load, mode switch, or folder option). */
+      char ensured_dump_dir[PATH_MAX_TT];
+      char ensured_dump_pages_dir[PATH_MAX_TT];
+      char ensured_replace_dir[PATH_MAX_TT];
+
+      /* Page-aligned replacement: reuses the 3-tier cache / requested / IO pool,
+       * keyed by {page_hash, palette, pages=true}. These sets are page-only. */
+      HdKeySet known_files_pages;      /* files in the -pages folder */
+      HdKeySet pending_attach_pages;   /* page combos decoded, awaiting GPU attach (stores BASE keys) */
+      HdKeySet dumped_pages;           /* dedup of dumped (page_hash, palette_hash) */
+
+      /* Per-frame resolved page bindings; a page HdTextureHandle indexes this.
+       * Cleared at on_queues_reset (same contract as handle_cache). */
+      ReplacedPage *page_bindings;
+      int page_bindings_count;
+      int page_bindings_cap;
+
+      /* Memo of page CRCs by page rect; invalidated on overlapping mirror writes
+       * so the per-draw page hash isn't recomputed for repeated draws of a page. */
+      CachedPageHash *cached_page_hashes;
+      int cached_page_hashes_count;
+      int cached_page_hashes_cap;
+
+      /* Reduce Palette Range (page path): per-page [min,max] CLUT window memo. */
+      CachedPageBounds *cached_page_bounds;
+      int cached_page_bounds_count;
+      int cached_page_bounds_cap;
+
+      uint64_t dbg_gpu_uploads_peak;  /* max uploads in a single on_queues_reset within the window */
+      uint64_t dbg_page_binds;        /* page combos bound for a draw (cache hit) */
+      uint64_t dbg_page_binds_last;
+      uint64_t dbg_page_miss;         /* page draws with no resident replacement (native) */
+      uint64_t dbg_page_miss_last;
+      uint64_t dbg_page_hashes;       /* actual full-page CRC32s computed (memo misses) */
+      uint64_t dbg_page_hashes_last;
+      uint64_t dbg_prefetch_issued;   /* journal-predicted combos handed to want_combo */
+      uint64_t dbg_prefetch_issued_last;
+      uint64_t dbg_inline_uploads;    /* async CPU-cache hits GPU-uploaded mid-draw */
+      uint64_t dbg_inline_uploads_last;
+      uint64_t dbg_pool_waits;        /* pooled Lazy-sync waits entered (draw blocked on the IO pool) */
+      uint64_t dbg_pool_waits_last;
+      uint64_t dbg_pool_wait_timeouts;/* pooled waits that hit the ~512ms bound (should stay 0) */
+      uint64_t dbg_pool_wait_timeouts_last;
+   };
+
+   static void texture_tracker_init(struct TextureTracker *self);
+   static void texture_tracker_fini(struct TextureTracker *self);
+
+   void texture_tracker_save_state(struct TextureTracker *self,
+         TextureTrackerSaveState *out);
+   void texture_tracker_load_state(struct TextureTracker *self,
+         const TextureTrackerSaveState *state);
+
+   void texture_tracker_upload(struct TextureTracker *self,
+         TTRect rect,
+         uint16_t *vram);
+   void texture_tracker_blit(struct TextureTracker *self,
+         TTRect dst,
+         TTRect src);
+   void texture_tracker_clearRegion(struct TextureTracker *self,
+         TTRect rect, uint16_t fill16);
+   void texture_tracker_notifyReadback(struct TextureTracker *self,
+         TTRect rect,
+         uint16_t *vram);
+
+   HdTextureHandle texture_tracker_get_hd_texture_index(struct TextureTracker *self,
+         TTRect rect,
+         UsedMode *mode,
+         unsigned int page_x,
+         unsigned int page_y,
+         bool *fastpath_capable,
+         bool *cache_hit);
+   HdTexture texture_tracker_get_hd_texture(struct TextureTracker *self,
+         HdTextureHandle index);
+   void texture_tracker_endFrame(struct TextureTracker *self);
+   void texture_tracker_on_queues_reset(struct TextureTracker *self);
+
+void texture_tracker_set_cache_budgets(struct TextureTracker *self,
+      size_t ram_bytes,
+      size_t vram_bytes)
+   {
+      HdImageCache_set_budget(&self->hd_cache, ram_bytes);
+      HdGpuCache_set_budget(&self->hd_gpu_cache, vram_bytes);
+      /* Fused-page composites are a separate VRAM tier; bound them by the same VRAM
+       * budget so they can't grow without limit (worst-case total HD VRAM ~= 2x the
+       * cap: GPU cache + fused pages). */
+      fused_pages_set_budget(&self->fused_pages, vram_bytes);
+   }
+
+   static Palette texture_tracker_get_palette(struct TextureTracker *self,
+         TTRect palette_rect);
+   static uint32_t texture_tracker_get_palette_hash(struct TextureTracker *self,
+         TTRect palette_rect);
+   static void texture_tracker_want_combo(struct TextureTracker *self,
+         HdTextureId id, bool high_priority, bool pages);
+   static void texture_tracker_dump_texture(struct TextureTracker *self,
+         TextureUpload *upload,
+         UsedMode *mode,
+         DumpedMode dump_mode);
+   static void texture_tracker_load_hd_texture(struct TextureTracker *self,
+         uint32_t hash);
+   static void texture_tracker_request_hd_texture(struct TextureTracker *self,
+         TextureUpload *upload,
+         uint32_t palette_hash);
+   void texture_tracker_reload_textures_from_disk(struct TextureTracker *self);
+   static void texture_tracker_dump_image(struct TextureTracker *self,
+         TextureUpload *upload,
+         UsedMode *mode,
+         uint32_t palette_hash_override);
+   /* ---- Page-aligned experiment + HD QoL forward declarations (PAGE_ALIGN.md) ---- */
+   static void texture_tracker_mirror_store(struct TextureTracker *self, TTRect rect, const uint16_t *vram);
+   static void texture_tracker_mirror_blit(struct TextureTracker *self, TTRect dst, TTRect src);
+   static void texture_tracker_mirror_fill(struct TextureTracker *self, TTRect rect, uint16_t value);
+   static void texture_tracker_invalidate_page_hashes(struct TextureTracker *self, TTRect written);
+   static uint32_t texture_tracker_hash_page(struct TextureTracker *self, TTRect page_rect);
+   static uint32_t texture_tracker_hash_page_cached(struct TextureTracker *self, TTRect page_rect);
+   static void texture_tracker_dump_page(struct TextureTracker *self, TTRect page_rect, uint32_t page_hash, UsedMode *mode, uint32_t palette_hash);
+   void texture_tracker_ensure_directories(struct TextureTracker *self, bool dump, bool replace);
+   static void texture_tracker_sync_load_combo(struct TextureTracker *self, TextureUpload *upload, uint32_t palette_hash);
+   static void texture_tracker_sync_load_page(struct TextureTracker *self, HdTextureId id);
+   static HdTextureHandle texture_tracker_match_page(struct TextureTracker *self, TTRect page_rect, uint32_t page_hash, uint32_t palette_hash);
+static void texture_tracker_clear_palette_cache(struct TextureTracker *self,
+      TTRect rect)
+   {
+      self->cached_palette_hashes_count = 0; /* keep allocation for reuse */
+   }
+   static TextureUpload *texture_tracker_find_upload(struct TextureTracker *self,
+         uint32_t hash);
+
+static INLINE int cfg_is_space(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static INLINE const char *cfg_skip_ws(const char *p)
+{
+    while (*p && cfg_is_space((unsigned char)*p)) p++;
+    return p;
+}
+
+/* Parse one "(\d+|\*)" field with surrounding optional whitespace. On success
+ * advances *pp past the field and returns 0, writing the value (-1 for '*');
+ * returns -1 if the field doesn't match. */
+static int cfg_parse_field(const char **pp, int *out)
+{
+    const char *p = cfg_skip_ws(*pp);
+    if (*p == '*') {
+        *out = -1;
+        p++;
+    } else if (*p >= '0' && *p <= '9') {
+        int v = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (*p - '0');
+            p++;
+        }
+        *out = v;
+    } else {
+        return -1;
+    }
+    *pp = cfg_skip_ws(p);
+    return 0;
+}
+
+/* Match one config line against:
+ * ^\s*ignore\s+(\d+|\*)\s*,\s*(\d+|\*)\s*,\s*(\d+|\*)\s*,\s*(\d+|\*)\s*(?:#.*)?$
+ * On match, fills *m and returns true. Hand-rolled matcher. */
+static bool cfg_match_ignore(const char *line, RectMatch *m)
+{
+    const char *p = cfg_skip_ws(line);
+    int i;
+    int *fields[4];
+    if (strncmp(p, "ignore", 6) != 0)
+        return false;
+    p += 6;
+    /* \s+ : at least one whitespace after the keyword */
+    if (!cfg_is_space((unsigned char)*p))
+        return false;
+    p = cfg_skip_ws(p);
+
+    fields[0] = &m->x; fields[1] = &m->y; fields[2] = &m->w; fields[3] = &m->h;
+    for (i = 0; i < 4; i++) {
+        if (cfg_parse_field(&p, fields[i]) != 0)
+            return false;
+        if (i < 3) {
+            if (*p != ',')
+                return false;
+            p++;
+        }
+    }
+    /* optional trailing comment, then end of line */
+    if (*p == '#')
+        return true;
+    return *p == '\0';
+}
+
+static int parse_config_file(const char *path, RectMatch *out, int max) {
+    char line[1024];
+    int count = 0;
+    RFILE *in = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+                                RETRO_VFS_FILE_ACCESS_HINT_NONE);
+    if (!in)
+        return 0;
+    while (count < max && filestream_gets(in, line, sizeof(line))) {
+        RectMatch m;
+        if (cfg_match_ignore(line, &m))
+            out[count++] = m;
+    }
+    filestream_close(in);
+    return count;
+}
+
+/* Match:  ^\s*clutrows\s+(\d+)\s*,\s*(\d+)\s*(?:#.*)?$  - an inclusive range of
+ * VRAM rows that hold CLUTs (excluded from page-aligned hashes). */
+static bool cfg_match_clutrows(const char *line, int *start, int *end)
+{
+    const char *p = cfg_skip_ws(line);
+    if (strncmp(p, "clutrows", 8) != 0)
+        return false;
+    p += 8;
+    if (!cfg_is_space((unsigned char)*p))
+        return false;
+    p = cfg_skip_ws(p);
+    if (cfg_parse_field(&p, start) != 0)
+        return false;
+    if (*p != ',')
+        return false;
+    p++;
+    if (cfg_parse_field(&p, end) != 0)
+        return false;
+    if (*p == '#')
+        return true;
+    return *p == '\0';
+}
+
+/* Scan dump.cfg for `clutrows a,b` lines, setting rows[a..b] (clamped).
+ * Returns the number of rows flagged. */
+static int parse_clut_rows_config(const char *path, uint8_t *rows, int height)
+{
+    char line[1024];
+    int flagged = 0;
+    RFILE *in = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+                                RETRO_VFS_FILE_ACCESS_HINT_NONE);
+    if (!in)
+        return 0;
+    while (filestream_gets(in, line, sizeof(line))) {
+        int start = -1, end = -1, y;
+        if (!cfg_match_clutrows(line, &start, &end))
+            continue;
+        if (start < 0) start = 0;
+        if (end >= height) end = height - 1;
+        for (y = start; y <= end; y++) {
+            if (!rows[y]) {
+                rows[y] = 1;
+                flagged++;
+            }
+        }
+    }
+    filestream_close(in);
+    return flagged;
+}
+
+/* Match:  ^\s*pageignore\s+(\d+),(\d+),(\d+),(\d+)\s*(?:#.*)?$  - a VRAM rect
+ * whose pages are excluded from page-aligned dumping (plain numbers, no `*`). */
+static bool cfg_match_pageignore(const char *line, RectMatch *m)
+{
+    const char *p = cfg_skip_ws(line);
+    int i;
+    int *fields[4];
+    if (strncmp(p, "pageignore", 10) != 0)
+        return false;
+    p += 10;
+    if (!cfg_is_space((unsigned char)*p))
+        return false;
+    p = cfg_skip_ws(p);
+    fields[0] = &m->x; fields[1] = &m->y; fields[2] = &m->w; fields[3] = &m->h;
+    for (i = 0; i < 4; i++) {
+        if (cfg_parse_field(&p, fields[i]) != 0)
+            return false;
+        if (*fields[i] < 0)
+            return false; /* no wildcards: this is an intersection test, not exact-match */
+        if (i < 3) {
+            if (*p != ',')
+                return false;
+            p++;
+        }
+    }
+    if (*p == '#')
+        return true;
+    return *p == '\0';
+}
+
+static int parse_page_ignore_config(const char *path, RectMatch *out, int max)
+{
+    char line[1024];
+    int count = 0;
+    RFILE *in = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+                                RETRO_VFS_FILE_ACCESS_HINT_NONE);
+    if (!in)
+        return 0;
+    while (count < max && filestream_gets(in, line, sizeof(line))) {
+        RectMatch m;
+        if (cfg_match_pageignore(line, &m))
+            out[count++] = m;
+    }
+    filestream_close(in);
+    return count;
+}
+
+/* Match:  ^\s*pagemindump\s+(\d+)\s*,\s*(\d+)\s*(?:#.*)?$  (VRAM halfwords) */
+static bool cfg_match_pagemindump(const char *line, int *w, int *h)
+{
+    const char *p = cfg_skip_ws(line);
+    if (strncmp(p, "pagemindump", 11) != 0)
+        return false;
+    p += 11;
+    if (!cfg_is_space((unsigned char)*p))
+        return false;
+    p = cfg_skip_ws(p);
+    if (cfg_parse_field(&p, w) != 0 || *w < 0)
+        return false;
+    if (*p != ',')
+        return false;
+    p++;
+    if (cfg_parse_field(&p, h) != 0 || *h < 0)
+        return false;
+    if (*p == '#')
+        return true;
+    return *p == '\0';
+}
+
+/* Scan dump.cfg for a `pagemindump w,h` line (last one wins). */
+static void parse_page_min_dump_config(const char *path, int *out_w, int *out_h)
+{
+    char line[1024];
+    RFILE *in = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+                                RETRO_VFS_FILE_ACCESS_HINT_NONE);
+    if (!in)
+        return;
+    while (filestream_gets(in, line, sizeof(line))) {
+        int w, h;
+        if (cfg_match_pagemindump(line, &w, &h)) {
+            *out_w = w;
+            *out_h = h;
+        }
+    }
+    filestream_close(in);
+}
+
+/* True when a page rect intersects any dump.cfg `pageignore` region - page-aligned
+ * dumping skips such pages (runtime-composited content). */
+static bool texture_tracker_page_dump_ignored(struct TextureTracker *self, TTRect page_rect) {
+   int i;
+   for (i = 0; i < self->page_ignore_count; i++) {
+      const RectMatch *m = &self->page_ignore[i];
+      TTRect r = make_rect((unsigned)m->x, (unsigned)m->y, (unsigned)m->w, (unsigned)m->h);
+      if (rect_intersects(&page_rect, &r))
+         return true;
+   }
+   return false;
+}
+
+struct RGBAImage {
+    uint8_t* data;
+    int width;
+    int height;
+};
+
+/* ------------------------------------------------------------------
+ * Image IO through libretro-common. Decoding goes through the
+ * image_texture front end (which dispatches to rpng / rjpeg / rbmp /
+ * rtga / rwebp / rdds by file type); encoding through rpng_encode.
+ * ------------------------------------------------------------------ */
+
+/* Extensions the replacement loader probes for, in priority order. PNG
+ * first (the historical pack format and what the dumper writes), then
+ * the remaining supported decoders. */
+static const char * const tt_replacement_exts[] = {
+    "png", "dds", "webp", "jpg", "jpeg", "bmp", "tga"
+};
+#define TT_REPLACEMENT_EXT_COUNT \
+    (sizeof(tt_replacement_exts) / sizeof(tt_replacement_exts[0]))
+
+/* Case-insensitive extension test against the supported set. ext points
+ * just past the dot. */
+static bool tt_is_replacement_ext(const char *ext) {
+    size_t i;
+    for (i = 0; i < TT_REPLACEMENT_EXT_COUNT; i++) {
+        const char *a = ext;
+        const char *b = tt_replacement_exts[i];
+        while (*a && *b) {
+            int ca = (*a >= 'A' && *a <= 'Z') ? *a + 32 : *a;
+            if (ca != *b)
+                break;
+            a++; b++;
+        }
+        if (*a == '\0' && *b == '\0')
+            return true;
+    }
+    return false;
+}
+
+static void rgba_image_free(RGBAImage *img) {
+    if (img->data != NULL) {
+        free(img->data);
+        img->data = NULL;
+    }
+}
+
+/* Decode an image from disk into *img (straight RGBA8, R at byte 0 - the
+ * byte order the GPU upload paths consume). On failure img->data is NULL.
+ * The caller owns img->data and must release it with rgba_image_free. */
+static void load_image(const char *path, RGBAImage *img) {
+    struct texture_image tex;
+    img->data          = NULL;
+    tex.pixels         = NULL;
+    tex.width          = 0;
+    tex.height         = 0;
+    tex.supports_rgba  = true; /* decode to RGBA byte order, not ARGB words */
+    tex.compressed     = NULL;
+    if (!image_texture_load(&tex, path))
+        return;
+    /* DDS can arrive as a GPU-native BCn payload with pixels == NULL;
+     * force the CPU decode since the tracker's mip/alpha pipeline (and
+     * the GL backend) want plain RGBA8. */
+    if (!tex.pixels && !image_texture_realize_rgba(&tex)) {
+        image_texture_free(&tex);
+        return;
+    }
+    img->data   = (uint8_t *)tex.pixels;
+    img->width  = (int)tex.width;
+    img->height = (int)tex.height;
+    tex.pixels  = NULL;          /* ownership moved to img */
+    image_texture_free(&tex);    /* frees any compressed payload */
+}
+
+static bool write_image(const char *path,
+      int width,
+      int height,
+      const void *data){
+    /* rpng_save_image_argb consumes ARGB8888 words; the dump decode
+     * produces RGBA bytes, so repack into a temporary. */
+    const uint8_t *src = (const uint8_t *)data;
+    size_t count = (size_t)width * (size_t)height;
+    uint32_t *argb = (uint32_t *)malloc(count ? count * sizeof(uint32_t) : 1);
+    size_t i;
+    bool ok;
+    if (!argb)
+        return false;
+    for (i = 0; i < count; i++) {
+        const uint8_t *p = src + i * 4u;
+        argb[i] = ((uint32_t)p[3] << 24) | ((uint32_t)p[0] << 16) |
+                  ((uint32_t)p[1] << 8)  |  (uint32_t)p[2];
+    }
+    ok = rpng_save_image_argb(path, argb,
+            (unsigned)width, (unsigned)height,
+            (unsigned)width * (unsigned)sizeof(uint32_t));
+    free(argb);
+    return ok;
+}
+
+
+extern retro_input_state_t dbg_input_state_cb;
+
+#include "libretro-common/include/retro_dirent.h"
+
+/* Texture and palette hashes are standard CRC-32 through
+ * libretro-common's encoding_crc32 - bit-identical to the zlib
+ * crc32 previously linked from the bundled zlib (poly 0xEDB88320,
+ * init/final 0xFFFFFFFF), so dumped filenames and replacement-pack
+ * lookups keyed on existing hashes are unchanged. */
+#include <encodings/crc32.h>
+#define crc32(crc, buf, len) encoding_crc32((uint32_t)(crc), (const uint8_t *)(buf), (size_t)(len))
+
+extern char retro_cd_base_name[4096];
+extern char retro_cd_base_directory[4096];
+/* RetroArch System / Save directories (defined in libretro.c). Used by the HD
+ * Texture Folder option to relocate the dump/replacement folders off the content
+ * directory to a single central location. */
+extern char retro_base_directory[4096];   /* System directory */
+extern char retro_save_directory[4096];   /* Save directory */
+#ifdef _WIN32
+static char retro_slash = '\\';
+#else
+static char retro_slash = '/';
+#endif
+
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+
+   /* HD Texture Folder mode: see struct tt_dir_mode. */
+   static struct tt_dir_mode texture_dir_mode = { RETRO_ATOMIC_INT_INITIALIZER(0) };
+
+   /* Replace Textures on/off for this game session, kept across renderer
+    * rebuilds; reset when the game is unloaded. */
+   static struct tt_replace_latch tt_replace = { -1, -1 };
+
+   /* Base directory for the texture dump/replacement folders, chosen by the HD
+    * Texture Folder option. Falls back to the content directory if the selected
+    * frontend directory is unset. Trailing separators are trimmed so the helpers
+    * below append retro_slash uniformly. */
+   static char *texture_root(char *out, size_t cap) {
+      const char *dir = retro_cd_base_directory;       /* 0 = content (default) */
+      const int   mode = tt_dir_mode_get(&texture_dir_mode);
+      size_t len;
+      if (mode == 1 && retro_base_directory[0] != '\0')
+         dir = retro_base_directory;                    /* 1 = system */
+      else if (mode == 2 && retro_save_directory[0] != '\0')
+         dir = retro_save_directory;                    /* 2 = save */
+      strncpy(out, dir, cap - 1);
+      out[cap - 1] = '\0';
+      len = strlen(out);
+      while (len > 0 && (out[len - 1] == '/' || out[len - 1] == '\\'))
+         out[--len] = '\0';
+      return out;
+   }
+
+   /* Create a single directory if it doesn't exist (the dump folders must
+    * exist before rpng can write into them). Trailing slash trimmed first
+    * since _mkdir dislikes it on Windows. */
+   static void ensure_directory(const char *dir_in) {
+      char dir[PATH_MAX_TT];
+      size_t len;
+      strncpy(dir, dir_in, sizeof(dir) - 1);
+      dir[sizeof(dir) - 1] = '\0';
+      len = strlen(dir);
+      while (len > 0 && (dir[len - 1] == '/' || dir[len - 1] == '\\'))
+         dir[--len] = '\0';
+      if (len == 0)
+         return;
+#ifdef _WIN32
+      _mkdir(dir);
+#else
+      mkdir(dir, 0755);
+#endif
+   }
+
+   /* Path helpers write into a caller-provided buffer (PATH_MAX_TT bytes) and
+    * return it C-style, no allocation. */
+
+   static char *dump_path(char *out, size_t cap) {
+      char root[PATH_MAX_TT];
+      int n = snprintf(out, cap, "%s%c%s-texture-dump%c",
+            texture_root(root, sizeof(root)), retro_slash, retro_cd_base_name, retro_slash);
+      if (n < 0 || (size_t)n >= cap)
+         out[cap - 1] = '\0';
+      return out;
+   }
+
+   static char *replacements_path(char *out, size_t cap) {
+      char root[PATH_MAX_TT];
+      int n = snprintf(out, cap, "%s%c%s-texture-replacements%c",
+            texture_root(root, sizeof(root)), retro_slash, retro_cd_base_name, retro_slash);
+      if (n < 0 || (size_t)n >= cap)
+         out[cap - 1] = '\0';
+      return out;
+   }
+
+   static char *replacement_filename_from_hash(char *out,
+         size_t cap,
+         uint32_t hash,
+         uint32_t palette_hash,
+         const char *ext){
+      char base[PATH_MAX_TT];
+      int n;
+      replacements_path(base, sizeof(base));
+      n = snprintf(out, cap, "%s%x-%x.%s", base, (unsigned)hash, (unsigned)palette_hash, ext);
+      if (n < 0 || (size_t)n >= cap)
+         out[cap - 1] = '\0';
+      return out;
+   }
+
+   /* Page-aligned experiment folders (kept separate so page packs and upload-rect
+    * packs never collide - same filename != same texture; see PAGE_ALIGN.md). */
+   static char *dump_pages_path(char *out, size_t cap) {
+      char root[PATH_MAX_TT];
+      int n = snprintf(out, cap, "%s%c%s-texture-dump-pages%c",
+            texture_root(root, sizeof(root)), retro_slash, retro_cd_base_name, retro_slash);
+      if (n < 0 || (size_t)n >= cap)
+         out[cap - 1] = '\0';
+      return out;
+   }
+
+   static char *replacements_pages_path(char *out, size_t cap) {
+      char root[PATH_MAX_TT];
+      int n = snprintf(out, cap, "%s%c%s-texture-replacements-pages%c",
+            texture_root(root, sizeof(root)), retro_slash, retro_cd_base_name, retro_slash);
+      if (n < 0 || (size_t)n >= cap)
+         out[cap - 1] = '\0';
+      return out;
+   }
+
+   /* Page-aligned experiment: filename of a page replacement (mirrors the
+    * upload-rect helper, but in the -pages folder; page_hash takes the
+    * texture-hash slot). */
+   static char *replacement_pages_filename_from_hash(char *out,
+         size_t cap,
+         uint32_t page_hash,
+         uint32_t palette_hash,
+         const char *ext){
+      char base[PATH_MAX_TT];
+      int n;
+      replacements_pages_path(base, sizeof(base));
+      n = snprintf(out, cap, "%s%x-%x.%s", base, (unsigned)page_hash, (unsigned)palette_hash, ext);
+      if (n < 0 || (size_t)n >= cap)
+         out[cap - 1] = '\0';
+      return out;
+   }
+
+   /* Resolve the on-disk replacement file for a combo, probing the
+    * supported extensions in priority order. Writes the winning path
+    * into out and returns true; on a miss, out holds the .png candidate
+    * (for error messages) and the return is false. */
+   static bool find_replacement_file(char *out,
+         size_t cap,
+         uint32_t hash,
+         uint32_t palette_hash,
+         bool pages){
+      size_t i;
+      for (i = 0; i < TT_REPLACEMENT_EXT_COUNT; i++) {
+         if (pages)
+            replacement_pages_filename_from_hash(out, cap, hash, palette_hash, tt_replacement_exts[i]);
+         else
+            replacement_filename_from_hash(out, cap, hash, palette_hash, tt_replacement_exts[i]);
+         if (path_is_valid(out))
+            return true;
+      }
+      if (pages)
+         replacement_pages_filename_from_hash(out, cap, hash, palette_hash, "png");
+      else
+         replacement_filename_from_hash(out, cap, hash, palette_hash, "png");
+      return false;
+   }
+
+static uint8_t *loaded_pixel(LoadedImage *image, int x, int y) {
+      return &image->owned_data[(y * image->width + x) * 4];
+   }
+
+   /* Fills *result (already sized higher/2 and given its buffer) from the
+    * level above it. */
+   static void generate_mip_into(LoadedImage *result, LoadedImage *higher) {
+      /* Generate custom mipmaps in order to avoid transparent (0, 0, 0, 0) and
+       * semi-transparent (r, g, b, a>=128) mixing to create some dark opaque
+       * value (r, g, b, a<128). */
+
+      int x, y;
+      /* Assumes higher.width and higher.height are both divisible by 2 (and also therefore > 1) */
+      for (y = 0; y < result->height; y++) {
+         for (x = 0; x < result->width; x++) {
+            uint8_t * dst;
+            uint8_t *src00 = loaded_pixel(higher, x * 2 + 0, y * 2 + 0);
+            uint8_t *src10 = loaded_pixel(higher, x * 2 + 1, y * 2 + 0);
+            uint8_t *src01 = loaded_pixel(higher, x * 2 + 0, y * 2 + 1);
+            uint8_t *src11 = loaded_pixel(higher, x * 2 + 1, y * 2 + 1);
+
+            int numTransparent = 0;
+            if (src00[0] == 0 && src00[1] == 0 && src00[2] == 0 && src00[3] == 0) numTransparent += 1;
+            if (src10[0] == 0 && src10[1] == 0 && src10[2] == 0 && src10[3] == 0) numTransparent += 1;
+            if (src01[0] == 0 && src01[1] == 0 && src01[2] == 0 && src01[3] == 0) numTransparent += 1;
+            if (src11[0] == 0 && src11[1] == 0 && src11[2] == 0 && src11[3] == 0) numTransparent += 1;
+
+            dst = loaded_pixel(result, x, y);
+            if (numTransparent > 2) {
+               dst[0] = 0;
+               dst[1] = 0;
+               dst[2] = 0;
+               dst[3] = 0;
+            } else {
+               int r = src00[0] + src10[0] + src01[0] + src11[0];
+               int g = src00[1] + src10[1] + src01[1] + src11[1];
+               int b = src00[2] + src10[2] + src01[2] + src11[2];
+               int a = src00[3] + src10[3] + src01[3] + src11[3];
+
+               int numNotTransparent = 4 - numTransparent;
+               dst[0] = r / numNotTransparent;
+               dst[1] = g / numNotTransparent;
+               dst[2] = b / numNotTransparent;
+               dst[3] = a / numNotTransparent;
+            }
+         }
+      }
+   }
+
+   /* Fills *result (already sized and given its buffer) from the decoded
+    * file. */
+   static void convert_tri_to_psx_into(LoadedImage *result, uint8_t *image,
+         int *alpha_flags){
+      size_t i;
+      size_t bytes = (size_t)result->width * (size_t)result->height * 4u;
+      (*alpha_flags) = 0;
+      for (i = 0; i < bytes; i += 4) {
+         uint8_t *src = &image[i];
+         uint8_t *dst = &result->owned_data[i];
+         if (src[3] == 0) {
+            /* Transparent */
+            (*alpha_flags) |= ALPHA_FLAG_TRANSPARENT;
+            dst[0] = 0;
+            dst[1] = 0;
+            dst[2] = 0;
+            dst[3] = 0;
+         } else if (src[3] == 255) {
+            (*alpha_flags) |= ALPHA_FLAG_OPAQUE;
+            if (src[0] == 0 && src[1] == 0 && src[2] == 0) {
+               /* Opaque black */
+               dst[0] = 1;
+               dst[1] = 1;
+               dst[2] = 1;
+               dst[3] = 0;
+            } else {
+               /* Opaque */
+               dst[0] = src[0];
+               dst[1] = src[1];
+               dst[2] = src[2];
+               dst[3] = 0;
+            }
+         } else {
+            (*alpha_flags) |= ALPHA_FLAG_SEMI_TRANSPARENT;
+            if (src[0] == 0 && src[1] == 0 && src[2] == 0) {
+               /* (0, 0, 0, 255) is a special reserved value */
+               dst[0] = 1;
+               dst[1] = 1;
+               dst[2] = 1;
+               dst[3] = 255;
+            } else {
+               /* Semi-transparent */
+               dst[0] = src[0];
+               dst[1] = src[1];
+               dst[2] = src[2];
+               dst[3] = 255;
+            }
+         }
+      }
+   }
+
+   /* Levels in a width x height chain: halve while both sides are even. */
+   static int tt_mip_count(int width, int height) {
+      int n = 1;
+      if (width <= 0 || height <= 0)
+         return 0;
+      while (width % 2 == 0 && height % 2 == 0) {
+         width /= 2;
+         height /= 2;
+         n++;
+      }
+      return n;
+   }
+
+   static LoadedLevels prepare_texture(RGBAImage *image, int *alpha_flags) {
+      LoadedLevels levels;
+      int width = image->width;
+      int height = image->height;
+      LoadedImage base;
+      loaded_levels_init(&levels);
+      loaded_image_init(&base);
+      loaded_image_alloc(&base, width, height);
+      convert_tri_to_psx_into(&base, image->data, alpha_flags);
+      loaded_levels_push_move(&levels, &base);
+      while (width % 2 == 0 && height % 2 == 0) {
+         LoadedImage mip;
+         loaded_image_init(&mip);
+         loaded_image_alloc(&mip, width / 2, height / 2);
+         generate_mip_into(&mip, &levels.levels[levels.count - 1]);
+         loaded_levels_push_move(&levels, &mip);
+
+         width /= 2;
+         height /= 2;
+      }
+      return levels;
+   }
+
+   /* As prepare_texture, but into upload memory the caller was given for
+    * exactly this chain: no level is allocated, nothing is copied. */
+   static LoadedLevels prepare_texture_staged(RGBAImage *image, int *alpha_flags,
+         TTStaging *staging, uint8_t *const *level_data) {
+      LoadedLevels levels;
+      int n = tt_mip_count(image->width, image->height);
+      int i;
+      loaded_levels_init(&levels);
+      levels.staging = staging; /* ours now, even if the array cannot be had */
+      levels.levels  = (LoadedImage *)malloc((size_t)n * sizeof(LoadedImage));
+      if (!levels.levels)
+         return levels;
+      levels.count   = n;
+      for (i = 0; i < n; i++) {
+         LoadedImage *l = &levels.levels[i];
+         l->width      = image->width >> i;
+         l->height     = image->height >> i;
+         l->owned_data = level_data[i];
+         l->owned_size = (size_t)l->width * (size_t)l->height * 4u;
+         if (i == 0)
+            convert_tri_to_psx_into(l, image->data, alpha_flags);
+         else
+            generate_mip_into(l, &levels.levels[i - 1]);
+      }
+      return levels;
+   }
+
+   /* Where a load gets the upload memory it decodes into. On the render
+    * thread (worker == NULL) it is allocated on the spot; a worker asks the
+    * render thread on its lane and collects the answer once the file is
+    * decoded. Asking as soon as the header gives the size lets the answer
+    * come back while the decode runs. */
+   struct TTStagingSource {
+      IOWorker  *worker;
+      bool       asked;
+      int        width, height;           /* the chain asked for */
+      TTStaging *staging;                 /* the answer, once taken */
+      uint8_t   *level_data[TT_STAGING_LEVELS_MAX];
+      TTStaging *spare;                   /* given but not used: the caller gives it back */
+   };
+   typedef struct TTStagingSource TTStagingSource;
+
+   static void tt_staging_source_init(TTStagingSource *src, IOWorker *worker) {
+      memset(src, 0, sizeof(*src));
+      src->worker = worker;
+   }
+
+   static void tt_staging_ask(TTStagingSource *src, int width, int height) {
+      int n = tt_mip_count(width, height);
+      if (n <= 0 || n > TT_STAGING_LEVELS_MAX)
+         return;
+      if (!src->worker) {
+         if (!tt_backend.staging_alloc)
+            return;
+         src->staging = tt_backend.staging_alloc(tt_backend.ctx, width, height, n,
+               src->level_data);
+      } else {
+         IOWorker   *w = src->worker;
+         IOResponse *q;
+         if (w->closed || !w->pool->staging)
+            return;
+         q = (IOResponse *)calloc(1, sizeof(IOResponse));
+         if (!q)
+            return;
+         q->kind           = IOResponseKind_Staging;
+         q->staging_worker = w->index;
+         q->staging_width  = width;
+         q->staging_height = height;
+         q->staging_levels = n;
+         loaded_levels_init(&q->levels);
+         tt_io_channel_push_response(w->pool->channel, &q->node);
+      }
+      src->asked  = true;
+      src->width  = width;
+      src->height = height;
+   }
+
+   /* The answer to the open question; a worker parks until it is there. */
+   static void tt_staging_take(TTStagingSource *src) {
+      IOWorker      *w = src->worker;
+      IOStagingReply r;
+      if (!src->asked || !w)
+         return;
+      src->asked = false;
+      for (;;) {
+         int key;
+         if (retro_spsc_read_avail(&w->lane) >= sizeof(r))
+            break;
+         key = retro_eventcount_prepare_wait(&w->answered);
+         if (retro_spsc_read_avail(&w->lane) >= sizeof(r)) {
+            retro_eventcount_cancel_wait(&w->answered);
+            break;
+         }
+         retro_eventcount_commit_wait(&w->answered, key);
+      }
+      retro_spsc_read(&w->lane, &r, sizeof(r));
+      if (r.closed)
+         w->closed = true;
+      src->staging = r.staging;
+      memcpy(src->level_data, r.level_data, sizeof(src->level_data));
+   }
+
+   /* The size a PNG's header gives, without decoding it. */
+   static bool tt_png_size(const char *path, int *width, int *height) {
+      static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+      uint8_t b[24];
+      int64_t got;
+      uint32_t w, h;
+      RFILE  *f = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (!f)
+         return false;
+      got = filestream_read(f, b, sizeof(b));
+      filestream_close(f);
+      if (got != (int64_t)sizeof(b) || memcmp(b, sig, 8) || memcmp(b + 12, "IHDR", 4))
+         return false;
+      w = ((uint32_t)b[16] << 24) | ((uint32_t)b[17] << 16) | ((uint32_t)b[18] << 8) | b[19];
+      h = ((uint32_t)b[20] << 24) | ((uint32_t)b[21] << 16) | ((uint32_t)b[22] << 8) | b[23];
+      if (w == 0 || h == 0 || w > 32768 || h > 32768)
+         return false;
+      *width  = (int)w;
+      *height = (int)h;
+      return true;
+   }
+
+   /* Load the decoded mip chain for a combo: resolve the pack file, decode
+    * it, and generate mips. Returns false when there is no file or the load
+    * fails; path_out always holds the probed source path (for error
+    * messages). Shared by the async IO workers and both sync loaders;
+    * thread-safe (per-combo dedup via `requested` means no two threads load
+    * the same combo concurrently). With a staging source the levels are
+    * generated straight into upload memory when it can be had; upload
+    * memory it was given but did not use is left in src->spare. */
+   static bool tt_load_replacement_levels(uint32_t hash, uint32_t palette_hash, bool pages,
+         LoadedLevels *out_levels, int *out_alpha_flags,
+         char *path_out, size_t path_cap, TTStagingSource *src) {
+      RGBAImage image;
+      int pw, ph;
+      if (!find_replacement_file(path_out, path_cap, hash, palette_hash, pages))
+         return false;
+      if (src && tt_png_size(path_out, &pw, &ph))
+         tt_staging_ask(src, pw, ph);
+      image.data = NULL;
+      load_image(path_out, &image);
+      if (src) {
+         if (image.data && !src->asked && !src->staging)
+            tt_staging_ask(src, image.width, image.height);
+         tt_staging_take(src);
+         if (src->staging && (!image.data ||
+               src->width != image.width || src->height != image.height)) {
+            src->spare   = src->staging;
+            src->staging = NULL;
+         }
+      }
+      if (image.data == NULL)
+         return false;
+      *out_alpha_flags = 0;
+      if (src && src->staging) {
+         *out_levels  = prepare_texture_staged(&image, out_alpha_flags,
+               src->staging, src->level_data);
+         src->staging = NULL;
+      } else
+         *out_levels = prepare_texture(&image, out_alpha_flags);
+      rgba_image_free(&image);
+      if (out_levels->count == 0) {
+         if (src) {
+            src->spare           = out_levels->staging;
+            out_levels->staging  = NULL;
+         }
+         loaded_levels_reset(out_levels);
+         return false;
+      }
+      return true;
+   }
+
+   /* Worker-side dump decode: expand a snapshot of raw VRAM source words (req->src)
+    * into RGBA with the tri-alpha convention, on the IO thread instead of the
+    * render thread. Bit-identical to the old inline loops in dump_image/dump_page
+    * (same math + order), so existing dumps still round-trip. Empty palette +
+    * non-ABGR1555 = grayscale "missing". Returns a malloc'd buffer the caller frees;
+    * *out_len receives its size. */
+   static uint8_t *decode_dump_rgba(const IORequest *req, size_t *out_len) {
+      size_t cap = (size_t)req->width * req->height * 4u;
+      uint8_t *bytes = (uint8_t *)malloc(cap ? cap : 1);
+      size_t bi = 0;
+      bool is_abgr1555 = (req->dump_mode == (int)TextureMode_ABGR1555);
+      bool has_pal = (req->palette != NULL && req->palette_len > 0);
+      int ppp = req->ppp;
+      int bpp = 16 / ppp;
+      int mask = (1 << bpp) - 1;
+      size_t wi;
+      for (wi = 0; wi < req->src_len; wi++) {
+         uint16_t word = req->src[wi];
+         int p;
+         for (p = 0; p < ppp; p++) {
+            uint16_t subpixel = (word >> (p * bpp)) & mask;
+            if (!is_abgr1555 && !has_pal) {
+               /* Missing palette: grayscale of the raw index. */
+               bytes[bi++] = (uint8_t)(255.0 * subpixel / mask);
+               bytes[bi++] = (uint8_t)(255.0 * subpixel / mask);
+               bytes[bi++] = (uint8_t)(255.0 * subpixel / mask);
+               bytes[bi++] = (uint8_t)255;
+            } else {
+               uint16_t abgr1555 = is_abgr1555 ? subpixel : req->palette[subpixel];
+               int r = ((abgr1555 >> 0) & 0x1f) * 255.0 / 31.0;
+               int g = ((abgr1555 >> 5) & 0x1f) * 255.0 / 31.0;
+               int b = ((abgr1555 >> 10) & 0x1f) * 255.0 / 31.0;
+               int a = (abgr1555 >> 15) * 255.0;
+               /* Convert psx alpha to the tri convention. */
+               if (a == 0) {
+                  if (r == 0 && g == 0 && b == 0) {
+                     /* Transparent: already (0,0,0,0). */
+                  } else {
+                     a = 255; /* Opaque */
+                  }
+               } else {
+                  a = 127; /* Semi-transparent */
+               }
+               bytes[bi++] = (uint8_t)r;
+               bytes[bi++] = (uint8_t)g;
+               bytes[bi++] = (uint8_t)b;
+               bytes[bi++] = (uint8_t)a;
+            }
+         }
+      }
+      if (out_len)
+         *out_len = bi;
+      return bytes;
+   }
+
+   static void io_pool_release(IOPool *pool) {
+      int i;
+      if (retro_atomic_fetch_sub_int(&pool->refs, 1) != 1)
+         return;
+      for (i = 0; i < pool->count; i++) {
+         retro_spsc_free(&pool->workers[i].lane);
+         retro_eventcount_free(&pool->workers[i].answered);
+      }
+      free(pool);
+   }
+
+   static void io_thread(void *user_data) {
+      /* Pool worker. Each worker is handed its slot of the pool with a
+       * reference on the pool and on the channel already taken on its behalf
+       * (at spawn); it releases both on the way out. Whichever holder
+       * releases last frees each. */
+      IOWorker *worker = (IOWorker *)user_data;
+      IOPool *pool = worker->pool;
+      tt_io_channel *channel = pool->channel;
+      TT_LOG_VERBOSE(RETRO_LOG_INFO, "io thread starting\n");
+
+      while (true) {
+         /* One request at a time, high priority first, so work spreads
+          * across the pool; sleeps while there is none. NULL is a prompt
+          * shutdown: whatever is still queued is dropped and freed with
+          * the channel (matches the previous behaviour). */
+         IORequest *request = (IORequest *)tt_io_channel_pop(channel);
+         if (!request)
+            break;
+
+         /* The expensive part (PNG decode + mipmaps, or decode + PNG write);
+          * workers run it in parallel. */
+         if (request->kind == IORequestKind_Load) {
+            uint32_t hash = request->hash;
+            uint32_t palette_hash = request->palette_hash;
+
+            char path[PATH_MAX_TT];
+            LoadedLevels levels;
+            int alpha_flags_out = 0;
+            TTStagingSource staging;
+            tt_staging_source_init(&staging, worker);
+            if (tt_load_replacement_levels(hash, palette_hash, request->pages,
+                  &levels, &alpha_flags_out, path, sizeof(path), &staging)) {
+               IOResponse *response = (IOResponse *)calloc(1, sizeof(IOResponse));
+               response->node.next    = NULL;
+               response->kind         = IOResponseKind_Load;
+               response->spare        = staging.spare;
+               response->hash         = hash;
+               response->palette_hash = palette_hash;
+               response->alpha_flags  = alpha_flags_out;
+               response->pages        = request->pages;
+               loaded_levels_init(&response->levels);
+               loaded_levels_move(&response->levels, &levels);
+
+               tt_io_channel_push_response(channel, &response->node);
+            } else {
+               /* FAILURE response (empty levels): previously the failure branch
+                * pushed nothing, so the combo stayed in `requested` forever -
+                * one transient open/decode failure (AV/indexer sharing
+                * violation, handle pressure during a burst) meant permanent
+                * native until a manual reload. The drain erases `requested` on
+                * an empty response so the next draw can retry. */
+               IOResponse *response = (IOResponse *)calloc(1, sizeof(IOResponse));
+               TT_LOG(RETRO_LOG_ERROR, "failed to load: %s\n", path);
+               response->node.next    = NULL;
+               response->kind         = IOResponseKind_Load;
+               response->spare        = staging.spare;
+               response->hash         = hash;
+               response->palette_hash = palette_hash;
+               response->alpha_flags  = 0;
+               response->pages        = request->pages;
+               loaded_levels_init(&response->levels);
+
+               tt_io_channel_push_response(channel, &response->node);
+            }
+         } else if (request->kind == IORequestKind_Dump) {
+            /* Decode (palette->RGBA->tri-alpha) here on the worker, then encode+write,
+             * so the burst stays off the render thread (it only snapshotted raw
+             * src+CLUT). */
+            size_t blen = 0;
+            uint8_t *bytes = decode_dump_rgba(request, &blen);
+            int success = write_image(request->path, request->width, request->height, bytes);
+            if (success == 0) {
+               TT_LOG(RETRO_LOG_ERROR, "failed to write to: %s\n", request->path);
+            }
+            free(bytes);
+         }
+         io_request_free(request);
+      }
+      tt_io_channel_release(channel); /* drop this worker's reference */
+      io_pool_release(pool);
+      TT_LOG_VERBOSE(RETRO_LOG_INFO, "io thread ending\n");
+   }
+
+   /* Upper bound on parallel PNG-decode workers. Keeps first-appearance
+    * prefetch bursts short without starving the emulation/render threads. */
+   enum { NUM_IO_THREADS = TT_IO_WORKERS_MAX };
+
+   /* Size the pool from the machine: leave two physical cores for the
+    * emulation thread and the frontend's video/audio threads, use the rest
+    * up to NUM_IO_THREADS. On a mixed part only the fast cluster counts -
+    * a decoder parked on a little core holds the whole texture behind it.
+    * Where the topology is unknown (consoles) keep the historical four. */
+   static int io_thread_count(void) {
+      unsigned fast = 0, slow = 0;
+      int n;
+      if (!sthread_get_core_topology(&fast, &slow))
+         return NUM_IO_THREADS;
+      n = (int)fast - 2;
+      if (n < 1)
+         n = 1;
+      if (n > NUM_IO_THREADS)
+         n = NUM_IO_THREADS;
+      return n;
+   }
+
+   static void io_thread_init(IOThread *t) {
+      int count = io_thread_count();
+      IOPool *pool;
+      t->pool   = NULL;
+      t->lent   = 0;
+      t->closed = false;
+      t->channel = tt_io_channel_new(io_request_node_free, io_response_node_free); /* this IOThread holds one reference */
+      pool = t->channel ? (IOPool *)calloc(1, sizeof(IOPool)) : NULL;
+      if (!pool) {
+         /* No channel: every request is refused (tt_io_channel_push returns
+          * false) and replacement textures simply never arrive. */
+         TT_LOG(RETRO_LOG_ERROR, "hd texture io pool: could not be set up\n");
+         if (t->channel)
+            tt_io_channel_stop(t->channel);
+         t->channel = NULL;
+         return;
+      }
+      pool->channel = t->channel;
+      pool->staging = tt_backend.staging_alloc && tt_backend.staging_release;
+      retro_atomic_int_init(&pool->refs, 1); /* this IOThread's */
+      { int i; for (i = 0; i < count; i++) {
+         IOWorker *w = &pool->workers[pool->count];
+         w->pool  = pool;
+         w->index = pool->count;
+         if (!retro_spsc_init(&w->lane, 4 * sizeof(IOStagingReply)))
+            break;
+         if (!retro_eventcount_init(&w->answered)) {
+            retro_spsc_free(&w->lane);
+            break;
+         }
+         pool->count++;
+      } }
+      t->pool = pool;
+      TT_LOG(RETRO_LOG_INFO, "hd texture io pool: %d worker(s)\n", pool->count);
+      { int i; for (i = 0; i < pool->count; i++) {
+         sthread_t * thread;
+         /* Take references on the worker's behalf BEFORE it starts, so the
+          * channel and pool can't be freed out from under it; the worker
+          * releases them on exit. */
+         tt_io_channel_acquire(t->channel);
+         retro_atomic_fetch_add_int(&pool->refs, 1);
+         thread = sthread_create(io_thread, &pool->workers[i]);
+         if (thread) {
+            sthread_detach(thread);
+         } else {
+            /* thread failed to start; undo its refs. Its lane stays unused. */
+            tt_io_channel_release(t->channel);
+            retro_atomic_fetch_sub_int(&pool->refs, 1);
+         }
+      } }
+   }
+
+   /* Answer a worker's request for upload memory. */
+   static void io_thread_answer(IOThread *t, const IOResponse *q) {
+      IOWorker      *w = &t->pool->workers[q->staging_worker];
+      IOStagingReply r;
+      if (t->closed)
+         return; /* the closing answer is already on its lane */
+      memset(&r, 0, sizeof(r));
+      r.staging = tt_backend.staging_alloc(tt_backend.ctx, q->staging_width,
+            q->staging_height, q->staging_levels, r.level_data);
+      if (r.staging)
+         t->lent++;
+      /* At most one question per worker is ever open, so there is room. */
+      retro_spsc_write(&w->lane, &r, sizeof(r));
+      retro_eventcount_notify(&w->answered);
+   }
+
+   /* A response coming back: the upload memory it carries is no longer out
+    * with a worker. */
+   static void io_thread_returned(IOThread *t, const IOResponse *r) {
+      if (r->levels.staging)
+         t->lent--;
+      if (r->spare)
+         t->lent--;
+   }
+
+   /* Stop the workers writing to upload memory: tell each its last answer has
+    * been given, then wait for every piece of memory already handed out to
+    * come back, so none is written once the backend lets it go. Takes and
+    * frees whatever responses arrive meanwhile. Render thread. */
+   static void io_thread_close(IOThread *t) {
+      int i;
+      if (!t->pool || t->closed)
+         return;
+      for (i = 0; i < t->pool->count; i++) {
+         IOStagingReply r;
+         memset(&r, 0, sizeof(r));
+         r.closed = true;
+         retro_spsc_write(&t->pool->workers[i].lane, &r, sizeof(r));
+         retro_eventcount_notify(&t->pool->workers[i].answered);
+      }
+      t->closed = true;
+      while (t->lent > 0) {
+         IOResponse *r = (IOResponse *)tt_io_channel_take_responses(t->channel);
+         if (!r) {
+            tt_io_channel_wait_response_unbounded(t->channel);
+            continue;
+         }
+         while (r) {
+            IOResponse *next = (IOResponse *)r->node.next;
+            io_thread_returned(t, r);
+            io_response_free(r);
+            r = next;
+         }
+      }
+   }
+
+   static void io_thread_deinit(IOThread *t) {
+      /* Tell the workers to leave, wake them all, and drop this IOThread's
+       * references; the last worker to exit frees the channel and pool. */
+      io_thread_close(t);
+      tt_io_channel_stop(t->channel);
+      t->channel = NULL;
+      if (t->pool)
+         io_pool_release(t->pool);
+      t->pool = NULL;
+   }
+
+   static void texture_tracker_dump_image(struct TextureTracker *self, TextureUpload *upload, UsedMode *mode, uint32_t palette_hash_override) {
+      int bpp;
+      char path[PATH_MAX_TT];
+      int ppp;
+      uint32_t hash = upload->hash;
+
+      uint8_t *bytes;
+      size_t   bytes_len;
+      size_t   bi;
+      size_t   img_count;
+
+      /* from glsl/vram.h */
+      int shift;
+      switch (mode->mode) {
+         case TextureMode_ABGR1555:
+            shift = 0;
+            break;
+         case TextureMode_Palette8bpp:
+            shift = 1;
+            break;
+         case TextureMode_Palette4bpp:
+            shift = 2;
+            break;
+         case TextureMode_None:
+         default:
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "Tried to dump unused texture %x.\n", hash);
+            return; /* Early out */
+      }
+
+      { size_t plen;
+      dump_path(path, sizeof(path));
+      plen = strlen(path);
+      snprintf(path + plen, sizeof(path) - plen, "%x", (unsigned)hash);
+
+      { uint16_t *palette = NULL;
+      if (mode->mode == TextureMode_Palette4bpp || mode->mode == TextureMode_Palette8bpp) {
+         TTRect palette_rect = make_rect(mode->palette_offset_x, mode->palette_offset_y, mode->mode == TextureMode_Palette8bpp ? 256 : 16, 1);
+         Palette p = texture_tracker_get_palette(self, palette_rect);
+         if (p.data != NULL) {
+            palette = p.data;
+            plen = strlen(path);
+            /* Filename hash from the caller (reduced range when enabled, else the
+             * full-palette hash). p.data is still used below for the PNG decode. */
+            snprintf(path + plen, sizeof(path) - plen, "-%x", (unsigned)palette_hash_override);
+         }
+      }
+
+      if (palette != NULL) {
+         TT_LOG_VERBOSE(RETRO_LOG_INFO, "Dumping palette %i, %i.\n", mode->palette_offset_x, mode->palette_offset_y);
+      } else if (mode->mode != TextureMode_ABGR1555) {
+         plen = strlen(path);
+         snprintf(path + plen, sizeof(path) - plen, "-missing");
+         TT_LOG_VERBOSE(RETRO_LOG_INFO, "MISSING palette %i, %i.\n", mode->palette_offset_x, mode->palette_offset_y);
+      } else {
+         /* ABGR1555: direct colour, no palette. The loader looks up palette hash 0,
+          * so tag the file -0 to round-trip (was <hash>.png, which never reloaded). */
+         plen = strlen(path);
+         snprintf(path + plen, sizeof(path) - plen, "-0");
+      }
+
+      ppp = 1 << shift;
+      (void)bpp; (void)bytes; (void)bytes_len; (void)bi; (void)img_count;
+
+      plen = strlen(path);
+      snprintf(path + plen, sizeof(path) - plen, ".png");
+
+      /* Snapshot the raw indexed words + CLUT (cheap copies); the IO worker
+       * (decode_dump_rgba) expands palette->RGBA->tri-alpha off the render thread. */
+      TT_LOG_VERBOSE(RETRO_LOG_INFO, "requesting dump: %s (%ux%u)\n", path,
+            (unsigned)(upload->width * ppp), (unsigned)upload->height);
+      {
+         IORequest *dump = (IORequest *)malloc(sizeof(IORequest));
+         dump->node.next = NULL;
+         dump->kind = IORequestKind_Dump;
+         snprintf(dump->path, sizeof(dump->path), "%s", path);
+         dump->width  = upload->width * ppp;
+         dump->height = upload->height;
+         dump->pages  = false;
+         dump->dump_mode = (int)mode->mode;
+         dump->ppp    = ppp;
+         dump->src_len = (size_t)upload->image_count;
+         dump->src = (uint16_t *)malloc((dump->src_len ? dump->src_len : 1) * sizeof(uint16_t));
+         memcpy(dump->src, upload->image, dump->src_len * sizeof(uint16_t));
+         if (palette != NULL) {
+            dump->palette_len = (size_t)(mode->mode == TextureMode_Palette8bpp ? 256 : 16);
+            dump->palette = (uint16_t *)malloc(dump->palette_len * sizeof(uint16_t));
+            memcpy(dump->palette, palette, dump->palette_len * sizeof(uint16_t));
+         } else {
+            dump->palette = NULL;
+            dump->palette_len = 0;
+         }
+
+         tt_io_channel_push(self->iothread.channel, &dump->node, false); /* texture dumps = background */
+      }
+      }
+      }
+   }
+
+   static void read_texture_directory(HdKeySet *out, const char *path, bool pages) {
+      RDIR *dir;
+      hd_key_set_clear(out);
+      dir = retro_opendir(path);
+      if (dir != NULL) {
+         while (retro_readdir(dir)) {
+            /* https://stackoverflow.com/questions/13701657/control-whole-string-with-sscanf */
+            uint32_t hash;
+            uint32_t palette_hash;
+            int chars_read;
+            HdTextureId id;
+            const char *name = retro_dirent_get_name(dir);
+            /* <hash>-<palette>.<ext> where ext is any supported decoder
+             * (png/dds/webp/jpg/jpeg/bmp/tga, case-insensitive). */
+            if (sscanf(name, "%x-%x.%n", &hash, &palette_hash, &chars_read) != 2 ||
+                  chars_read <= 0 ||
+                  name[chars_read - 1] != '.' ||
+                  !tt_is_replacement_ext(name + chars_read)
+               ) {
+               continue;
+            }
+
+            /* pages=true sets id.pages so hd_pack_key salts these away from the
+             * upload-rect keyspace (they share the cache, separate known_files). */
+            id.hash = hash; id.palette_hash = palette_hash; id.pages = pages;
+            /* Bulk build: append unsorted here, sort and dedup once below. The
+             * sorted insert this replaces memmoved the tail per key, which on a
+             * 25k-file pack is gigabytes of moves paid at init AND on every
+             * reload-textures keypress (the reload stall). */
+            if (!hd_key_set_append_unsorted(out, hd_pack_key(id)))
+               break;
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "file found: %s\n", name);
+         }
+         retro_closedir(dir);
+      }
+      hd_key_set_finalize_sorted(out);
+   }
+
+   /* ---- Prefetch-journal persistence (see the TTJournal block above). ----
+    * One record per chain link: {u64 key, u64 successor, u32 flags} with
+    * flags bit0 = successor is a page combo. Stored as prefetch.journal in
+    * the -texture-replacements folder so it travels with the pack (authors
+    * can ship it pre-trained); written via temp file + rename. */
+#define TT_JOURNAL_MAGIC   0x4A505454u /* "TTPJ" */
+#define TT_JOURNAL_VERSION 1u
+
+   /* The file is little-endian regardless of host: it ships with packs, so
+    * a journal trained on x86/ARM must read the same on a big-endian host.
+    * Byte-identical to the host-order files written so far on LE hosts. */
+   static INLINE void tt_put_le32(uint8_t *p, uint32_t v) {
+      p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+   }
+   static INLINE void tt_put_le64(uint8_t *p, uint64_t v) {
+      tt_put_le32(p, (uint32_t)v); tt_put_le32(p + 4, (uint32_t)(v >> 32));
+   }
+   static INLINE uint32_t tt_get_le32(const uint8_t *p) {
+      return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+   }
+   static INLINE uint64_t tt_get_le64(const uint8_t *p) {
+      return (uint64_t)tt_get_le32(p) | ((uint64_t)tt_get_le32(p + 4) << 32);
+   }
+
+   static char *journal_file_path(char *out, size_t cap) {
+      char base[PATH_MAX_TT];
+      int n;
+      replacements_path(base, sizeof(base));
+      n = snprintf(out, cap, "%sprefetch.journal", base);
+      if (n < 0 || (size_t)n >= cap)
+         out[cap - 1] = '\0';
+      return out;
+   }
+
+   static void tt_journal_load_file(TTJournal *j) {
+      char path[PATH_MAX_TT];
+      RFILE *f;
+      uint8_t head[16];
+      journal_file_path(path, sizeof(path));
+      f = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (f == NULL)
+         return;
+      if (filestream_read(f, head, sizeof(head)) == (int64_t)sizeof(head) &&
+            tt_get_le32(head) == TT_JOURNAL_MAGIC &&
+            tt_get_le32(head + 4) == TT_JOURNAL_VERSION &&
+            tt_get_le32(head + 8) <= 0x400000u) { /* 4M links = a corrupt count, not a real pack */
+         uint32_t count = tt_get_le32(head + 8);
+         uint32_t i;
+         for (i = 0; i < count; i++) {
+            uint8_t rec[20];
+            if (filestream_read(f, rec, sizeof(rec)) != (int64_t)sizeof(rec))
+               break;
+            tt_journal_record(j, tt_get_le64(rec), tt_get_le64(rec + 8),
+                  (tt_get_le32(rec + 16) & 1u) != 0);
+         }
+      }
+      filestream_close(f);
+      j->dirty = false; /* what was just read IS what is on disk */
+      if (j->count > 0)
+         TT_LOG(RETRO_LOG_INFO, "[prefetch] journal loaded: %u chain links\n", (unsigned)j->count);
+   }
+
+   /* Serialise the journal into a malloc'd blob in the on-disk format (header
+    * + one 20-byte record per link). Memory-speed; NULL if empty or OOM. */
+   static uint8_t *tt_journal_serialize(const TTJournal *j, size_t *out_len) {
+      size_t need = 16 + (size_t)j->count * 20;
+      uint8_t *buf;
+      uint8_t *p;
+      size_t i;
+      if (j->count == 0)
+         return NULL;
+      buf = (uint8_t *)malloc(need);
+      if (buf == NULL)
+         return NULL;
+      tt_put_le32(buf,      TT_JOURNAL_MAGIC);
+      tt_put_le32(buf + 4,  TT_JOURNAL_VERSION);
+      tt_put_le32(buf + 8,  (uint32_t)j->count);
+      tt_put_le32(buf + 12, 0);
+      p = buf + 16;
+      for (i = 0; i < j->cap; i++) {
+         const TTJournalSlot *s = &j->slots[i];
+         if (!s->used)
+            continue;
+         tt_put_le64(p, s->key);       p += 8;
+         tt_put_le64(p, s->next_key);  p += 8;
+         tt_put_le32(p, s->next_pages ? 1u : 0u); p += 4;
+      }
+      *out_len = (size_t)(p - buf);
+      return buf;
+   }
+
+   /* Write a serialised journal to disk via <path><tmp_suffix> + rename.
+    * Distinct suffixes keep the synchronous and background writers from
+    * clobbering each other's temp file. */
+   static bool tt_journal_write_blob(const char *path, const char *tmp_suffix,
+         const uint8_t *buf, size_t len) {
+      char tmp[PATH_MAX_TT];
+      RFILE *f;
+      bool ok;
+      if (strlen(path) + strlen(tmp_suffix) + 1 >= sizeof(tmp))
+         return false;
+      snprintf(tmp, sizeof(tmp), "%s%s", path, tmp_suffix);
+      f = filestream_open(tmp, RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (f == NULL)
+         return false; /* replacements folder may not exist */
+      ok = filestream_write(f, buf, (int64_t)len) == (int64_t)len;
+      filestream_close(f);
+      if (!ok) {
+         remove(tmp);
+         return false;
+      }
+      remove(path);
+      if (rename(tmp, path) != 0) {
+         remove(tmp);
+         return false;
+      }
+      return true;
+   }
+
+   /* Synchronous save - used only at moments that are not latency-sensitive
+    * (tracker teardown, reload keypress, replacement/mode switched off). */
+   /* Background-save state; shared by the synchronous save below and the
+    * background writer further down. */
+   /* Two words pass between the render thread and the writer thread, and
+    * both are atomics; there is no lock. `busy` is taken by the render
+    * thread with an exchange when it starts a writer and cleared by the
+    * writer as the last thing it does. `result` is stored by the writer
+    * before it clears `busy` and consumed by the render thread with an
+    * exchange - so by the time `busy` reads clear, the result is there. */
+   static retro_atomic_int_t tt_journal_io_busy;    /* a writer thread is active */
+   static retro_atomic_int_t tt_journal_io_result;  /* 0 = none, 1 = ok, -1 = failed; consumed in endFrame */
+   /* The writer is joinable, not detached: a detached thread could outlive
+    * retro_deinit and run into a dlclose'd core, and it could race the
+    * synchronous teardown save on the same target file. Reaped by
+    * tt_journal_writer_join before every synchronous save and before the
+    * next background save is started. Render thread only: the writer never
+    * touches its own handle. */
+   static sthread_t *tt_journal_io_thread = NULL;
+
+   static void tt_journal_writer_join(void);
+
+   static void tt_journal_save_file(TTJournal *j) {
+      char path[PATH_MAX_TT];
+      uint8_t *buf;
+      size_t len = 0;
+      /* Never race a background writer on the same target: wait for it and
+       * reap it first. If it succeeded, `dirty` may still be set from links
+       * recorded after its snapshot, which is exactly what this save covers;
+       * if it failed, endFrame's result check has not run yet, so re-dirty
+       * here and let this synchronous save carry the whole map. */
+      tt_journal_writer_join();
+      if (retro_atomic_exchange_int(&tt_journal_io_result, 0) < 0)
+         j->dirty = true;
+      if (!j->dirty)
+         return;
+      buf = tt_journal_serialize(j, &len);
+      if (buf == NULL)
+         return;
+      journal_file_path(path, sizeof(path));
+      if (tt_journal_write_blob(path, ".tmp", buf, len))
+         j->dirty = false;
+      free(buf);
+   }
+
+   /* ---- Background (periodic) save ----
+    * The periodic autosave used to run the whole open/write/rename inline in
+    * endFrame every 600 frames. Under antivirus/indexer scanning that is a
+    * multi-millisecond render-thread stall - a dropped frame and an audible
+    * ~10-second-period audio stutter - and a failed rename left `dirty` set,
+    * so the full rewrite retried every 10 s for the rest of the session even
+    * on a static screen. Now the render thread only snapshots the map into a
+    * heap buffer (memory-speed) and a detached writer thread does the file
+    * I/O; its outcome is handed back through tt_journal_io_result so a
+    * failure re-dirties the journal and backs the next attempt off (see
+    * endFrame). */
+   struct TTJournalSaveJob {
+      char path[PATH_MAX_TT];
+      uint8_t *buf;
+      size_t len;
+   };
+   typedef struct TTJournalSaveJob TTJournalSaveJob;
+
+
+   static void tt_journal_writer_thread(void *ud) {
+      TTJournalSaveJob *job = (TTJournalSaveJob *)ud;
+      bool ok = tt_journal_write_blob(job->path, ".tmpa", job->buf, job->len);
+      free(job->buf);
+      free(job);
+      /* The result first: whoever sees `busy` clear finds it. */
+      retro_atomic_store_release_int(&tt_journal_io_result, ok ? 1 : -1);
+      retro_atomic_store_release_int(&tt_journal_io_busy, 0);
+   }
+
+   /* Wait for an in-flight background write to finish and reap its thread.
+    * Cheap when nothing is in flight. Called from the render thread only. */
+   static void tt_journal_writer_join(void) {
+      sthread_t *thread = tt_journal_io_thread;
+      tt_journal_io_thread = NULL;
+      if (thread)
+         sthread_join(thread);
+   }
+
+   static void texture_tracker_journal_save_async(struct TextureTracker *self) {
+      TTJournalSaveJob *job;
+      if (retro_atomic_exchange_int(&tt_journal_io_busy, 1))
+         return; /* previous write still in flight; dirty stays set, retried next window */
+      /* The previous writer has finished (busy is clear) but its thread has
+       * not been reaped yet; join it now so handles never accumulate. */
+      tt_journal_writer_join();
+      job = (TTJournalSaveJob *)malloc(sizeof(TTJournalSaveJob));
+      if (job != NULL) {
+         job->buf = tt_journal_serialize(&self->journal, &job->len);
+         journal_file_path(job->path, sizeof(job->path));
+      }
+      if (job == NULL || job->buf == NULL) {
+         free(job);
+         retro_atomic_store_release_int(&tt_journal_io_busy, 0);
+         return;
+      }
+      self->journal.dirty = false; /* optimistic; a writer failure re-dirties via the result flag */
+      {
+         sthread_t *thread = sthread_create(tt_journal_writer_thread, job);
+         if (thread) {
+            tt_journal_io_thread = thread;
+         } else {
+            free(job->buf);
+            free(job);
+            self->journal.dirty = true;
+            retro_atomic_store_release_int(&tt_journal_io_busy, 0);
+         }
+      }
+   }
+
+   static void texture_tracker_init(struct TextureTracker *self)
+   {
+      char rpath[PATH_MAX_TT];
+      char cfg[PATH_MAX_TT];
+      int mi;
+      /* former default member initializers */
+      self->dump_enabled = false;
+      self->hd_textures_enabled = false;
+      self->eager_textures = true;
+      self->frame = 0;
+      self->dbg_responses_received = 0;
+      self->dbg_responses_received_last = 0;
+      self->dbg_gpu_uploads = 0;
+      self->dbg_gpu_uploads_last = 0;
+      self->dbg_attaches = 0;
+      self->dbg_attaches_last = 0;
+      self->frame_dump = NULL;
+      self->frame_dump_need_comma = false;
+      self->fastpath_enabled = true;
+      self->default_hd_texture.data = NULL; /* plain-struct handle: explicit null */
+      rect_tracker_init(&self->tracker); /* embedded RectTracker: explicit init (was default initialiser) */
+      fused_pages_init(&self->fused_pages); /* embedded FusedPages: explicit init (was default initialiser) */
+      HdImageCache_init(&self->hd_cache, HD_CACHE_RAM_BUDGET);
+      HdGpuCache_init(&self->hd_gpu_cache, HD_CACHE_VRAM_BUDGET);
+      handle_lru_cache_init(&self->handle_cache, 4);
+      dbg_hotkey_init(&self->frame_dump_key, RETROK_LEFTBRACKET);
+      dbg_hotkey_init(&self->hd_toggle_key, RETROK_RIGHTBRACKET);
+      dbg_hotkey_init(&self->reload_key, RETROK_QUOTE);
+      dbg_hotkey_init(&self->fastpath_key, RETROK_SEMICOLON);
+      hd_key_set_init(&self->known_files);
+      hd_key_set_init(&self->requested);
+      hd_key_set_init(&self->inflight);
+      hd_key_set_init(&self->pending_attach);
+      hd_count_map_init(&self->load_attempts);
+      hd_count_map_init(&self->attach_retries);
+      self->dbg_pool_waits = 0;
+      self->dbg_pool_waits_last = 0;
+      self->dbg_pool_wait_timeouts = 0;
+      self->dbg_pool_wait_timeouts_last = 0;
+      tt_journal_init(&self->journal);
+      hd_key_set_init(&self->journal_seen);
+      hd_key_set_init(&self->journal_walked);
+      self->journal_prev_key = 0;
+      self->journal_prev_valid = false;
+      self->journal_saved_frame = 0;
+      self->journal_save_backoff = 0;
+      self->journal_loaded = false;
+      self->inline_uploads_this_frame = 0;
+      self->dbg_prefetch_issued = 0;
+      self->dbg_prefetch_issued_last = 0;
+      self->dbg_inline_uploads = 0;
+      self->dbg_inline_uploads_last = 0;
+      self->cached_palette_hashes = NULL;
+      self->cached_palette_hashes_count = 0;
+      self->cached_palette_hashes_cap = 0;
+      /* ---- page-aligned experiment + HD QoL members ---- */
+      hd_key_set_init(&self->known_files_pages);
+      hd_key_set_init(&self->pending_attach_pages);
+      hd_key_set_init(&self->dumped_pages);
+      self->dump_mode_rect        = true;
+      self->dump_mode_pages       = false;
+      self->replacement_mode_pages= false;
+      self->replacement_fallback  = false;
+      self->lazy_sync             = false;
+      self->reduce_palette_range  = false;
+      memset(self->clut_rows, 0, sizeof(self->clut_rows));
+      self->clut_rows_count       = 0;
+      self->page_ignore_count     = 0;
+      self->page_min_dump_w       = 0;
+      self->page_min_dump_h       = 0;
+      self->vram_mirror           = (uint16_t*)calloc((size_t)FB_WIDTH * FB_HEIGHT, sizeof(uint16_t));
+      self->ensured_dump_dir[0]       = '\0';
+      self->ensured_dump_pages_dir[0] = '\0';
+      self->ensured_replace_dir[0]    = '\0';
+      self->page_bindings         = NULL;
+      self->page_bindings_count   = 0;
+      self->page_bindings_cap     = 0;
+      self->cached_page_hashes    = NULL;
+      self->cached_page_hashes_count = 0;
+      self->cached_page_hashes_cap   = 0;
+      self->cached_page_bounds    = NULL;
+      self->cached_page_bounds_count = 0;
+      self->cached_page_bounds_cap   = 0;
+      self->dbg_gpu_uploads_peak  = 0;
+      self->dbg_page_binds        = 0;
+      self->dbg_page_binds_last   = 0;
+      self->dbg_page_miss         = 0;
+      self->dbg_page_miss_last    = 0;
+      self->dbg_page_hashes       = 0;
+      self->dbg_page_hashes_last  = 0;
+      read_texture_directory(&self->known_files, replacements_path(rpath, sizeof(rpath)), false);
+      TT_LOG(RETRO_LOG_INFO, "num hd textures: %d\n", (int)self->known_files.count);
+      read_texture_directory(&self->known_files_pages, replacements_pages_path(rpath, sizeof(rpath)), true);
+      TT_LOG(RETRO_LOG_INFO, "num hd page textures: %d\n", (int)self->known_files_pages.count);
+      /* The journal itself is read lazily on its first use in a Lazy mode
+       * (texture_tracker_journal_note) - Eager mode and replacement-off
+       * never touch the file. */
+
+      /* Read in the dump config file */
+      dump_path(cfg, sizeof(cfg));
+      snprintf(cfg + strlen(cfg), sizeof(cfg) - strlen(cfg), "/dump.cfg");
+      self->dump_ignore_count = parse_config_file(cfg, self->dump_ignore, DUMP_IGNORE_MAX);
+      for (mi = 0; mi < self->dump_ignore_count; mi++) {
+         RectMatch m = self->dump_ignore[mi];
+         TT_LOG_VERBOSE(RETRO_LOG_INFO, "Ignoring %d,%d,%d,%d\n", m.x, m.y, m.w, m.h);
+      }
+      self->clut_rows_count = parse_clut_rows_config(cfg, self->clut_rows, FB_HEIGHT);
+      if (self->clut_rows_count > 0)
+         TT_LOG(RETRO_LOG_INFO, "clutmask: %d VRAM row(s) declared as CLUT rows via dump.cfg\n", self->clut_rows_count);
+      self->page_ignore_count = parse_page_ignore_config(cfg, self->page_ignore, PAGE_IGNORE_MAX);
+      if (self->page_ignore_count > 0)
+         TT_LOG(RETRO_LOG_INFO, "pageignore: %d region(s) excluded from page dumping via dump.cfg\n", self->page_ignore_count);
+      parse_page_min_dump_config(cfg, &self->page_min_dump_w, &self->page_min_dump_h);
+      if (self->page_min_dump_w > 0 || self->page_min_dump_h > 0)
+         TT_LOG(RETRO_LOG_INFO, "pagemindump: page dumps need an overlapping upload >= %dx%d halfwords\n", self->page_min_dump_w, self->page_min_dump_h);
+      /* Spin up the IO worker pool last, once the self->tracker is fully built. */
+      io_thread_init(&self->iothread);
+   }
+
+   static void texture_tracker_fini(struct TextureTracker *self)
+   {
+      /* No worker may still be writing upload memory once the caches below
+       * let theirs go. */
+      io_thread_close(&self->iothread);
+      ih_reset(&self->default_hd_texture); /* drop the default HD texture reference */
+      tt_journal_save_file(&self->journal); /* persist any un-saved chain links */
+      tt_journal_free(&self->journal);
+      hd_key_set_free(&self->journal_seen);
+      hd_key_set_free(&self->journal_walked);
+      HdImageCache_clear(&self->hd_cache);   /* frees decoded levels + arena */
+      HdGpuCache_clear(&self->hd_gpu_cache); /* releases cached image refs + arena */
+      hd_key_set_free(&self->known_files);
+      hd_key_set_free(&self->requested);
+      hd_key_set_free(&self->inflight);
+      hd_key_set_free(&self->pending_attach);
+      hd_count_map_free(&self->load_attempts);
+      hd_count_map_free(&self->attach_retries);
+      hd_key_set_free(&self->known_files_pages);
+      hd_key_set_free(&self->pending_attach_pages);
+      hd_key_set_free(&self->dumped_pages);
+      free(self->vram_mirror);
+      { int i; for (i = 0; i < self->page_bindings_count; i++) ih_reset(&self->page_bindings[i].texture); }
+      free(self->page_bindings);
+      free(self->cached_page_hashes);
+      free(self->cached_page_bounds);
+      free(self->cached_palette_hashes);
+      fused_pages_deinit(&self->fused_pages); /* embedded FusedPages: explicit deinit (was default teardown) */
+      rect_tracker_deinit(&self->tracker); /* embedded RectTracker: explicit deinit (was default teardown) */
+      /* Signal and drop the IO worker pool last. Previously self->iothread was
+       * a by-value member, so its teardown ran after this body; preserve that
+       * ordering by deinitialising it here at the end. */
+      io_thread_deinit(&self->iothread);
+   }
+
+static SRect toSRect(TTRect rect) {
+      return make_srect(rect.x, rect.y, rect.width, rect.height);
+   }
+static TTRect fromSRect(SRect rect) {
+      return make_rect(rect.x, rect.y, rect.width, rect.height);
+   }
+
+   /* fromSRect(s).contains(r) in one shot, so the by-value temporary the old
+    * chained call relied on has a stable address for rect_contains. */
+   static INLINE bool fromSRect_contains(SRect s, TTRect r) {
+      struct TTRect fr = fromSRect(s);
+      return rect_contains(&fr, &r);
+   }
+
+   static Palette texture_tracker_get_palette(struct TextureTracker *self, TTRect palette_rect) {
+      assert(palette_rect.height == 1);
+
+      { static RectIndexSet overlap = { NULL, 0, 0 };
+      rect_tracker_overlapping(&self->tracker, palette_rect, &overlap);
+      { int oi; for (oi = 0; oi < overlap.count; oi++) {
+         RectIndex index = overlap.items[oi];
+         EnduringTextureRect *other = &self->tracker.textures.a[index]; /* TODO: The `other.alive` check is unnecessary because self->tracker.overlapping never returns dead indices */
+         if (fromSRect_contains(other->texture_rect.vram_rect, palette_rect) && other->alive) {
+            int y;
+            int x;
+            if (other->texture_rect.offset_x != 0 || other->texture_rect.offset_y != 0) {
+               continue; /* TODO: handle offset subrects */
+            }
+            x = palette_rect.x - other->texture_rect.vram_rect.x;
+            y = palette_rect.y - other->texture_rect.vram_rect.y;
+            { int offset = y * other->texture_rect.vram_rect.width + x;
+            uint16_t *data = other->texture_rect.upload->image + offset;
+            uint32_t hash = crc32(0, (unsigned char*)data, palette_rect.width * sizeof(uint16_t));
+            { Palette _p; _p.data = data; _p.hash = hash; return _p; }
+            }
+         }
+      } }
+
+      /* Fallback: the CLUT wasn't inside a tracked, zero-offset upload rect, so the
+       * rect-tracker lookup above found nothing - this produced the bulk of the
+       * "-missing" palette dumps and palette_hash==0 keys. Read the CLUT straight
+       * from the CPU VRAM mirror instead; it is kept current by every VRAM mutation
+       * hook, exactly as the hardware reads its CLUT from live VRAM. Columns are
+       * masked so a CLUT near the right VRAM edge wraps around correctly. */
+      if (self->vram_mirror != NULL) {
+         unsigned n  = (unsigned)palette_rect.width;   /* 16 (4bpp) or 256 (8bpp) */
+         unsigned py = (unsigned)palette_rect.y & (FB_HEIGHT - 1);
+         unsigned i;
+         uint32_t hash;
+         if (n > 256u)
+            n = 256u;
+         for (i = 0; i < n; i++) {
+            unsigned px = ((unsigned)palette_rect.x + i) & (FB_WIDTH - 1);
+            self->palette_scratch[i] = self->vram_mirror[py * FB_WIDTH + px];
+         }
+         hash = crc32(0, (unsigned char*)self->palette_scratch, n * sizeof(uint16_t));
+         { Palette _p; _p.data = self->palette_scratch; _p.hash = hash; return _p; }
+      }
+
+      { Palette _p; _p.data = NULL; _p.hash = 0; return _p; }
+      }
+   }
+
+   static uint32_t texture_tracker_get_palette_hash(struct TextureTracker *self, TTRect palette_rect) {
+      Palette palette;
+      int i;
+      for (i = 0; i < self->cached_palette_hashes_count; i++) {
+         if (rect_eq(&self->cached_palette_hashes[i].rect, &palette_rect)) {
+            return self->cached_palette_hashes[i].hash;
+         }
+      }
+      palette = texture_tracker_get_palette(self, palette_rect);
+      if (palette.data != NULL) {
+         if (self->cached_palette_hashes_count == self->cached_palette_hashes_cap) {
+            int ncap = self->cached_palette_hashes_cap ? self->cached_palette_hashes_cap * 2 : 16;
+            CachedPaletteHash *nh = (CachedPaletteHash *)realloc(self->cached_palette_hashes,
+                  (size_t)ncap * sizeof(CachedPaletteHash));
+            if (!nh)
+               return palette.hash;
+            self->cached_palette_hashes = nh;
+            self->cached_palette_hashes_cap = ncap;
+         }
+         self->cached_palette_hashes[self->cached_palette_hashes_count].rect = palette_rect;
+         self->cached_palette_hashes[self->cached_palette_hashes_count].hash = palette.hash;
+         self->cached_palette_hashes_count++;
+         return palette.hash;
+      }
+      return 0; /* TODO: better way to indicate no palette found? */
+   }
+
+   void texture_tracker_clearRegion(struct TextureTracker *self,
+         TTRect rect, uint16_t fill16){
+      if (rect.width == 0 || rect.height == 0) {
+         /* Some games do this, apparently. */
+         return;
+      }
+      rect_tracker_clear(&self->tracker, make_srect(rect.x, rect.y, rect.width, rect.height));
+      fused_pages_mark_dead(&self->fused_pages, rect);
+      texture_tracker_mirror_fill(self, rect, fill16); /* keep the page mirror current */
+
+      texture_tracker_clear_palette_cache(self, rect);
+   }
+
+
+   void texture_tracker_blit(struct TextureTracker *self,
+         TTRect dst,
+         TTRect src){
+      rect_tracker_blit(&self->tracker, make_srect(dst.x, dst.y, dst.width, dst.height), make_srect(src.x, src.y, src.width, src.height));
+      texture_tracker_mirror_blit(self, dst, src); /* keep the page mirror current */
+      /* Mark only - rebuilds are COALESCED to the safe point / first serve of
+       * the frame. The inline rebuild here ran once per VRAM blit (once per
+       * typed character during dialogue), clearing+re-blitting a possibly
+       * in-use composite mid-frame: the streaming-text flicker. */
+      fused_pages_mark_dirty(&self->fused_pages, dst);
+      texture_tracker_clear_palette_cache(self, dst);
+   }
+
+   static uint32_t texture_tracker_hash_vram(struct TextureTracker *self,
+         TTRect rect,
+         uint16_t *vram){
+      /* The CRC of the rect's rows chained in place: the same value as over
+       * a packed copy, without making one. Rows split where x wraps. */
+      unsigned first = rect.width < FB_WIDTH - (rect.x & (FB_WIDTH - 1))
+            ? rect.width : FB_WIDTH - (rect.x & (FB_WIDTH - 1));
+      uint32_t hash = 0;
+      unsigned j;
+      (void)self;
+      for (j = 0; j < rect.height; j++)
+      {
+         const uint16_t *row = vram + ((rect.y + j) & (FB_HEIGHT - 1)) * FB_WIDTH;
+         hash = crc32(hash, row + (rect.x & (FB_WIDTH - 1)), first * sizeof(uint16_t));
+         if (first < rect.width)
+            hash = crc32(hash, row, (rect.width - first) * sizeof(uint16_t));
+      }
+      return hash;
+   }
+
+   /* Geometry helpers return a result plus a validity flag.
+    * Named structs make the boolean's meaning explicit. */
+   struct SRectResult { SRect rect; bool valid; };
+   struct TextureRectResult { TextureRect rect; bool valid; };
+
+   static SRectResult intersect(SRect a, SRect b) {
+      int al     = srect_left(&a),   ar = srect_right(&a),  at = srect_top(&a), ab = srect_bottom(&a);
+      int bl     = srect_left(&b),   br = srect_right(&b),  bt = srect_top(&b), bb = srect_bottom(&b);
+      int left   = (al > bl) ? al : bl;
+      int right  = (ar < br) ? ar : br;
+      int top    = (at > bt) ? at : bt;
+      int bottom = (ab < bb) ? ab : bb;
+      int width  = right - left;
+      int height = bottom - top;
+      if (width <= 0 || height <= 0)
+      { SRectResult r = { make_srect(0, 0, 1, 1), false }; return r; }
+      {
+         SRectResult r = { make_srect(left, top, width, height), true };
+         return r;
+      }
+   }
+
+   static TextureRect subTexture(TextureRect original, SRect sub_vram_rect) {
+      return make_texture_rect(
+            original.upload,
+            original.offset_x + srect_left(&sub_vram_rect) - srect_left(&original.vram_rect),
+            original.offset_y + srect_top(&sub_vram_rect) - srect_top(&original.vram_rect),
+            sub_vram_rect
+            );
+   }
+
+   static TextureRectResult clip_texture_rect_to_vram(TextureRect *t,
+         TTRect vram_rect){
+      SRectResult intersection = intersect(t->vram_rect, toSRect(vram_rect));
+      if (intersection.valid) {
+         TextureRectResult r = { subTexture(*t, intersection.rect), true };
+         return r;
+      }
+      { TextureRectResult r = { make_texture_rect(NULL, 0, 0, make_srect(0, 0, 1, 1)), false };
+      return r;
+      }
+   }
+
+   void texture_tracker_notifyReadback(struct TextureTracker *self,
+         TTRect rect,
+         uint16_t *vram){
+      RestorableRect rr;
+      uint32_t hash;
+      /* These hacks are my workaround for the dialog self->frame texture restorable getting evicted by FMVs */
+      if (rect.width == 96 && rect.height == 224 && rect.y == 0 && (rect.x % 96) == 0) {
+         /* HACK: Looks like final fmv self->frame readback for cross fade, ignore */
+         return;
+      }
+      if (rect.width == 64 && rect.height == 224 && rect.y == 0 && (rect.x % 64) == 0) {
+         /* HACK: Looks like final fmv self->frame readback for cross fade, ignore */
+         return;
+      }
+
+      hash = texture_tracker_hash_vram(self, rect, vram);
+
+      texture_tracker_mirror_store(self, rect, vram); /* keep the page mirror current */
+
+      { int i; for (i = 0; i < rrvec_size(&self->restorable_rects); ) {
+         if (rect_intersects(&self->restorable_rects.items[i].rect, &rect))
+            rrvec_erase_at(&self->restorable_rects, i);
+         else
+            i++;
+      } }
+
+      { static RectIndexSet overlap = { NULL, 0, 0 };
+
+      OwnedRectVec to_restore;
+      ownedrects_init(&to_restore); /* must be valid before ownedrects_push below (reads v.items/count/cap); left indeterminate otherwise -> garbage push at -O2/-O3 */
+      rect_tracker_overlapping(&self->tracker, rect, &overlap);
+      { int oi; for (oi = 0; oi < overlap.count; oi++) {
+         RectIndex index = overlap.items[oi];
+         EnduringTextureRect *e = &self->tracker.textures.a[index];
+         if (e->alive) { /* TODO: This check is unnecessary because self->tracker.overlapping never returns dead indices */
+                   /* Clip to the self->requested rect */
+            TextureRectResult result = clip_texture_rect_to_vram(&e->texture_rect, rect);
+            if (result.valid) {
+               /* assert(rect.contains(fromSRect(result.rect.vram_rect))); */
+               ownedrects_push(&to_restore, result.rect);
+            }
+         }
+      } }
+
+      restorablerect_init(&rr);
+      rr.rect = rect;
+      rr.hash = hash;
+      ownedrects_move(&rr.to_restore, &to_restore);
+      rrvec_push(&self->restorable_rects, &rr);
+      restorablerect_destroy(&rr);
+      }
+   }
+
+   void texture_tracker_upload(struct TextureTracker *self,
+         TTRect rect,
+         uint16_t *vram){
+      TextureUpload * upload;
+      RestorableRect * restore;
+      texture_tracker_clear_palette_cache(self, rect);
+
+      if (rect.width == FB_WIDTH && rect.height == FB_HEIGHT) {
+         /* probably loading a save state, this is the entirety of vram */
+         rect_tracker_clear(&self->tracker, toSRect(rect));
+         fused_pages_mark_dead(&self->fused_pages, rect);
+         texture_tracker_mirror_store(self, rect, vram); /* refresh the whole mirror */
+         return;
+      }
+
+      /* Would this ever happen? */
+      if (rect.width == 0 || rect.height == 0) {
+         return;
+      }
+
+      /* Keep the CPU VRAM mirror current with the uploaded bytes (page-aligned
+       * experiment), unconditionally regardless of dedup/restore below. */
+      texture_tracker_mirror_store(self, rect, vram);
+
+      upload = NULL;
+      { bool preexisting = false;
+      {
+         /* Hashed in place; the packed copy is made only for a new upload,
+          * which keeps it. */
+         uint32_t hash = texture_tracker_hash_vram(self, rect, vram);
+         /* TODO: check for hash collision, by checking if existing upload has
+          * different dimensions. not sure how to recover if it does, but the
+          * odds of a collision are probably much higher than the odds that both
+          * textures would be in play simultaneously, so it'd probably be safe
+          * to simply ignore the newest upload and clear instead. */
+         upload = texture_tracker_find_upload(self, hash);    /* borrowed */
+         if (upload == NULL) {
+            size_t img_n = (size_t)rect.width * (size_t)rect.height;
+            uint16_t *img = (uint16_t *)malloc(img_n * sizeof(uint16_t));
+            size_t vi = 0;
+            unsigned j, i;
+            for (j = 0; j < rect.height; j++)
+               for (i = 0; i < rect.width; i++)
+                  img[vi++] = vram[((rect.y + j) & (FB_HEIGHT - 1)) * FB_WIDTH
+                        + ((rect.x + i) & (FB_WIDTH - 1))];
+            upload = texture_upload_new();  /* owns +1 */
+            upload->image = img;            /* transfer ownership */
+            upload->image_count = (int)img_n;
+            upload->width = rect.width;
+            upload->height = rect.height;
+            upload->hash = hash;
+            upload->dumpable = true;
+            /* Don't dump uploads specified by dump.cfg */
+            { int ri; for (ri = 0; ri < self->dump_ignore_count; ri++) {
+               if (rect_match_matches(&self->dump_ignore[ri], rect)) {
+                  upload->dumpable = false;
+                  break;
+               }
+            } }
+         } else {
+            preexisting = true;
+            texture_upload_acquire(upload); /* take our own ref on the borrowed result */
+         }
+      }
+
+      restore = NULL;
+      {
+      int _oi;
+      for (_oi = 0; _oi < rrvec_size(&self->restorable_rects); _oi++) {
+         RestorableRect *other = &self->restorable_rects.items[_oi];
+         if (other->hash == upload->hash && rect_eq(&other->rect, &rect)) {
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "RESTORATION: %x\n", other->hash);
+            restore = other;
+            break;
+         }
+      }
+      }
+      if (restore != NULL) {
+         int _ri;
+         for (_ri = 0; _ri < ownedrects_size(&restore->to_restore); _ri++) {
+            TextureRect *t = &restore->to_restore.v.items[_ri];
+            rect_tracker_place(&self->tracker, *t); /* TODO: clip to other.rect */
+         }
+      } else {
+         rect_tracker_upload(&self->tracker, toSRect(rect), upload);
+      }
+      /* Mark only - rebuilds are COALESCED (see texture_tracker_blit). Uploads
+       * during streaming text (credits letters, dialogue glyphs) dirtied and
+       * inline-rebuilt composites once per letter. */
+      fused_pages_mark_dirty(&self->fused_pages, rect);
+
+      /* HD texture caching method: - Lazy (self->eager_textures=false): nothing
+       * is queued here; each (hash,palette) is loaded on demand when first
+       * drawn (request_hd_texture). Leanest. - Eager
+       * (self->eager_textures=true, the master-consistent default): on the
+       * first upload of a hash, prefetch ALL of its known palette variants into
+       * the cache. Routed through want_combo so it still respects the cache
+       * (decode-once / dedup) and the VRAM/RAM budgets, unlike stock Beetle's
+       * raw load_hd_texture. */
+      if (self->eager_textures && self->hd_textures_enabled && !preexisting && !self->replacement_mode_pages) {
+         int lo = hd_key_set_lower_bound(&self->known_files, (uint64_t)upload->hash << 32);
+         int hi = hd_key_set_lower_bound(&self->known_files, ((uint64_t)upload->hash + 1) << 32);
+         int ki;
+         for (ki = lo; ki < hi; ki++) {
+            HdTextureId combo;
+            combo.hash = upload->hash;
+            combo.palette_hash = (uint32_t)self->known_files.keys[ki];
+            combo.pages = false;
+            texture_tracker_want_combo(self, combo, false, false); /* eager prefetch = low priority */
+         }
+      }
+      texture_upload_release(upload); /* drop the local ref; rects hold their own */
+      }
+   }
+
+   static void texture_tracker_load_hd_texture(struct TextureTracker *self, uint32_t hash) {
+      /* Savestate re-warm. Route through want_combo (like the Eager prefetch)
+       * rather than raw IORequest pushes: that restores the cache-hit skip,
+       * in-flight dedup via `requested`, and low-priority classification. The
+       * raw path re-read and re-decoded already-cached combos wholesale after
+       * every savestate load, and could triple-load one combo (raw + draw-path
+       * async + lazy-sync inline). */
+      int lo = hd_key_set_lower_bound(&self->known_files, (uint64_t)hash << 32);
+      int hi = hd_key_set_lower_bound(&self->known_files, ((uint64_t)hash + 1) << 32);
+      int ki;
+      for (ki = lo; ki < hi; ki++) {
+         HdTextureId combo;
+         combo.hash = hash;
+         combo.palette_hash = (uint32_t)self->known_files.keys[ki];
+         combo.pages = false;
+         TT_LOG_VERBOSE(RETRO_LOG_INFO, "requesting texture: %x-%x\n", hash, combo.palette_hash);
+         texture_tracker_want_combo(self, combo, false, false); /* savestate warm = background */
+      }
+   }
+
+   /* Queue a disk load for one (hash,palette) combo, unless it's already
+    * decoded (in the cache), already in flight, or known to have no file.
+    * Combos with no file are inserted into `requested` as a permanent negative
+    * cache. A load that fails despite the file being listed is retried on the
+    * next draw and written off as a permanent negative after
+    * TT_LOAD_MAX_ATTEMPTS. A combo already resident in either cache schedules a
+    * pending attach rather than returning, since residency in the cache says
+    * nothing about whether the current upload object carries the binding. */
+   static void texture_tracker_want_combo(struct TextureTracker *self, HdTextureId id, bool high_priority, bool pages) {
+      /* pages=true sources the file from the -pages folder and checks
+       * known_files_pages; both feed the SAME 3-tier cache (id.pages namespaces
+       * the shared requested/hd_cache/hd_gpu_cache via hd_pack_key's salt). */
+      if (HdGpuCache_contains(&self->hd_gpu_cache, hd_pack_key(id)) || HdImageCache_contains(&self->hd_cache, hd_pack_key(id))) {
+         /* Already decoded/resident - but not necessarily BOUND to the current
+          * upload object: bindings live on TextureUpload, and uploads are
+          * destroyed and recreated (with EMPTY textures maps) as their VRAM
+          * recycles. Schedule an attach so the safe-point pass re-binds the
+          * cached image; returning silently here made the Eager prefetch a
+          * no-op exactly for cached combos on recreated uploads. */
+         if (pages)
+            hd_key_set_insert(&self->pending_attach_pages, ((uint64_t)id.hash << 32) | (uint64_t)id.palette_hash);
+         else
+            hd_key_set_insert(&self->pending_attach, hd_pack_key(id));
+         return;
+      }
+      if (!hd_key_set_insert(&self->requested, hd_pack_key(id))) {
+         /* Already in flight, or negatively cached. If a draw now needs a
+          * combo the journal queued as a low-priority prediction, move that
+          * request ahead of the rest of the prefetch backlog: otherwise a
+          * Lazy-sync bind waits behind every earlier prediction, and an async
+          * Lazy draw shows native for as long as the backlog takes. */
+         if (high_priority && hd_key_set_contains(&self->inflight, hd_pack_key(id))) {
+            /* Only a request the workers have not been shown yet can move;
+             * one already in their window is at most a window's worth of
+             * decodes away, behind every high-priority request. */
+            struct IOLoadKey k;
+            k.hash = id.hash; k.palette_hash = id.palette_hash; k.pages = pages;
+            tt_io_channel_promote(self->iothread.channel, io_request_is_load, &k);
+         }
+         return;
+      }
+      if (!hd_key_set_contains(pages ? &self->known_files_pages : &self->known_files, hd_pack_key(id)))
+         return; /* no file on disk */
+
+      {
+         IORequest *load = (IORequest *)malloc(sizeof(IORequest));
+         load->node.next = NULL;
+         load->kind = IORequestKind_Load;
+         load->hash = id.hash;
+         load->palette_hash = id.palette_hash;
+         load->pages = pages;
+         load->src = NULL; load->palette = NULL; /* Load: no dump payload to free */
+         /* High priority = needed for an on-screen draw (jumps ahead of prefetch);
+          * low priority = speculative prefetch that fills idle IO time. */
+         if (!tt_io_channel_push(self->iothread.channel, &load->node, high_priority))
+            return; /* no channel: nothing is in flight, the combo stays native */
+      }
+      /* A request is now genuinely queued - track it so the pooled Lazy-sync
+       * wait knows a response WILL arrive (unlike `requested`, which also
+       * holds permanent no-file negatives that never respond). */
+      hd_key_set_insert(&self->inflight, hd_pack_key(id));
+   }
+
+   /* Drain delivered IO responses into the CPU cache (decode-once) and mark
+    * them for attach. The cache owns them regardless of whether their hash is
+    * resident; each response node is freed after its levels are moved into
+    * the cache. A failure response (empty levels) just erases `requested` so
+    * the next draw can retry. Split out of on_queues_reset so the pooled
+    * Lazy-sync wait can bank responses mid-frame; the ATTACH passes still run
+    * only at the safe point. Render thread only. */
+   static void texture_tracker_drain_responses(struct TextureTracker *self) {
+      IOResponse *responses = (IOResponse *)
+            tt_io_channel_take_responses(self->iothread.channel); /* steal the list */
+      {
+         IOResponse *response = responses;
+         while (response != NULL) {
+            IOResponse *rnext = (IOResponse *)response->node.next;
+            HdTextureId id;
+            if (response->kind == IOResponseKind_Staging) {
+               io_thread_answer(&self->iothread, response);
+               io_response_free(response);
+               response = rnext;
+               continue;
+            }
+            io_thread_returned(&self->iothread, response);
+            id.hash = response->hash;
+            id.palette_hash = response->palette_hash;
+            id.pages = response->pages;
+            hd_key_set_erase(&self->requested, hd_pack_key(id)); /* no longer in flight; retryable or cached */
+            hd_key_set_erase(&self->inflight, hd_pack_key(id));
+            if (response->levels.count == 0) {
+               /* Failure response: the load failed although the file is listed
+                * in known_files. Erasing `requested` above lets the next draw
+                * retry, which is what a transient error needs - but a file that
+                * fails every time (unreadable, or spelled on disk in a form
+                * find_replacement_file cannot reconstruct) would otherwise be
+                * reopened once per draw for the rest of the session. Count the
+                * attempts and reinstate the permanent negative at the limit. */
+               if (hd_count_map_bump(&self->load_attempts, hd_pack_key(id)) >= TT_LOAD_MAX_ATTEMPTS) {
+                  TT_LOG(RETRO_LOG_WARN, "giving up on %x-%x after %d failed loads\n",
+                        id.hash, id.palette_hash, TT_LOAD_MAX_ATTEMPTS);
+                  hd_key_set_insert(&self->requested, hd_pack_key(id));
+                  hd_count_map_erase(&self->load_attempts, hd_pack_key(id));
+               }
+            } else {
+               self->dbg_responses_received++;
+               hd_count_map_erase(&self->load_attempts, hd_pack_key(id));
+               hd_image_cache_put(&self->hd_cache, id, &response->levels, response->alpha_flags);
+               if (response->pages)
+                  /* page combo: store the BASE (unsalted) key so the page attach pass can unpack it */
+                  hd_key_set_insert(&self->pending_attach_pages, ((uint64_t)id.hash << 32) | (uint64_t)id.palette_hash);
+               else
+                  hd_key_set_insert(&self->pending_attach, hd_pack_key(id));
+            }
+            io_response_free(response); /* levels already moved out (now empty) */
+            response = rnext;
+         }
+      }
+   }
+
+   /* Pooled Lazy-sync wait: block (bounded) until combo id's in-flight load
+    * lands in a cache tier, draining every delivered response along the way -
+    * so while this draw waits on ONE combo, every other in-flight combo (the
+    * rest of the overlap set, journal predictions) banks its decode too.
+    * "Synchronous" thus means "do not use native until ready", not "decode
+    * serially on the render thread": a 12-miss draw costs ~max(loads) across
+    * the 4 workers instead of sum(loads) inline.
+    *
+    * Returns true when a cache tier holds the combo. False = nothing is in
+    * flight for it (no file / negative / its load just failed) or the wait
+    * timed out; the draw shows native this frame and retries later. The
+    * bound (~512ms of 2ms slices) means a pathological state degrades to
+    * pop-in rather than hanging the renderer. */
+   enum { TT_POOL_WAIT_SLICE_US = 2000, TT_POOL_WAIT_TRIES = 256 };
+
+   static bool texture_tracker_sync_wait_combo(struct TextureTracker *self, HdTextureId id) {
+      uint64_t key = hd_pack_key(id);
+      int tries;
+      self->dbg_pool_waits++;
+      for (tries = 0; tries < TT_POOL_WAIT_TRIES; tries++) {
+         if (HdGpuCache_contains(&self->hd_gpu_cache, key) ||
+               HdImageCache_contains(&self->hd_cache, key))
+            return true;
+         if (!hd_key_set_contains(&self->inflight, key))
+            return false; /* nothing in flight: no file, negative-cached, or failed */
+         texture_tracker_drain_responses(self);
+         if (HdGpuCache_contains(&self->hd_gpu_cache, key) ||
+               HdImageCache_contains(&self->hd_cache, key))
+            return true;
+         if (!hd_key_set_contains(&self->inflight, key))
+            return false; /* the drain above consumed its failure response */
+         tt_io_channel_wait_response(self->iothread.channel,
+               (int64_t)TT_POOL_WAIT_SLICE_US);
+      }
+      self->dbg_pool_wait_timeouts++;
+      TT_LOG(RETRO_LOG_WARN, "pooled-sync wait timed out for %x-%x\n",
+            id.hash, id.palette_hash);
+      return false;
+   }
+
+   /* How many predicted combos to keep in flight ahead of the current one. At
+    * one new state per frame (worst case: the intro-crawl typewriter mints a
+    * new page hash per typed glyph) depth 8 covers the ~2-4 frame async
+    * latency with margin; each step is one map lookup + one want_combo
+    * (cache/dedup-checked, low priority), so over-walking is nearly free. */
+   enum { TT_PREFETCH_DEPTH = 8 };
+
+   /* Per-frame cap on inline (mid-draw) GPU uploads of already-decoded combos
+    * in the async Lazy path (see the struct field comment). */
+   enum { TT_INLINE_UPLOAD_BUDGET = 8 };
+
+   /* Journal hook - called for every combo a draw actually needs (rect combos
+    * via request_hd_texture, page combos via match_page).
+    *
+    * 1) RECORD: the first sighting of a combo this session appends it to the
+    *    persisted chain (previous first-seen -> this one).
+    * 2) PREDICT: that first sighting ALSO walks the recorded chain from this
+    *    combo and queues background loads for the next TT_PREFETCH_DEPTH
+    *    predicted combos. As successive stream states arrive, the walk re-runs
+    *    from each one, so the lookahead window slides along with the stream.
+    *
+    * Cost when everything is already known/cached: two sorted-set probes. */
+   /* The journal exists for the two Lazy modes only. In Eager (the upstream
+    * default) and whenever replacement is off it is completely inert: no
+    * recording, no prefetch walks, no file reads or writes - so the fork can
+    * not change stock behaviour in those configurations. */
+   static INLINE bool texture_tracker_journal_active(const struct TextureTracker *self) {
+      return self->hd_textures_enabled && !self->eager_textures;
+   }
+
+   static void texture_tracker_journal_note(struct TextureTracker *self, HdTextureId id) {
+      uint64_t key = hd_pack_key(id);
+      if (!texture_tracker_journal_active(self))
+         return;
+      if (!self->journal_loaded) {
+         /* First use this session: read the trained map now. This coincides
+          * with the first replacement loads anyway, so the one small read is
+          * lost in that noise; it is never done in Eager / replacement-off. */
+         tt_journal_load_file(&self->journal);
+         self->journal_loaded = true;
+      }
+      if (hd_key_set_insert(&self->journal_seen, key)) {
+         if (self->journal_prev_valid && self->journal_prev_key != key)
+            tt_journal_record(&self->journal, self->journal_prev_key, key, id.pages);
+         self->journal_prev_key = key;
+         self->journal_prev_valid = true;
+      }
+      if (hd_key_set_insert(&self->journal_walked, key)) {
+         uint64_t cur = key;
+         int i;
+         for (i = 0; i < TT_PREFETCH_DEPTH; i++) {
+            uint64_t nxt;
+            bool nxt_pages;
+            if (!tt_journal_lookup(&self->journal, cur, &nxt, &nxt_pages))
+               break;
+            texture_tracker_want_combo(self, hd_unpack_key(nxt, nxt_pages), false, nxt_pages);
+            self->dbg_prefetch_issued++;
+            cur = nxt;
+         }
+      }
+   }
+
+   /* Cache-backed HD texture binding for a drawn (hash,palette): pure lazy.
+    *
+    * If the combo is in the GPU cache, bind it immediately (handle copy, used
+    * this frame). If it's decoded in the CPU cache, schedule a GPU upload for
+    * the next safe point (on_queues_reset). Otherwise queue a single disk load
+    * for it. The 3-tier cache makes every re-draw free, so each combo costs at
+    * most one decode on its very first appearance.
+    *
+    * (Cross-hash prefetch was tried and removed: with the cache, re-draws are
+    * already free, so warming the whole palette hash-set up front mostly
+    * decoded combos that were never drawn - thrashing the RAM cache and
+    * clogging the IO queue ahead of the combos actually on screen, which made
+    * pop-in worse.) */
+   static void texture_tracker_request_hd_texture(struct TextureTracker *self, TextureUpload *upload, uint32_t palette_hash) {
+      if (hd_tex_map_contains(&upload->textures, palette_hash))
+         return; /* already attached to this upload */
+
+      { HdTextureId current = { upload->hash, palette_hash };
+      CachedGpuImage *gpu;
+      texture_tracker_journal_note(self, current);
+
+      /* GPU-cache hit: the Vulkan image already exists, so binding it is just a
+       * ref-counted handle copy (no Vulkan commands). Bind it IMMEDIATELY so
+       * the CURRENT self->frame's draw uses the HD texture. Deferring to
+       * on_queues_reset cost a 1-self->frame native flicker every time an
+       * animation self->frame's upload was recreated (constant for sprites) -
+       * i.e. persistent pop-in even when the image was fully cached. */
+      gpu = HdGpuCache_get(&self->hd_gpu_cache, hd_pack_key(current));
+      if (gpu != NULL) {
+         hd_tex_map_set(&upload->textures, palette_hash, gpu->image, gpu->alpha_flags);
+         self->dbg_attaches++;
+         /* Invalidate covering fused pages, exactly like sync_load_combo and
+          * the safe-point attach pass do - this was the one bind site that
+          * didn't, so a composite that predated the bind kept rendering the
+          * native texels for this upload indefinitely. */
+         { int _ti; for (_ti = 0; _ti < self->tracker.textures.count; _ti++)
+         {
+            EnduringTextureRect *e = &self->tracker.textures.a[_ti];
+            if (e->alive && e->texture_rect.upload == upload)
+               fused_pages_mark_dirty(&self->fused_pages, fromSRect(e->texture_rect.vram_rect));
+         } }
+         return;
+      }
+
+      /* Lazy (synchronous), pooled: the pre-pass in get_hd_texture_index (and
+       * the journal walk above) already have this draw's misses racing on the
+       * IO pool 4-wide; dispatch this one too (a no-op if already in flight)
+       * and wait for it to land, then bind from the cache tier. The render
+       * thread no longer decodes inline, so a multi-upload draw costs about
+       * max(loads) instead of sum(loads). A failed or absent load falls back
+       * to native for this frame and retries on a later draw. */
+      if (self->lazy_sync) {
+         if (!HdImageCache_contains(&self->hd_cache, hd_pack_key(current))) {
+            texture_tracker_want_combo(self, current, true, false);
+            if (!texture_tracker_sync_wait_combo(self, current))
+               return; /* native this frame */
+         }
+         texture_tracker_sync_load_combo(self, upload, palette_hash); /* upload+bind from the cache tier */
+         return;
+      }
+
+      if (HdImageCache_contains(&self->hd_cache, hd_pack_key(current))) {
+         /* Decoded but not in VRAM. Lazy (async): uploading is cheap next to
+          * decode, so do a BUDGETED inline upload+bind (the sync loader's
+          * CPU-hit path) instead of deferring to the safe point - the deferral
+          * cost a guaranteed 1-frame native flicker, which in particular
+          * nullified prefetched rect combos (they always arrive
+          * decoded-but-unattached). Eager keeps the stock safe-point attach. */
+         if (!self->eager_textures &&
+               self->inline_uploads_this_frame < TT_INLINE_UPLOAD_BUDGET) {
+            self->inline_uploads_this_frame++;
+            self->dbg_inline_uploads++;
+            texture_tracker_sync_load_combo(self, upload, palette_hash);
+            return;
+         }
+         hd_key_set_insert(&self->pending_attach, hd_pack_key(current));
+      }
+      else
+         texture_tracker_want_combo(self, current, true, false); /* on-demand: high priority */
+      }
+   }
+
+   static void output_rect_json(RFILE *stream, TTRect *rect) {
+      filestream_printf(stream,
+            "{ \"x\": %u,\"y\": %u,\"width\": %u,\"height\": %u}\n",
+            rect->x, rect->y, rect->width, rect->height);
+   }
+
+   static void texture_tracker_dump_texture(struct TextureTracker *self, TextureUpload *upload, UsedMode *mode, DumpedMode dump_mode) {
+      int dmi;
+      bool already_dumped;
+      if (!upload->dumpable) {
+         return;
+      }
+
+      already_dumped = false;
+      for (dmi = 0; dmi < upload->dumped_modes_count; dmi++) {
+         if (dumpedmode_eq(&upload->dumped_modes[dmi], &dump_mode)) {
+            already_dumped = true;
+            break;
+         }
+      }
+      if (!already_dumped) {
+         if (upload->dumped_modes_count == upload->dumped_modes_cap) {
+            int ncap = upload->dumped_modes_cap ? upload->dumped_modes_cap * 2 : 4;
+            DumpedMode *nm = (DumpedMode *)realloc(upload->dumped_modes,
+                  (size_t)ncap * sizeof(DumpedMode));
+            if (!nm)
+               return;
+            upload->dumped_modes = nm;
+            upload->dumped_modes_cap = ncap;
+         }
+         upload->dumped_modes[upload->dumped_modes_count++] = dump_mode;
+         if (self->dump_enabled) {
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "Dumping %x\n", upload->hash);
+            /* dump_mode.palette_hash is the effective hash (reduced range when the
+             * option is on, else full) chosen by the caller: dedup key + filename. */
+            texture_tracker_dump_image(self, upload, mode, dump_mode.palette_hash);
+         }
+      }
+   }
+
+   static HandleCacheResult handle_lru_cache_get(struct HandleLRUCache *self,
+         TTRect rect,
+         uint32_t palette_hash){
+      HandleCacheResult res;
+      int i, j;
+      for (i = 0; i < self->count; i++) {
+         CacheEntry *entry = &self->entries[i];
+         if (entry->key_palette_hash == palette_hash && rect_contains(&entry->rect, &rect)) {
+            CacheEntry hit = *entry;
+            for (j = i; j > 0; j--) {
+               self->entries[j] = self->entries[j - 1];
+            }
+            self->entries[0] = hit;
+            self->dbg_hits += 1;
+            res.handle = hit.handle;
+            res.found = true;
+            return res;
+         }
+      }
+      self->dbg_misses += 1;
+      res.handle = hd_handle_make_none();
+      res.found = false;
+      return res;
+   }
+   static void handle_lru_cache_insert(struct HandleLRUCache *self,
+         TTRect rect,
+         uint32_t palette_hash,
+         HdTextureHandle handle){
+      int j;
+      CacheEntry e;
+      e.rect = rect;
+      e.key_palette_hash = palette_hash;
+      e.handle = handle;
+      /* If full, the entry at index max_size-1 (the LRU) is dropped by the
+       * shift below not preserving it. Otherwise grow by one. */
+      if (self->count < self->max_size)
+         self->count++;
+      for (j = self->count - 1; j > 0; j--)
+         self->entries[j] = self->entries[j - 1];
+      self->entries[0] = e;
+   }
+   static INLINE void handle_lru_cache_clear(struct HandleLRUCache *self) { self->count = 0; }
+
+   /* Reduce Palette Range (see the "HD Reduce Palette Range" core option).
+    * A 4bpp / 8bpp texture can only look up the CLUT entries its index words
+    * name; the rest of the CLUT is slack that games often leave as garbage or
+    * rewrite later. Flag every entry the texture names in a small table, then
+    * walk in from both ends of the table to the first and last flagged entry:
+    * that inclusive span is all the palette hash needs to cover. Once both the
+    * first and the last CLUT entry are flagged the span is the whole CLUT, so
+    * the scan stops early. Returns false for direct-colour modes and for an
+    * empty texture; the caller then hashes the whole CLUT. */
+   static bool reduce_palette_bounds(const uint16_t *words, size_t word_count, int mode,
+         unsigned *out_min, unsigned *out_max) {
+      unsigned char named[256]; /* named[e] != 0: some texel uses CLUT entry e */
+      unsigned top;             /* last addressable CLUT entry: 15 or 255 */
+      unsigned first, last;
+      size_t i;
+
+      if (mode == (int)TextureMode_Palette4bpp)
+         top = 15;
+      else if (mode == (int)TextureMode_Palette8bpp)
+         top = 255;
+      else
+         return false; /* direct colour: no CLUT to narrow */
+      if (word_count == 0)
+         return false;
+
+      memset(named, 0, top + 1);
+      i = 0;
+      while (i < word_count) {
+         /* flag in blocks of 256 words, checking for the full span between blocks */
+         size_t end = (word_count - i > 256) ? i + 256 : word_count;
+         if (top == 15) {
+            for (; i < end; i++) {
+               unsigned w = words[i];
+               named[w & 15]        = 1;
+               named[(w >> 4) & 15] = 1;
+               named[(w >> 8) & 15] = 1;
+               named[w >> 12]       = 1;
+            }
+         } else {
+            for (; i < end; i++) {
+               unsigned w = words[i];
+               named[w & 255] = 1;
+               named[w >> 8]  = 1;
+            }
+         }
+         if (named[0] && named[top])
+            break;
+      }
+
+      /* word_count > 0, so at least one entry is flagged and both walks stop */
+      first = 0;
+      while (!named[first])
+         first++;
+      last = top;
+      while (!named[last])
+         last--;
+      *out_min = first;
+      *out_max = last;
+      return true;
+   }
+
+   /* CRC32 over palette[min..max] inclusive. When min==0 and max==width-1 this
+    * equals the full-palette CRC, so a texture using its whole CLUT yields an
+    * identical hash/filename to the non-reduced path (packs stay interchangeable). */
+   static uint32_t hash_partial_palette(const uint16_t *palette, unsigned min, unsigned max) {
+      return crc32(0, (const unsigned char *)(palette + min), (size_t)(max - min + 1) * sizeof(uint16_t));
+   }
+
+   /* Effective palette hash for an upload-rect texture: reduced range (option on and
+    * a valid range) else full_hash. The [min,max] scan is memoised on the upload. */
+   static uint32_t texture_tracker_effective_palette_hash_upload(struct TextureTracker *self,
+         TextureUpload *upload, int mode, const uint16_t *palette, uint32_t full_hash) {
+      if (!self->reduce_palette_range || palette == NULL)
+         return full_hash;
+      if (upload->reduce_pal_mode != mode) {
+         unsigned lo, hi;
+         if (reduce_palette_bounds(upload->image, (size_t)upload->image_count, mode, &lo, &hi)) {
+            upload->reduce_pal_min = (int)lo;
+            upload->reduce_pal_max = (int)hi;
+         } else {
+            upload->reduce_pal_min = -1;
+         }
+         upload->reduce_pal_mode = mode;
+      }
+      if (upload->reduce_pal_min < 0)
+         return full_hash;
+      return hash_partial_palette(palette, (unsigned)upload->reduce_pal_min, (unsigned)upload->reduce_pal_max);
+   }
+
+   /* Page-aligned counterpart. The [min,max] scan over the page's index words (read
+    * from vram_mirror) is memoised in cached_page_bounds keyed by (rect, page_hash). */
+   static uint32_t texture_tracker_effective_palette_hash_page(struct TextureTracker *self,
+         TTRect page_rect, uint32_t page_hash, const uint16_t *palette, uint32_t full_hash) {
+      int mode;
+      int i;
+      CachedPageBounds *slot = NULL;
+      if (!self->reduce_palette_range || palette == NULL)
+         return full_hash;
+      /* Mode implied by page width: 64 = 4bpp, 128 = 8bpp (256 = direct colour). */
+      if (page_rect.width == 64)       mode = (int)TextureMode_Palette4bpp;
+      else if (page_rect.width == 128) mode = (int)TextureMode_Palette8bpp;
+      else                             return full_hash;
+
+      for (i = 0; i < self->cached_page_bounds_count; i++) {
+         if (rect_eq(&self->cached_page_bounds[i].rect, &page_rect)) {
+            slot = &self->cached_page_bounds[i];
+            break;
+         }
+      }
+      if (slot == NULL) {
+         if (self->cached_page_bounds_count == self->cached_page_bounds_cap) {
+            int ncap = self->cached_page_bounds_cap ? self->cached_page_bounds_cap * 2 : 16;
+            CachedPageBounds *nb = (CachedPageBounds*)realloc(self->cached_page_bounds,
+                  (size_t)ncap * sizeof(CachedPageBounds));
+            if (!nb)
+               return full_hash;
+            self->cached_page_bounds = nb;
+            self->cached_page_bounds_cap = ncap;
+         }
+         slot = &self->cached_page_bounds[self->cached_page_bounds_count++];
+         slot->rect = page_rect;
+         slot->hash = page_hash ^ 1u; /* guarantee a mismatch -> first compute */
+         slot->pal_min = -1;
+         slot->pal_max = -1;
+      }
+
+      if (slot->hash != page_hash) {
+         size_t n = (size_t)page_rect.width * page_rect.height;
+         uint16_t *words = (uint16_t*)malloc((n ? n : 1) * sizeof(uint16_t));
+         unsigned lo, hi;
+         unsigned j, x;
+         size_t k = 0;
+         if (!words)
+            return full_hash;
+         for (j = 0; j < page_rect.height; j++) {
+            unsigned vy = (page_rect.y + j) & (FB_HEIGHT - 1);
+            if (self->clut_rows[vy])
+               continue; /* CLUT rows hold palette data, not texture indices - skip the bounds scan */
+            for (x = 0; x < page_rect.width; x++) {
+               unsigned vx = (page_rect.x + x) & (FB_WIDTH - 1);
+               words[k++] = self->vram_mirror[vy * FB_WIDTH + vx];
+            }
+         }
+         if (reduce_palette_bounds(words, k, mode, &lo, &hi)) {
+            slot->pal_min = (int)lo;
+            slot->pal_max = (int)hi;
+         } else {
+            slot->pal_min = -1;
+            slot->pal_max = -1;
+         }
+         slot->hash = page_hash;
+         free(words);
+      }
+
+      if (slot->pal_min < 0)
+         return full_hash;
+      return hash_partial_palette(palette, (unsigned)slot->pal_min, (unsigned)slot->pal_max);
+   }
+
+   HdTextureHandle texture_tracker_get_hd_texture_index(struct TextureTracker *self,
+         TTRect rect,
+         UsedMode *mode,
+         unsigned int page_x,
+         unsigned int page_y,
+         bool *fastpath_capable_out,
+         bool *cache_hit){
+      TTRect palette_rect;
+      TTRect result_rect;
+      HdTextureHandle result;
+      (*fastpath_capable_out) = false;
+      palette_rect = make_rect(mode->palette_offset_x, mode->palette_offset_y, mode->mode == TextureMode_Palette8bpp ? 256 : 16, 1);
+
+      /* TODO: I'm pretty sure this doesn't handle TextureMode_ABGR1555 */
+
+      { uint32_t palette_hash = 0;
+      /* Reduce Palette Range needs the gathered CLUT data (not just its hash) to
+       * compute per-upload/per-page reduced hashes below. Copy it into a local
+       * because get_palette may return a pointer into the volatile palette_scratch. */
+      uint16_t pal_local[256];
+      bool have_pal_data = false;
+      (*cache_hit) = false;
+      if (self->hd_textures_enabled || self->dump_enabled) {
+         if (mode->mode == TextureMode_Palette8bpp || mode->mode == TextureMode_Palette4bpp) {
+            if (self->reduce_palette_range) {
+               Palette p = texture_tracker_get_palette(self, palette_rect);
+               if (p.data != NULL) {
+                  palette_hash = p.hash;
+                  memcpy(pal_local, p.data, (size_t)palette_rect.width * sizeof(uint16_t));
+                  have_pal_data = true;
+               }
+            } else {
+               palette_hash = texture_tracker_get_palette_hash(self, palette_rect);
+            }
+         }
+      }
+      if (self->hd_textures_enabled && !self->replacement_mode_pages) {
+         /* Check if the same texture as last time is used. (The handle cache stores
+          * non-fused upload-rect handles; page mode resolves its own way below.) */
+         HandleCacheResult cache_result = handle_lru_cache_get(&self->handle_cache, rect, palette_hash);
+         (*cache_hit) = cache_result.found;
+         if ((*cache_hit)) {
+            /* cache_result.handle is currently always a non-fused, non-none,
+             * index + palette_hash in the future it may be useful to cache
+             * none, but there's currently no way to check if such a containing
+             * rect is still alive (since HdTextureHandle's index would be -1) */
+            EnduringTextureRect *tex = &self->tracker.textures.a[cache_result.handle.index]; /* Forgive me */
+            if (tex->alive) {
+               /* Index by the handle's own palette hash (may be a reduced-range hash),
+                * not the draw's full palette_hash. */
+               uint32_t hh = cache_result.handle.palette_hash;
+               HdTexEntry *hce = hd_tex_map_find(&tex->texture_rect.upload->textures, hh);
+               (*fastpath_capable_out) = self->fastpath_enabled && (((hce ? hce->alpha_flags : 0) & ALPHA_FLAG_TRANSPARENT) == 0);
+               return cache_result.handle;
+            }
+         }
+      }
+
+      { static RectIndexSet overlap = { NULL, 0, 0 };
+      /* A page-match-only draw needs neither the overlap set nor the upload-rect
+       * dump loop, so skip the spatial query in that common case. */
+      bool need_overlap = self->dump_enabled || (self->hd_textures_enabled && !self->replacement_mode_pages);
+      if (need_overlap)
+         rect_tracker_overlapping(&self->tracker, rect, &overlap);
+
+      /* Dump texture (upload-rect). The two folders are independent, so "Both"
+       * mode collects both pack types in a single playthrough. */
+      if (self->dump_enabled && self->dump_mode_rect) {
+         int oi; for (oi = 0; oi < overlap.count; oi++) {
+            RectIndex index = overlap.items[oi];
+            TextureRect *tex = rect_tracker_get_index(&self->tracker, index);
+            DumpedMode _dm;
+            uint32_t dump_phash;
+            /* Reduce Palette Range: dump under the reduced hash (per-upload; falls
+             * back to the full hash when disabled or no valid range). */
+            dump_phash = have_pal_data
+               ? texture_tracker_effective_palette_hash_upload(self, tex->upload, (int)mode->mode, pal_local, palette_hash)
+               : palette_hash;
+            _dm.mode = mode->mode;
+            _dm.palette_hash = dump_phash;
+            texture_tracker_dump_texture(self, tex->upload, mode, _dm);
+         }
+      }
+      /* Dump texture (page-aligned): dump the WHOLE VRAM page once per
+       * (page_hash, palette_hash). Require a real dumpable tracked upload to overlap. */
+      if (self->dump_enabled && self->dump_mode_pages) {
+         bool dumpable = false;
+         int oi;
+         for (oi = 0; oi < overlap.count; oi++) {
+            TextureUpload *u = rect_tracker_get_index(&self->tracker, overlap.items[oi])->upload;
+            /* dump.cfg `pagemindump`: small uploads (text glyphs, map pixels, icon
+             * slots) are runtime compositing, not page content worth a page dump -
+             * require a substantial upload to trigger one. */
+            if (u->dumpable &&
+                (int)u->width  >= self->page_min_dump_w &&
+                (int)u->height >= self->page_min_dump_h) {
+               dumpable = true;
+               break;
+            }
+         }
+         if (dumpable && mode->mode != TextureMode_None) {
+            unsigned width
+               = mode->mode == TextureMode_Palette4bpp ? 64
+               : mode->mode == TextureMode_Palette8bpp ? 128
+               : 256;
+            TTRect page_rect = { 0, 0, 0, 0 };
+            uint32_t page_hash;
+            uint32_t page_phash;
+            HdTextureId page_id;
+            page_rect.x = page_x; page_rect.y = page_y; page_rect.width = width; page_rect.height = 256;
+            /* dump.cfg `pageignore`: runtime-composited regions (sprites, menu text,
+             * icon slots) churn page content by design - skip before hashing so
+             * ignored pages cost no CRC work. */
+            if (!texture_tracker_page_dump_ignored(self, page_rect)) {
+               page_hash = texture_tracker_hash_page_cached(self, page_rect);
+               /* Reduce Palette Range (page path): dump under the page's reduced hash. */
+               page_phash = have_pal_data
+                  ? texture_tracker_effective_palette_hash_page(self, page_rect, page_hash, pal_local, palette_hash)
+                  : palette_hash;
+               page_id.hash = page_hash; page_id.palette_hash = page_phash; page_id.pages = true;
+               if (!hd_key_set_contains(&self->dumped_pages, hd_pack_key(page_id))) {
+                  hd_key_set_insert(&self->dumped_pages, hd_pack_key(page_id));
+                  texture_tracker_dump_page(self, page_rect, page_hash, mode, page_phash);
+               }
+            }
+         }
+      }
+      if (self->frame_dump != NULL) {
+         if (self->frame_dump_need_comma) {
+            filestream_printf(self->frame_dump, ",");
+         } else {
+            self->frame_dump_need_comma = true;
+         }
+         filestream_printf(self->frame_dump, " { \"rect\": ");
+         output_rect_json(self->frame_dump, &rect);
+         filestream_printf(self->frame_dump,
+               ", \"mode\": { \"mode\": %d, \"palette_x\": %u, \"palette_y\": %u} }\n",
+               (int)mode->mode, mode->palette_offset_x, mode->palette_offset_y);
+      }
+
+      if (!self->hd_textures_enabled) {
+         (*fastpath_capable_out) = false;
+         return hd_handle_make_none();
+      }
+
+      /* Page-aligned replacement: match the whole VRAM page from the -pages pack
+       * instead of per-upload rects. Bypasses the overlap/fuse path. */
+      if (self->replacement_mode_pages) {
+         unsigned width;
+         TTRect page_rect = { 0, 0, 0, 0 };
+         uint32_t page_hash;
+         uint32_t page_phash;
+         HdTextureHandle page;
+         (*fastpath_capable_out) = false;
+         if (mode->mode == TextureMode_None)
+            return hd_handle_make_none();
+         width = mode->mode == TextureMode_Palette4bpp ? 64
+               : mode->mode == TextureMode_Palette8bpp ? 128 : 256;
+         page_rect.x = page_x; page_rect.y = page_y; page_rect.width = width; page_rect.height = 256;
+         page_hash = texture_tracker_hash_page_cached(self, page_rect);
+         /* Reduce Palette Range (page path): prefer the reduced hash only when a
+          * reduced page file exists, else keep the full hash (backward compatible). */
+         page_phash = palette_hash;
+         if (have_pal_data) {
+            uint32_t rh = texture_tracker_effective_palette_hash_page(self, page_rect, page_hash, pal_local, palette_hash);
+            if (rh != palette_hash) {
+               HdTextureId rid;
+               rid.hash = page_hash; rid.palette_hash = rh; rid.pages = true;
+               if (hd_key_set_contains(&self->known_files_pages, hd_pack_key(rid)))
+                  page_phash = rh;
+            }
+         }
+         page = texture_tracker_match_page(self, page_rect, page_hash, page_phash);
+         if (!hd_handle_is_none(&page) || !self->replacement_fallback)
+            return page;
+         /* Direction B fallback: page-aligned found no match. Page mode skipped the
+          * overlap query (need_overlap was false), so run it now for the upload-rect
+          * overlap/fuse loop below. */
+         rect_tracker_overlapping(&self->tracker, rect, &overlap);
+      }
+
+      result = hd_handle_make_none();
+
+      /* Pooled Lazy-sync pre-pass: dispatch EVERY unbound, uncached combo in
+       * the overlap set to the IO pool BEFORE the bind loop below blocks on
+       * the first one - a text line's dozen glyph misses then decode 4-wide
+       * behind a single wait instead of serially. Mirrors the bind loop's
+       * effective-hash (Reduce) resolution, which is memoised, so the double
+       * scan costs almost nothing. */
+      if (self->lazy_sync) {
+         int pi;
+         for (pi = 0; pi < overlap.count; pi++) {
+            RectIndex pindex = overlap.items[pi];
+            TextureRect *ptex = rect_tracker_get_index(&self->tracker, pindex);
+            uint32_t peff = palette_hash;
+            HdTextureId cid;
+            if (have_pal_data) {
+               uint32_t prh = texture_tracker_effective_palette_hash_upload(self, ptex->upload, (int)mode->mode, pal_local, palette_hash);
+               if (prh != palette_hash) {
+                  HdTextureId prid;
+                  prid.hash = ptex->upload->hash; prid.palette_hash = prh; prid.pages = false;
+                  if (hd_key_set_contains(&self->known_files, hd_pack_key(prid)))
+                     peff = prh;
+               }
+            }
+            if (hd_tex_map_contains(&ptex->upload->textures, peff))
+               continue; /* already bound to this upload */
+            cid.hash = ptex->upload->hash; cid.palette_hash = peff; cid.pages = false;
+            if (HdGpuCache_contains(&self->hd_gpu_cache, hd_pack_key(cid)) ||
+                  HdImageCache_contains(&self->hd_cache, hd_pack_key(cid)))
+               continue; /* a cache tier already holds it; the bind loop attaches it */
+            texture_tracker_want_combo(self, cid, true, false);
+         }
+      }
+
+      { int oi;
+      int bound_count = 0;
+      /* Iterate the ENTIRE overlap set before deciding single-vs-fused. This
+       * loop is the ONLY producer of upload-rect load requests in the Lazy
+       * modes, and it used to return the fused handle mid-loop at the second
+       * image-bearing upload - so in a draw spanning many uploads (e.g. a text
+       * line built from dozens of glyph uploads) every upload past that point
+       * was never requested, this frame or any later one: those replacements
+       * could never load (and Lazy-synchronous loaded exactly two per draw). */
+      for (oi = 0; oi < overlap.count; oi++) {
+         RectIndex index = overlap.items[oi];
+         TextureRect *tex = rect_tracker_get_index(&self->tracker, index);
+         uint32_t eff = palette_hash;
+         HdTexEntry *overlapped_image;
+         /* Reduce Palette Range: prefer this upload's reduced hash, but only if a
+          * reduced file exists on disk - else keep the full hash so existing
+          * full-palette packs still match with the option enabled. Memoised scan. */
+         if (have_pal_data) {
+            uint32_t rh = texture_tracker_effective_palette_hash_upload(self, tex->upload, (int)mode->mode, pal_local, palette_hash);
+            if (rh != palette_hash) {
+               HdTextureId rid;
+               rid.hash = tex->upload->hash; rid.palette_hash = rh; rid.pages = false;
+               if (hd_key_set_contains(&self->known_files, hd_pack_key(rid)))
+                  eff = rh;
+            }
+         }
+         overlapped_image = hd_tex_map_find(&tex->upload->textures, eff);
+         if (overlapped_image == NULL) {
+            /* Not bound to this upload yet. Bind it now: a GPU-cache hit binds
+             * in-frame (handle copy, used by THIS draw - no 1-self->frame
+             * native flicker), otherwise this schedules a decode / GPU upload
+             * that lands on a later self->frame. */
+            texture_tracker_request_hd_texture(self, tex->upload, eff);
+            overlapped_image = hd_tex_map_find(&tex->upload->textures, eff);
+         }
+         if (overlapped_image != NULL) {
+            bound_count++;
+            if (hd_handle_is_none(&result)) {
+               /* note that if tex->vram_rect contains rect, then it will be the only entry in overlap, so an early out would be pointless */
+               result_rect = fromSRect(tex->vram_rect);
+               (*fastpath_capable_out) = self->fastpath_enabled && fromSRect_contains(tex->vram_rect, rect) && (overlapped_image->alpha_flags & ALPHA_FLAG_TRANSPARENT) == 0;
+               result = hd_handle_make(index, eff);
+            }
+         }
+      }
+      if (bound_count >= 2) {
+         /* Multiple overlap, must fuse - decided AFTER the full request pass. */
+         unsigned int width
+            = mode->mode == TextureMode_Palette4bpp ? 64
+            : mode->mode == TextureMode_Palette8bpp ? 128
+            : 256;
+         TTRect page_rect = { page_x, page_y, width, 256 };
+         (*fastpath_capable_out) = false;
+         return fused_pages_get_or_make(&self->fused_pages, page_rect, palette_hash, &self->tracker,
+               self,
+               have_pal_data ? pal_local : NULL,
+               have_pal_data ? (unsigned)palette_rect.width : 0);
+      } }
+
+      /* Cross-mode fallback (Direction A): upload-rect found no HD match. Try the
+       * page-aligned (-pages) pack for this VRAM page before native. Gate on "no
+       * upload-rect FILE exists for this draw" so a texture whose replacement is just
+       * mid-load doesn't trigger a wasted page probe. Page handles are per-frame, so
+       * they MUST bypass handle_cache - return directly. */
+      if (self->replacement_fallback && !self->replacement_mode_pages && hd_handle_is_none(&result)
+            && mode->mode != TextureMode_None) {
+         bool upload_rect_has_file = false;
+         int oi;
+         for (oi = 0; oi < overlap.count; oi++) {
+            TextureRect *tex = rect_tracker_get_index(&self->tracker, overlap.items[oi]);
+            HdTextureId fid;
+            fid.hash = tex->upload->hash; fid.palette_hash = palette_hash; fid.pages = false;
+            if (hd_key_set_contains(&self->known_files, hd_pack_key(fid))) {
+               upload_rect_has_file = true;
+               break;
+            }
+            /* A reduced-range file counts too (don't trigger a wasted page probe). */
+            if (have_pal_data) {
+               uint32_t rh = texture_tracker_effective_palette_hash_upload(self, tex->upload, (int)mode->mode, pal_local, palette_hash);
+               if (rh != palette_hash) {
+                  HdTextureId rid;
+                  rid.hash = tex->upload->hash; rid.palette_hash = rh; rid.pages = false;
+                  if (hd_key_set_contains(&self->known_files, hd_pack_key(rid))) {
+                     upload_rect_has_file = true;
+                     break;
+                  }
+               }
+            }
+         }
+         if (!upload_rect_has_file) {
+            unsigned width = mode->mode == TextureMode_Palette4bpp ? 64
+                  : mode->mode == TextureMode_Palette8bpp ? 128 : 256;
+            TTRect page_rect = { 0, 0, 0, 0 };
+            uint32_t page_hash;
+            uint32_t page_phash;
+            HdTextureHandle page;
+            page_rect.x = page_x; page_rect.y = page_y; page_rect.width = width; page_rect.height = 256;
+            page_hash = texture_tracker_hash_page_cached(self, page_rect);
+            page_phash = palette_hash;
+            if (have_pal_data) {
+               uint32_t rh = texture_tracker_effective_palette_hash_page(self, page_rect, page_hash, pal_local, palette_hash);
+               if (rh != palette_hash) {
+                  HdTextureId rid;
+                  rid.hash = page_hash; rid.palette_hash = rh; rid.pages = true;
+                  if (hd_key_set_contains(&self->known_files_pages, hd_pack_key(rid)))
+                     page_phash = rh;
+               }
+            }
+            page = texture_tracker_match_page(self, page_rect, page_hash, page_phash);
+            if (!hd_handle_is_none(&page)) {
+               (*fastpath_capable_out) = false;
+               return page;
+            }
+         }
+      }
+
+      if (!hd_handle_is_none(&result))
+         handle_lru_cache_insert(&self->handle_cache, result_rect, palette_hash, result);
+      return result;
+      }
+      }
+   }
+
+   HdTexture texture_tracker_get_hd_texture(struct TextureTracker *self,
+         HdTextureHandle handle)
+   {
+      if (handle.page) {
+         /* Page-aligned replacement: resolve from this frame's page_bindings.
+          * vram_rect is the page in VRAM words; the shader maps it to the full
+          * image via (vram_rect, texel_rect={0,0,img_w,img_h}) - like the fused path. */
+         if (handle.index < 0 || handle.index >= self->page_bindings_count
+               || !ih_is_valid(&self->page_bindings[handle.index].texture)) {
+            HdTexture _r;
+            TT_LOG(RETRO_LOG_WARN, "stale page HdTextureHandle: %d\n", handle.index);
+            _r.vram_rect = (SRect){0, 0, 1, 1};
+            _r.texel_rect = (SRect){0, 0, (int)(tt_img_width(ih_get(&self->default_hd_texture))), (int)(tt_img_height(ih_get(&self->default_hd_texture)))};
+            _r.texture = tt_ih_owned_copy(&self->default_hd_texture); /* owned +1 (released by the consumer) */
+            return _r;
+         }
+         {
+            ReplacedPage *rp = &self->page_bindings[handle.index];
+            TTGpuImage *img = ih_get(&rp->texture);
+            HdTexture _r;
+            /* Reconstruct a counted handle from the cached image (add_reference + adopt). */
+            tt_img_addref(img);
+            _r.vram_rect = toSRect(rp->page_rect);
+            _r.texel_rect = (SRect){0, 0, (int)tt_img_width(img), (int)tt_img_height(img)};
+            _r.texture = img; /* +1 taken above */
+            return _r;
+         }
+      }
+      if (!handle.fused)
+      {
+         int scaleX;
+         ImageHandle image;
+         /* HdTextureHandle's are perhaps too tricky.  They assume that the
+          * RectTracker's textures vector hasn't removed anything since the
+          * handle was created. So it would seem all you need to do is, in
+          * renderer reset_queue, call the rect-tracker dead-handle release.
+          * Except you have to be very very careful that no handles outside of
+          * the queues (ie. local) exist across a call to reset_queue.  That is,
+          * the handle must go into the queue as soon as possible, otherwise
+          * that hd texture might not work (previously it would segfault). */
+         TextureRect *tex = rect_tracker_get_index(&self->tracker, handle.index);
+         if (tex == NULL) {
+            if (handle.index != -1) {
+               TT_LOG(RETRO_LOG_WARN, "stale HdTextureHandle: %d, %x\n", handle.index, handle.palette_hash);
+            }
+            {
+               HdTexture _r;
+               _r.vram_rect = (SRect){0, 0, 1, 1};
+               _r.texel_rect = (SRect){0, 0, (int)(tt_img_width(ih_get(&self->default_hd_texture))), (int)(tt_img_height(ih_get(&self->default_hd_texture)))};
+               _r.texture = tt_ih_owned_copy(&self->default_hd_texture); /* owned +1 (released by the consumer) */
+               return _r;
+            }
+         }
+         { TextureUpload *upload = tex->upload;
+         /* Use find rather than index, because if a stale HdTextureHandle was
+          * provided this could segfault because indexing on a key that isn't
+          * present would initialize a new one with a null pointer */
+         HdTexEntry *iter = hd_tex_map_find(&upload->textures, handle.palette_hash);
+         if (iter == NULL) {
+            TT_LOG(RETRO_LOG_WARN, "stale HdTextureHandle: %d, %x\n", handle.index, handle.palette_hash);
+            {
+               HdTexture _r;
+               _r.vram_rect = (SRect){0, 0, 1, 1};
+               _r.texel_rect = (SRect){0, 0, (int)(tt_img_width(ih_get(&self->default_hd_texture))), (int)(tt_img_height(ih_get(&self->default_hd_texture)))};
+               _r.texture = tt_ih_owned_copy(&self->default_hd_texture); /* owned +1 (released by the consumer) */
+               return _r;
+            }
+         }
+         /* Reconstruct a counted handle from the stored raw image
+          * (add_reference then adopt), matching hd_gpu_image_handle. */
+         tt_img_addref(iter->image);
+         image = ih_make(iter->image);
+         scaleX = tt_img_width(ih_get(&image)) / upload->width;
+         { int scaleY = tt_img_height(ih_get(&image)) / upload->height;
+         SRect texture_subrect = texture_rect_subrect(tex);
+         {
+            HdTexture _r;
+            _r.vram_rect = tex->vram_rect;
+            _r.texel_rect = (SRect){
+               texture_subrect.x * scaleX,
+               texture_subrect.y * scaleY,
+               texture_subrect.width * scaleX,
+               texture_subrect.height * scaleY
+            };
+            /* Move the owned reference built just above into the result; the
+             * local 'image' is not ih_reset, so the +1 ref from
+             * image_add_reference lives on in _r.texture; the retain here balances the
+             * eventual release at teardown. */
+            _r.texture = ih_get(&image);
+            return _r;
+         }
+         }
+         }
+      }
+      else
+         return fused_pages_get_from_handle(&self->fused_pages, handle, &self->default_hd_texture);
+   }
+
+static bool is_power_of_two(int n) {
+      /* https://stackoverflow.com/questions/108318/whats-the-simplest-way-to-test-whether-a-number-is-a-power-of-2-in-c */
+      return n != 0 && (n & (n - 1)) == 0;
+   }
+
+   /* ===== Page-aligned experiment + Lazy(sync) function definitions (PAGE_ALIGN.md) ===== */
+
+   /* CRC32 of a VRAM page rect read from the CPU mirror. Row-by-row incremental
+    * CRC is bit-identical to CRCing one gathered buffer, so it matches -pages
+    * dumps while avoiding a malloc+copy on the common (no x-wrap) path. */
+   /* A zeroed stand-in row for CLUT-row masking; wide enough for any page width
+    * (256 halfwords = direct-colour pages). */
+   static const uint16_t tt_zero_row[256] = {0};
+
+   static uint32_t texture_tracker_hash_page(struct TextureTracker *self, TTRect page_rect) {
+      uint32_t crc = 0;
+      self->dbg_page_hashes++;
+      if (page_rect.x + page_rect.width <= FB_WIDTH) {
+         unsigned j;
+         for (j = 0; j < page_rect.height; j++) {
+            unsigned vy = (page_rect.y + j) & (FB_HEIGHT - 1);
+            const uint16_t *row = &self->vram_mirror[vy * FB_WIDTH + page_rect.x];
+            if (self->clut_rows[vy])
+               row = tt_zero_row; /* dump.cfg CLUT row: hash as zeros so palette writes can't churn the page */
+            crc = crc32(crc, (const unsigned char*)row, page_rect.width * sizeof(uint16_t));
+         }
+         return crc;
+      }
+      {  /* rare x-wrap: gather then CRC */
+         uint16_t *vec = (uint16_t*)malloc((size_t)page_rect.width * page_rect.height * sizeof(uint16_t));
+         unsigned j, i;
+         size_t k = 0;
+         for (j = 0; j < page_rect.height; j++) {
+            unsigned vy = (page_rect.y + j) & (FB_HEIGHT - 1);
+            if (self->clut_rows[vy]) {
+               memset(vec + k, 0, (size_t)page_rect.width * sizeof(uint16_t));
+               k += page_rect.width;
+               continue;
+            }
+            for (i = 0; i < page_rect.width; i++) {
+               unsigned vx = (page_rect.x + i) & (FB_WIDTH - 1);
+               vec[k++] = self->vram_mirror[vy * FB_WIDTH + vx];
+            }
+         }
+         crc = crc32(0, (unsigned char*)vec, (size_t)page_rect.width * page_rect.height * sizeof(uint16_t));
+         free(vec);
+         return crc;
+      }
+   }
+
+   /* Memoized page hash: re-CRC only if the page was written since last hash AND
+    * not already refreshed this frame (caps busy regions to one re-hash/page/frame). */
+   static uint32_t texture_tracker_hash_page_cached(struct TextureTracker *self, TTRect page_rect) {
+      int i;
+      for (i = 0; i < self->cached_page_hashes_count; i++) {
+         CachedPageHash *c = &self->cached_page_hashes[i];
+         if (rect_eq(&c->rect, &page_rect)) {
+            if (c->dirty && c->hashed_frame != self->frame) {
+               c->hash = texture_tracker_hash_page(self, page_rect);
+               c->dirty = false;
+               c->hashed_frame = self->frame;
+            }
+            return c->hash;
+         }
+      }
+      {
+         uint32_t h = texture_tracker_hash_page(self, page_rect);
+         if (self->cached_page_hashes_count == self->cached_page_hashes_cap) {
+            int ncap = self->cached_page_hashes_cap ? self->cached_page_hashes_cap * 2 : 16;
+            self->cached_page_hashes = (CachedPageHash*)realloc(self->cached_page_hashes, (size_t)ncap * sizeof(CachedPageHash));
+            self->cached_page_hashes_cap = ncap;
+         }
+         {
+            CachedPageHash *c = &self->cached_page_hashes[self->cached_page_hashes_count++];
+            c->rect = page_rect; c->hash = h; c->dirty = false; c->hashed_frame = self->frame;
+         }
+         return h;
+      }
+   }
+
+   /* Drop (mark dirty) memoized page hashes whose page overlaps a written VRAM rect. */
+   static void texture_tracker_invalidate_page_hashes(struct TextureTracker *self, TTRect written) {
+      int i;
+      bool all;
+      if (self->cached_page_hashes_count == 0)
+         return;
+      all = (written.x + written.width > FB_WIDTH || written.y + written.height > FB_HEIGHT);
+      for (i = 0; i < self->cached_page_hashes_count; i++) {
+         if (all || rect_intersects(&self->cached_page_hashes[i].rect, &written))
+            self->cached_page_hashes[i].dirty = true;
+      }
+   }
+
+   /* --- VRAM mirror helpers. All x/y wrap to match the live VRAM access pattern. --- */
+   static void texture_tracker_mirror_store(struct TextureTracker *self, TTRect rect, const uint16_t *vram) {
+      unsigned j, i;
+      texture_tracker_invalidate_page_hashes(self, rect);
+      for (j = rect.y; j < rect.y + rect.height; j++) {
+         unsigned my = j & (FB_HEIGHT - 1);
+         for (i = rect.x; i < rect.x + rect.width; i++) {
+            unsigned mx = i & (FB_WIDTH - 1);
+            self->vram_mirror[my * FB_WIDTH + mx] = vram[my * FB_WIDTH + mx];
+         }
+      }
+   }
+   static void texture_tracker_mirror_blit(struct TextureTracker *self, TTRect dst, TTRect src) {
+      uint16_t *tmp;
+      unsigned j, i;
+      texture_tracker_invalidate_page_hashes(self, dst);
+      /* copy src to a temp first so overlapping src/dst can't read overwritten cells */
+      tmp = (uint16_t*)malloc((size_t)src.width * src.height * sizeof(uint16_t));
+      for (j = 0; j < src.height; j++) {
+         unsigned sy = (src.y + j) & (FB_HEIGHT - 1);
+         for (i = 0; i < src.width; i++) {
+            unsigned sx = (src.x + i) & (FB_WIDTH - 1);
+            tmp[j * src.width + i] = self->vram_mirror[sy * FB_WIDTH + sx];
+         }
+      }
+      for (j = 0; j < dst.height; j++) {
+         unsigned dy = (dst.y + j) & (FB_HEIGHT - 1);
+         for (i = 0; i < dst.width; i++) {
+            unsigned dx = (dst.x + i) & (FB_WIDTH - 1);
+            self->vram_mirror[dy * FB_WIDTH + dx] = tmp[j * dst.width + i];
+         }
+      }
+      free(tmp);
+   }
+   static void texture_tracker_mirror_fill(struct TextureTracker *self, TTRect rect, uint16_t value) {
+      unsigned j, i;
+      texture_tracker_invalidate_page_hashes(self, rect);
+      for (j = rect.y; j < rect.y + rect.height; j++) {
+         unsigned my = j & (FB_HEIGHT - 1);
+         for (i = rect.x; i < rect.x + rect.width; i++)
+            self->vram_mirror[my * FB_WIDTH + (i & (FB_WIDTH - 1))] = value;
+      }
+   }
+
+   /* Decode a FULL VRAM texture page from the mirror via the active palette and
+    * queue a PNG to <cd>-texture-dump-pages/. Snapshots raw words; the IO worker
+    * decodes off-thread (decode_dump_rgba). */
+   static void texture_tracker_dump_page(struct TextureTracker *self, TTRect page_rect, uint32_t page_hash, UsedMode *mode, uint32_t palette_hash) {
+      int shift;
+      int ppp;
+      uint16_t *palette = NULL;
+      char dir[PATH_MAX_TT];
+      char path[PATH_MAX_TT];
+      uint16_t *src;
+      size_t src_len;
+      unsigned j, i;
+      size_t k;
+      switch (mode->mode) {
+         case TextureMode_ABGR1555:    shift = 0; break;
+         case TextureMode_Palette8bpp: shift = 1; break;
+         case TextureMode_Palette4bpp: shift = 2; break;
+         case TextureMode_None:
+         default: return;
+      }
+      if (mode->mode == TextureMode_Palette4bpp || mode->mode == TextureMode_Palette8bpp) {
+         TTRect palette_rect = make_rect(mode->palette_offset_x, mode->palette_offset_y, mode->mode == TextureMode_Palette8bpp ? 256 : 16, 1);
+         Palette p = texture_tracker_get_palette(self, palette_rect);
+         if (p.data != NULL)
+            palette = p.data;
+      }
+      ppp = 1 << shift;
+      src_len = (size_t)page_rect.width * page_rect.height;
+      src = (uint16_t*)malloc((src_len ? src_len : 1) * sizeof(uint16_t));
+      k = 0;
+      for (j = 0; j < page_rect.height; j++) {
+         unsigned vy = (page_rect.y + j) & (FB_HEIGHT - 1);
+         for (i = 0; i < page_rect.width; i++) {
+            unsigned vx = (page_rect.x + i) & (FB_WIDTH - 1);
+            src[k++] = self->vram_mirror[vy * FB_WIDTH + vx];
+         }
+      }
+      dump_pages_path(dir, sizeof(dir));
+      {
+         static bool pages_dir_made = false;
+         if (!pages_dir_made) { ensure_directory(dir); pages_dir_made = true; }
+      }
+      if (mode->mode != TextureMode_ABGR1555 && palette == NULL)
+         snprintf(path, sizeof(path), "%s%x-missing.png", dir, (unsigned)page_hash);
+      else
+         snprintf(path, sizeof(path), "%s%x-%x.png", dir, (unsigned)page_hash, (unsigned)palette_hash);
+      {
+         IORequest *dump = (IORequest *)malloc(sizeof(IORequest));
+         dump->node.next = NULL;
+         dump->kind = IORequestKind_Dump;
+         snprintf(dump->path, sizeof(dump->path), "%s", path);
+         dump->width  = (int)(page_rect.width * ppp);
+         dump->height = (int)page_rect.height;
+         dump->pages  = true;
+         dump->dump_mode = (int)mode->mode;
+         dump->ppp    = ppp;
+         dump->src = src; dump->src_len = src_len;
+         if (palette != NULL) {
+            dump->palette_len = (size_t)(mode->mode == TextureMode_Palette8bpp ? 256 : 16);
+            dump->palette = (uint16_t*)malloc(dump->palette_len * sizeof(uint16_t));
+            memcpy(dump->palette, palette, dump->palette_len * sizeof(uint16_t));
+         } else {
+            dump->palette = NULL; dump->palette_len = 0;
+         }
+         tt_io_channel_push(self->iothread.channel, &dump->node, false);
+      }
+   }
+
+   /* Auto-create the dump/replacement folder(s) for the active features + modes at
+    * the HD-Texture-Folder location. Only mkdirs when the target path changes. */
+   void texture_tracker_ensure_directories(struct TextureTracker *self, bool dump, bool replace) {
+      char buf[PATH_MAX_TT];
+      if (retro_cd_base_name[0] == '\0')
+         return; /* no game loaded yet - paths would be malformed */
+      if (dump && self->dump_mode_rect) dump_path(buf, sizeof(buf)); else buf[0] = '\0';
+      if (strcmp(buf, self->ensured_dump_dir) != 0) {
+         if (buf[0]) ensure_directory(buf);
+         snprintf(self->ensured_dump_dir, sizeof(self->ensured_dump_dir), "%s", buf);
+      }
+      if (dump && self->dump_mode_pages) dump_pages_path(buf, sizeof(buf)); else buf[0] = '\0';
+      if (strcmp(buf, self->ensured_dump_pages_dir) != 0) {
+         if (buf[0]) ensure_directory(buf);
+         snprintf(self->ensured_dump_pages_dir, sizeof(self->ensured_dump_pages_dir), "%s", buf);
+      }
+      if (replace) {
+         if (self->replacement_mode_pages) replacements_pages_path(buf, sizeof(buf));
+         else                              replacements_path(buf, sizeof(buf));
+      } else buf[0] = '\0';
+      if (strcmp(buf, self->ensured_replace_dir) != 0) {
+         if (buf[0]) ensure_directory(buf);
+         snprintf(self->ensured_replace_dir, sizeof(self->ensured_replace_dir), "%s", buf);
+      }
+   }
+
+   /* Lazy (synchronous) upload-rect load: disk+decode+GPU upload+bind inline. */
+   static void texture_tracker_sync_load_combo(struct TextureTracker *self, TextureUpload *upload, uint32_t palette_hash) {
+      HdTextureId id;
+      CachedHdImage *cpu;
+      ImageHandle texture;
+      id.hash = upload->hash; id.palette_hash = palette_hash; id.pages = false;
+      cpu = HdImageCache_get(&self->hd_cache, hd_pack_key(id));
+      if (cpu != NULL) {
+         /* Pre-decoded (async response or journal prefetch). The safe-point
+          * attach pass dimension-checks before binding; this bind site must
+          * too, or a mismatched replacement binds unchecked. */
+         int cw = cpu->levels.count > 0 ? cpu->levels.levels[0].width : 0;
+         int ch = cpu->levels.count > 0 ? cpu->levels.levels[0].height : 0;
+         if (!(cw > 0 && cw % upload->width == 0 && is_power_of_two(cw / upload->width) &&
+               ch > 0 && ch % upload->height == 0 && is_power_of_two(ch / upload->height))) {
+            TT_LOG(RETRO_LOG_WARN, "Dimension mismatch (sync, cached) for %x-%x, original=%dx%d, replacement=%dx%d\n",
+                   id.hash, id.palette_hash, upload->width, upload->height, cw, ch);
+            HdImageCache_erase(&self->hd_cache, hd_pack_key(id));
+            hd_key_set_insert(&self->requested, hd_pack_key(id));
+            return;
+         }
+      }
+      if (cpu == NULL) {
+         char path[PATH_MAX_TT];
+         int alpha_flags = 0;
+         LoadedLevels levels;
+         TTStagingSource staging;
+         bool ok;
+         int width, height;
+         if (hd_key_set_contains(&self->requested, hd_pack_key(id)))
+            return;
+         if (!hd_key_set_contains(&self->known_files, hd_pack_key(id))) {
+            hd_key_set_insert(&self->requested, hd_pack_key(id));
+            return;
+         }
+         tt_staging_source_init(&staging, NULL);
+         ok = tt_load_replacement_levels(id.hash, id.palette_hash, false,
+               &levels, &alpha_flags, path, sizeof(path), &staging);
+         if (staging.spare)
+            tt_staging_release(staging.spare);
+         if (!ok) {
+            /* Same bounded retry as the async drain: a transient failure must
+             * not cost the combo the rest of the session, and a deterministic
+             * one must not be reattempted once per draw. Lazy (synchronous)
+             * previously wrote every failure off permanently, so the mode most
+             * sensitive to a missed load was also the one that never retried. */
+            TT_LOG(RETRO_LOG_ERROR, "sync load failed: %s\n", path);
+            if (hd_count_map_bump(&self->load_attempts, hd_pack_key(id)) >= TT_LOAD_MAX_ATTEMPTS) {
+               hd_key_set_insert(&self->requested, hd_pack_key(id));
+               hd_count_map_erase(&self->load_attempts, hd_pack_key(id));
+            }
+            return;
+         }
+         hd_count_map_erase(&self->load_attempts, hd_pack_key(id));
+         width  = levels.levels[0].width;
+         height = levels.levels[0].height;
+         if (!(width % upload->width == 0 && is_power_of_two(width / upload->width) &&
+               height % upload->height == 0 && is_power_of_two(height / upload->height))) {
+            TT_LOG(RETRO_LOG_WARN, "Dimension mismatch (sync) for %x-%x, original=%dx%d, replacement=%dx%d\n",
+                   id.hash, id.palette_hash, upload->width, upload->height, width, height);
+            loaded_levels_reset(&levels);
+            hd_key_set_insert(&self->requested, hd_pack_key(id));
+            return;
+         }
+         hd_image_cache_put(&self->hd_cache, id, &levels, alpha_flags);
+         self->dbg_responses_received++;
+         cpu = HdImageCache_get(&self->hd_cache, hd_pack_key(id));
+         if (cpu == NULL)
+            return; /* cache insert failed (allocation); retry on a later draw */
+      }
+      texture = ih_make(tt_upload_levels(&cpu->levels));
+      hd_gpu_cache_put(&self->hd_gpu_cache, id, texture, cpu->alpha_flags, cpu->bytes);
+      self->dbg_gpu_uploads++;
+      hd_tex_map_set(&upload->textures, palette_hash, ih_get(&texture), cpu->alpha_flags);
+      ih_reset(&texture);
+      self->dbg_attaches++;
+      {
+         int ti;
+         for (ti = 0; ti < self->tracker.textures.count; ti++) {
+            EnduringTextureRect *e = &self->tracker.textures.a[ti];
+            if (e->alive && e->texture_rect.upload == upload)
+               fused_pages_mark_dirty(&self->fused_pages, fromSRect(e->texture_rect.vram_rect));
+         }
+      }
+   }
+
+   /* Lazy-sync page load: disk+decode+GPU upload inline; lands in the shared cache
+    * keyed by {page_hash, palette, pages=true}; no per-upload bind. */
+   static void texture_tracker_sync_load_page(struct TextureTracker *self, HdTextureId id) {
+      CachedHdImage *cpu;
+      ImageHandle texture;
+      if (HdGpuCache_contains(&self->hd_gpu_cache, hd_pack_key(id)))
+         return;
+      cpu = HdImageCache_get(&self->hd_cache, hd_pack_key(id));
+      if (cpu == NULL) {
+         char path[PATH_MAX_TT];
+         int alpha_flags = 0;
+         LoadedLevels levels;
+         TTStagingSource staging;
+         bool ok;
+         if (hd_key_set_contains(&self->requested, hd_pack_key(id)))
+            return;
+         if (!hd_key_set_contains(&self->known_files_pages, hd_pack_key(id))) {
+            hd_key_set_insert(&self->requested, hd_pack_key(id));
+            return;
+         }
+         tt_staging_source_init(&staging, NULL);
+         ok = tt_load_replacement_levels(id.hash, id.palette_hash, true,
+               &levels, &alpha_flags, path, sizeof(path), &staging);
+         if (staging.spare)
+            tt_staging_release(staging.spare);
+         if (!ok) {
+            TT_LOG(RETRO_LOG_ERROR, "sync page load failed: %s\n", path);
+            hd_key_set_insert(&self->requested, hd_pack_key(id));
+            return;
+         }
+         hd_image_cache_put(&self->hd_cache, id, &levels, alpha_flags);
+         self->dbg_responses_received++;
+         cpu = HdImageCache_get(&self->hd_cache, hd_pack_key(id));
+         if (cpu == NULL)
+            return; /* cache insert failed (allocation); retry on a later draw */
+      }
+      texture = ih_make(tt_upload_levels(&cpu->levels));
+      hd_gpu_cache_put(&self->hd_gpu_cache, id, texture, cpu->alpha_flags, cpu->bytes);
+      ih_reset(&texture);
+      self->dbg_gpu_uploads++;
+   }
+
+   /* Draw-time page resolve: GPU-cache hit -> bind this frame; else load per the
+    * caching method (lazy_sync inline, else async high-priority) and native this frame. */
+   static HdTextureHandle texture_tracker_match_page(struct TextureTracker *self, TTRect page_rect, uint32_t page_hash, uint32_t palette_hash) {
+      HdTextureId id;
+      CachedGpuImage *gpu;
+      id.hash = page_hash; id.palette_hash = palette_hash; id.pages = true;
+      texture_tracker_journal_note(self, id);
+      gpu = HdGpuCache_get(&self->hd_gpu_cache, hd_pack_key(id));
+      if (gpu == NULL) {
+         if (self->lazy_sync) {
+            /* Pooled: dispatch (no-op if the journal already has it in
+             * flight) and wait on the pool instead of decoding inline; the
+             * wait banks every other in-flight page/rect while it blocks.
+             * Then promote the decoded levels CPU -> GPU for this draw. */
+            if (HdImageCache_contains(&self->hd_cache, hd_pack_key(id))) {
+               texture_tracker_sync_load_page(self, id);
+               gpu = HdGpuCache_get(&self->hd_gpu_cache, hd_pack_key(id));
+            } else {
+               texture_tracker_want_combo(self, id, true, true);
+               if (texture_tracker_sync_wait_combo(self, id)) {
+                  texture_tracker_sync_load_page(self, id);
+                  gpu = HdGpuCache_get(&self->hd_gpu_cache, hd_pack_key(id));
+               }
+            }
+         } else if (HdImageCache_contains(&self->hd_cache, hd_pack_key(id))) {
+            /* Decoded (typically a journal-prefetched page whose GPU promotion
+             * hasn't happened yet). Lazy (async): budgeted inline promote so
+             * THIS frame's draw binds it - the deferred path was a guaranteed
+             * 1-frame native flash per page state. Over budget, and always in
+             * Eager, the stock safe-point attach (BASE key, so the page attach
+             * pass can unpack). */
+            if (!self->eager_textures &&
+                  self->inline_uploads_this_frame < TT_INLINE_UPLOAD_BUDGET) {
+               self->inline_uploads_this_frame++;
+               self->dbg_inline_uploads++;
+               texture_tracker_sync_load_page(self, id);
+               gpu = HdGpuCache_get(&self->hd_gpu_cache, hd_pack_key(id));
+            } else
+               hd_key_set_insert(&self->pending_attach_pages, ((uint64_t)id.hash << 32) | (uint64_t)id.palette_hash);
+         } else {
+            texture_tracker_want_combo(self, id, true, true); /* on-demand page disk load (high priority) */
+         }
+      }
+      if (gpu == NULL) {
+         self->dbg_page_miss++;
+         return hd_handle_make_none(); /* native this frame */
+      }
+      if (self->page_bindings_count == self->page_bindings_cap) {
+         int ncap = self->page_bindings_cap ? self->page_bindings_cap * 2 : 16;
+         self->page_bindings = (ReplacedPage*)realloc(self->page_bindings, (size_t)ncap * sizeof(ReplacedPage));
+         self->page_bindings_cap = ncap;
+      }
+      {
+         ReplacedPage *rp = &self->page_bindings[self->page_bindings_count];
+         rp->page_rect = page_rect;
+         rp->texture = hd_gpu_image_handle(gpu); /* +1 counted handle owned by page_bindings */
+         rp->alpha_flags = gpu->alpha_flags;
+      }
+      self->dbg_page_binds++;
+      {
+         int idx = self->page_bindings_count;
+         self->page_bindings_count++;
+         return hd_handle_make_page((RectIndex)idx, palette_hash);
+      }
+   }
+
+   /* Release every per-upload HD binding (upload->textures). Each entry holds an
+    * image_add_reference on a GPU-cache image, so persistent bindings would pin VRAM
+    * outside the budget. Clearing them per frame (below) makes the budgeted GPU cache
+    * the sole persistent VRAM owner: the draw path re-binds on-screen combos each
+    * frame via request_hd_texture -> HdGpuCache_get (which touches the LRU), so drawn
+    * textures stay hot and off-screen ones age out and free their VRAM. */
+   static void texture_tracker_clear_all_upload_bindings(struct TextureTracker *self) {
+      int _ti;
+      int _rri;
+      for (_ti = 0; _ti < self->tracker.textures.count; _ti++)
+         hd_tex_map_clear(&self->tracker.textures.a[_ti].texture_rect.upload->textures);
+      for (_rri = 0; _rri < rrvec_size(&self->restorable_rects); _rri++) {
+         RestorableRect *restorable = &self->restorable_rects.items[_rri];
+         int _tri;
+         for (_tri = 0; _tri < ownedrects_size(&restorable->to_restore); _tri++)
+            hd_tex_map_clear(&restorable->to_restore.v.items[_tri].upload->textures);
+      }
+   }
+
+   /* Drop ALL resident HD state and free its VRAM (GPU + RAM caches, in-flight/pending
+    * loads, page bindings, per-upload bindings, fused pages). Used when HD replacement
+    * is turned off so VRAM is reclaimed immediately (does NOT re-scan folders). */
+   void texture_tracker_flush_hd_state(struct TextureTracker *self) {
+      int i;
+      TTRect _mdr;
+      texture_tracker_clear_all_upload_bindings(self);
+      HdGpuCache_clear(&self->hd_gpu_cache);
+      HdImageCache_clear(&self->hd_cache);
+      hd_key_set_clear(&self->requested);
+      hd_key_set_clear(&self->inflight);
+      hd_key_set_clear(&self->pending_attach);
+      hd_key_set_clear(&self->pending_attach_pages);
+      hd_count_map_clear(&self->load_attempts);
+      hd_count_map_clear(&self->attach_retries);
+      /* HD is being turned off: persist the journal and reset its session
+       * state so a later re-enable records/predicts from a clean chain. */
+      tt_journal_save_file(&self->journal);
+      hd_key_set_clear(&self->journal_seen);
+      hd_key_set_clear(&self->journal_walked);
+      self->journal_prev_valid = false;
+      /* The per-draw handle cache memoizes (rect, mode) -> handle; with the
+       * upload bindings cleared above those handles now resolve to the 1x1
+       * default texture. Without this clear, re-enabling Replace Textures
+       * kept serving the stale memoized handles instead of re-running the
+       * load/attach path, leaving placeholder textures on screen. */
+      handle_lru_cache_clear(&self->handle_cache);
+      for (i = 0; i < self->page_bindings_count; i++)
+         ih_reset(&self->page_bindings[i].texture);
+      self->page_bindings_count = 0;
+      _mdr.x = 0; _mdr.y = 0; _mdr.width = FB_WIDTH; _mdr.height = FB_HEIGHT;
+      fused_pages_mark_dead(&self->fused_pages, _mdr);
+      fused_pages_remove_dead(&self->fused_pages); /* actually free the fused-page VRAM now */
+   }
+
+   /* TEMPORARY: */
+   void texture_tracker_on_queues_reset(struct TextureTracker *self) {
+      uint64_t up0 = self->dbg_gpu_uploads; /* GPU uploads done by THIS reset (per-frame burst detector) */
+      handle_lru_cache_clear(&self->handle_cache);
+      /* page handles don't survive a queue reset (same contract as handle_cache) */
+      { int i; for (i = 0; i < self->page_bindings_count; i++) ih_reset(&self->page_bindings[i].texture); }
+      self->page_bindings_count = 0;
+      /* NOTE: upload->textures bindings are intentionally NOT cleared here. They hold
+       * a shared (ref-counted) copy of the cache's image - not separate VRAM - so
+       * clearing them per frame frees no VRAM, adds heavy re-attach churn, and breaks
+       * handle resolution across a mid-frame queue flush (stale-handle floods). They
+       * are released only on eviction/reload/flush. */
+      rect_tracker_releaseDeadHandles(&self->tracker); /* This is called from reset_queue, so as of now no HdTextureHandle's exist */
+
+      /* Poll HD uploads (shared with the pooled Lazy-sync wait). */
+      texture_tracker_drain_responses(self);
+
+      /* Attach pass: for every wanted combo whose base hash is currently
+       * resident, bind an HD image to it. Prefer the GPU cache (a ref-counted
+       * handle copy - no upload); otherwise build the image from the CPU cache
+       * and store it in the GPU cache. Combos whose hash isn't resident yet
+       * stay cached (NOT discarded) and attach on a later self->frame. */
+      {
+         int pi;
+         int kept = 0;
+         for (pi = 0; pi < self->pending_attach.count; pi++) {
+            int height;
+            int width;
+            HdTextureId id;
+            id.hash = (uint32_t)(self->pending_attach.keys[pi] >> 32);
+            id.palette_hash = (uint32_t)self->pending_attach.keys[pi];
+            id.pages = false;
+            { TextureUpload *upload = texture_tracker_find_upload(self, id.hash); /* borrowed */
+            if (upload == NULL) {
+               /* Not resident yet: RETAIN the marker (in place, order kept) so
+                * the combo attaches when its hash returns to VRAM. The
+                * wholesale clear below used to discard these - a response
+                * draining while its upload was momentarily dead (constant for
+                * recycling text rows) lost its attach forever.
+                *
+                * Retention needs two ceilings, because a retained marker is by
+                * definition one that misses texture_tracker_find_upload, and a
+                * miss walks every rect of every restorable entry: drop it once
+                * the image leaves both caches, and drop it after
+                * TT_ATTACH_MAX_RETRIES passes so a marker whose upload never
+                * returns cannot pin that scan for the rest of the session. A
+                * dropped marker is not a lost binding - the next draw of that
+                * combo hits the cache and re-arms it. */
+               if ((HdGpuCache_contains(&self->hd_gpu_cache, hd_pack_key(id)) ||
+                     HdImageCache_contains(&self->hd_cache, hd_pack_key(id))) &&
+                     hd_count_map_bump(&self->attach_retries, hd_pack_key(id)) < TT_ATTACH_MAX_RETRIES)
+                  self->pending_attach.keys[kept++] = self->pending_attach.keys[pi];
+               else
+                  hd_count_map_erase(&self->attach_retries, hd_pack_key(id));
+               continue;
+            }
+            hd_count_map_erase(&self->attach_retries, hd_pack_key(id));
+            if (hd_tex_map_contains(&upload->textures, id.palette_hash))
+               continue; /* already attached */
+
+            /* Tier 1: ready-to-bind GPU image - just copy the handle. */
+            { CachedGpuImage *gpu = HdGpuCache_get(&self->hd_gpu_cache, hd_pack_key(id));
+            if (gpu != NULL) {
+               hd_tex_map_set(&upload->textures, id.palette_hash, gpu->image, gpu->alpha_flags);
+               self->dbg_attaches++;
+               { int _ti; for (_ti = 0; _ti < self->tracker.textures.count; _ti++)
+               {
+                  EnduringTextureRect *e = &self->tracker.textures.a[_ti];
+                  if (e->alive && e->texture_rect.upload == upload)
+                     fused_pages_mark_dirty(&self->fused_pages, fromSRect(e->texture_rect.vram_rect));
+               } }
+               continue;
+            }
+
+            /* Tier 2: decoded CPU levels - upload to GPU, then cache the image. */
+            { CachedHdImage *cached = HdImageCache_get(&self->hd_cache, hd_pack_key(id));
+            if (cached == NULL)
+               continue; /* evicted from both caches; will be re-self->requested on draw */
+
+            width = cached->levels.levels[0].width;
+            height = cached->levels.levels[0].height;
+            if (width  % upload->width  == 0 && is_power_of_two(width  / upload->width) &&
+                  height % upload->height == 0 && is_power_of_two(height / upload->height))
+            {
+               ImageHandle texture = ih_make(tt_upload_levels(&cached->levels));
+               hd_gpu_cache_put(&self->hd_gpu_cache, id, texture, cached->alpha_flags, cached->bytes);
+               hd_tex_map_set(&upload->textures, id.palette_hash, ih_get(&texture), cached->alpha_flags);
+               /* Both caches above retain their own reference; drop the
+                * upload_texture producer reference held by this local. */
+               ih_reset(&texture);
+               self->dbg_gpu_uploads++;
+               self->dbg_attaches++;
+               { int _ti; for (_ti = 0; _ti < self->tracker.textures.count; _ti++) {
+                  EnduringTextureRect *e = &self->tracker.textures.a[_ti];
+                  if (e->alive && e->texture_rect.upload == upload)
+                     fused_pages_mark_dirty(&self->fused_pages, fromSRect(e->texture_rect.vram_rect));
+               } }
+            } else {
+               TT_LOG(RETRO_LOG_WARN, "Dimension mismatch for %x-%x, original=%dx%d, replacement=%dx%d\n",
+                     id.hash, id.palette_hash, upload->width, upload->height, width, height);
+               HdImageCache_erase(&self->hd_cache, hd_pack_key(id)); /* don't keep a bad-sized image around */
+               hd_key_set_insert(&self->requested, hd_pack_key(id)); /* negatively cache so we don't reload + re-warn every self->frame */
+            }
+            }
+            }
+            }
+         }
+         self->pending_attach.count = kept; /* attached/evicted/mismatched dropped; unresident retained */
+      }
+
+      /* Page attach pass: page combos have no TextureUpload to bind to - they're
+       * resolved at draw time from the GPU cache. So this only promotes decoded CPU
+       * levels into the GPU cache; match_page binds from there on a later frame. (No
+       * dimension check: the page binding maps vram_rect to the image proportionally.)
+       * pending_attach_pages stores BASE keys; rebuild the salted id to hit the cache. */
+      {
+         int pi;
+         for (pi = 0; pi < self->pending_attach_pages.count; pi++) {
+            HdTextureId id;
+            CachedHdImage *cached;
+            id.hash = (uint32_t)(self->pending_attach_pages.keys[pi] >> 32);
+            id.palette_hash = (uint32_t)self->pending_attach_pages.keys[pi];
+            id.pages = true;
+            if (HdGpuCache_contains(&self->hd_gpu_cache, hd_pack_key(id)))
+               continue; /* already resident */
+            cached = HdImageCache_get(&self->hd_cache, hd_pack_key(id));
+            if (cached == NULL)
+               continue; /* evicted before upload; re-requested on next draw */
+            {
+               ImageHandle texture = ih_make(tt_upload_levels(&cached->levels));
+               hd_gpu_cache_put(&self->hd_gpu_cache, id, texture, cached->alpha_flags, cached->bytes);
+               ih_reset(&texture); /* gpu cache holds the surviving ref */
+               self->dbg_gpu_uploads++;
+            }
+         }
+      }
+      hd_key_set_clear(&self->pending_attach_pages);
+
+      fused_pages_rebuild_dirty(&self->fused_pages, &self->tracker, self);
+      fused_pages_evict(&self->fused_pages);      /* LRU-evict to budget (marks dead) */
+      fused_pages_remove_dead(&self->fused_pages); /* free the marked-dead pages' VRAM */
+
+      {
+         uint64_t this_reset_uploads = self->dbg_gpu_uploads - up0;
+         if (this_reset_uploads > self->dbg_gpu_uploads_peak)
+            self->dbg_gpu_uploads_peak = this_reset_uploads;
+      }
+   }
+   static TextureUpload *texture_tracker_find_upload(struct TextureTracker *self, uint32_t hash) {
+      TextureUpload *upload = rect_tracker_find_upload(&self->tracker, hash); /* borrowed */
+      int _ri;
+
+      if (upload != NULL)
+         return upload;
+
+      /* backup search, in case it's restorable but currently missing from the rect tracker */
+      for (_ri = 0; _ri < rrvec_size(&self->restorable_rects); _ri++)
+      {
+         RestorableRect *entry = &self->restorable_rects.items[_ri];
+         size_t _ti;
+         for (_ti = 0; _ti < ownedrects_size(&entry->to_restore); _ti++)
+         {
+            TextureRect *t = &entry->to_restore.v.items[_ti];
+            if (hash == t->upload->hash)
+               return t->upload;
+         }
+      }
+
+      return NULL;
+   }
+
+   /* Defined in libretro.c; declared here so endFrame() can post an OSD toast on the
+    * ']' HD-replacement toggle (the cbs header is #included far below this point). */
+   extern retro_environment_t environ_cb;
+
+   void texture_tracker_endFrame(struct TextureTracker *self) {
+      self->frame += 1;
+
+      /* Answer the workers' requests for upload memory now rather than at
+       * the next queue reset, so a decode that finished during the frame is
+       * not left waiting through the present. */
+      texture_tracker_drain_responses(self);
+
+      /* Re-arm the inline-upload budget for the next frame's draws. */
+      self->inline_uploads_this_frame = 0;
+
+      /* Journal housekeeping - only while a Lazy mode is replacing textures
+       * (see texture_tracker_journal_active); otherwise nothing below runs. */
+      if (texture_tracker_journal_active(self)) {
+         /* Consume the outcome of the last background save. A failure means
+          * the links are still unsaved: re-dirty and back the next attempt
+          * off ~5 minutes, so a locked file can never become a periodic
+          * rewrite loop (that loop, run inline, was the ~10s audio stutter). */
+         int save_result = retro_atomic_exchange_int(&tt_journal_io_result, 0);
+         if (save_result < 0) {
+            self->journal.dirty = true;
+            self->journal_save_backoff = 18000; /* ~5 min at 60fps */
+            self->journal_saved_frame = self->frame;
+         } else if (save_result > 0) {
+            self->journal_save_backoff = 0;
+         }
+
+         /* Persist newly recorded links every ~10s (snapshot here, file I/O
+          * on the writer thread) so a crash keeps most of the training; the
+          * synchronous save also runs at teardown, reload, and mode/HD-off. */
+         if (self->journal.dirty &&
+               self->frame - self->journal_saved_frame >= 600 + (uint64_t)self->journal_save_backoff) {
+            texture_tracker_journal_save_async(self);
+            self->journal_saved_frame = self->frame;
+         }
+
+         /* Re-arm the prediction-walk gate periodically so replayed
+          * deterministic content (attract-mode loops, revisited scenes)
+          * prefetches again after the caches have moved on; between clears
+          * each origin walks only once. */
+         if (self->frame % 900 == 0)
+            hd_key_set_clear(&self->journal_walked);
+      }
+
+      if (self->frame % 300 == 0)
+      {
+         TT_LOG_VERBOSE(RETRO_LOG_INFO, "hit ratio: %f (%ld, %ld)\n", (double)(self->handle_cache.dbg_hits) / (self->handle_cache.dbg_hits + self->handle_cache.dbg_misses), self->handle_cache.dbg_hits, self->handle_cache.dbg_misses);
+         self->handle_cache.dbg_hits = 0;
+         self->handle_cache.dbg_misses = 0;
+         TT_LOG(RETRO_LOG_INFO, "[hdcache] last 300f: %llu decodes, %llu gpu-uploads (peak %llu/frame), %llu attaches\n",
+               (unsigned long long)(self->dbg_responses_received - self->dbg_responses_received_last),
+               (unsigned long long)(self->dbg_gpu_uploads - self->dbg_gpu_uploads_last),
+               (unsigned long long)self->dbg_gpu_uploads_peak,
+               (unsigned long long)(self->dbg_attaches - self->dbg_attaches_last));
+         TT_LOG(RETRO_LOG_INFO, "[hdcache] mode=%s ; replace=%s ; ram %zu/%zu MB (%zu entries) ; vram %zu/%zu MB (%zu entries)\n",
+               self->eager_textures ? "eager" : (self->lazy_sync ? "lazy-sync" : "lazy"),
+               self->replacement_mode_pages ? "page" : "upload-rect",
+               HdImageCache_size_bytes(&self->hd_cache) / (1024 * 1024), HdImageCache_budget(&self->hd_cache) / (1024 * 1024), HdImageCache_count(&self->hd_cache),
+               HdGpuCache_size_bytes(&self->hd_gpu_cache) / (1024 * 1024), HdGpuCache_budget(&self->hd_gpu_cache) / (1024 * 1024), HdGpuCache_count(&self->hd_gpu_cache));
+         {  /* Fused-page composites are a separate VRAM tier NOT counted in the vram figure above. */
+            int64_t _fused_bytes = 0;
+            int _fi;
+            for (_fi = 0; _fi < fused_page_vec_size(&self->fused_pages.pages); _fi++)
+               _fused_bytes += page_bytes(&fused_page_vec_at(&self->fused_pages.pages, _fi)->fusion);
+            TT_LOG(RETRO_LOG_INFO, "[hdcache] fused: %d pages, %.1f MiB\n",
+                  fused_page_vec_size(&self->fused_pages.pages), _fused_bytes / 1048576.0);
+         }
+         if (self->replacement_mode_pages || self->replacement_fallback) {
+            TT_LOG(RETRO_LOG_INFO, "[hdcache] pages(%s): %llu binds, %llu native-misses, %llu page-CRCs (last 300f); memo %d entries\n",
+                  self->replacement_mode_pages ? "mode" : "fallback",
+                  (unsigned long long)(self->dbg_page_binds - self->dbg_page_binds_last),
+                  (unsigned long long)(self->dbg_page_miss - self->dbg_page_miss_last),
+                  (unsigned long long)(self->dbg_page_hashes - self->dbg_page_hashes_last),
+                  self->cached_page_hashes_count);
+         }
+         TT_LOG(RETRO_LOG_INFO, "[hdcache] prefetch: journal %u links; last 300f: %llu predicted loads, %llu inline uploads, %llu pool waits (%llu timeouts)\n",
+               (unsigned)self->journal.count,
+               (unsigned long long)(self->dbg_prefetch_issued - self->dbg_prefetch_issued_last),
+               (unsigned long long)(self->dbg_inline_uploads - self->dbg_inline_uploads_last),
+               (unsigned long long)(self->dbg_pool_waits - self->dbg_pool_waits_last),
+               (unsigned long long)(self->dbg_pool_wait_timeouts - self->dbg_pool_wait_timeouts_last));
+         self->dbg_responses_received_last = self->dbg_responses_received;
+         self->dbg_gpu_uploads_last = self->dbg_gpu_uploads;
+         self->dbg_gpu_uploads_peak = 0;
+         self->dbg_attaches_last = self->dbg_attaches;
+         self->dbg_page_binds_last = self->dbg_page_binds;
+         self->dbg_page_miss_last = self->dbg_page_miss;
+         self->dbg_page_hashes_last = self->dbg_page_hashes;
+         self->dbg_prefetch_issued_last = self->dbg_prefetch_issued;
+         self->dbg_inline_uploads_last = self->dbg_inline_uploads;
+         self->dbg_pool_waits_last = self->dbg_pool_waits;
+         self->dbg_pool_wait_timeouts_last = self->dbg_pool_wait_timeouts;
+      }
+
+      if (self->frame_dump != NULL) {
+         filestream_printf(self->frame_dump, "]}\n");
+         filestream_close(self->frame_dump);
+         self->frame_dump = NULL;
+      }
+
+      if (dbg_input_state_cb != 0)
+      {
+         if (dbg_hotkey_query(&self->frame_dump_key))
+         {
+            char fdpath[PATH_MAX_TT];
+            dump_path(fdpath, sizeof(fdpath));
+            snprintf(fdpath + strlen(fdpath), sizeof(fdpath) - strlen(fdpath), "test_dump.json");
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "Left bracket!\n");
+            self->frame_dump = filestream_open(fdpath, RETRO_VFS_FILE_ACCESS_WRITE,
+                  RETRO_VFS_FILE_ACCESS_HINT_NONE);
+            self->frame_dump_need_comma = false;
+            if (self->frame_dump != NULL)
+            {
+               bool need_comma = false;
+               int _eti;
+               filestream_printf(self->frame_dump, "{ \"initial\": [\n");
+               for (_eti = 0; _eti < self->tracker.textures.count; _eti++)
+               {
+                  EnduringTextureRect *etexture = &self->tracker.textures.a[_eti];
+                  TTRect rect;
+                  TextureRect *texture;
+                  if (!etexture->alive) continue;
+                  texture = &etexture->texture_rect;
+                  if (need_comma)
+                     filestream_printf(self->frame_dump, ",");
+                  else
+                     need_comma = true;
+                  filestream_printf(self->frame_dump, " { \"rect\": ");
+                  rect = fromSRect(texture->vram_rect);
+                  output_rect_json(self->frame_dump, &rect);
+                  filestream_printf(self->frame_dump, ", \"hash\": \"%x\" }\n", texture->upload->hash);
+               }
+               filestream_printf(self->frame_dump, "], \"events\": [\n");
+            }
+         }
+
+         if (dbg_hotkey_query(&self->hd_toggle_key)) {
+            /* Snapshot HD VRAM-cache stats BEFORE any flush, so toggling OFF reports
+             * what was actually resident. Shown ON-SCREEN (bypasses RetroArch's core
+             * log-level filtering) and doubles as a build-freshness check: if you see
+             * this new "cache .../... MB" format, the VRAM-fix build is definitely live. */
+            size_t vram_used   = HdGpuCache_size_bytes(&self->hd_gpu_cache) / (1024 * 1024);
+            size_t vram_budget = HdGpuCache_budget(&self->hd_gpu_cache) / (1024 * 1024);
+            size_t vram_count  = HdGpuCache_count(&self->hd_gpu_cache);
+            int    fused_count = fused_page_vec_size(&self->fused_pages.pages);
+            self->hd_textures_enabled = !self->hd_textures_enabled;
+            tt_replace_latch_toggle(&tt_replace, self->hd_textures_enabled);
+            if (!self->hd_textures_enabled)
+               texture_tracker_flush_hd_state(self); /* free HD VRAM immediately when turned off */
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "Toggling hd textures: %s\n", self->hd_textures_enabled ? "on" : "off");
+            if (environ_cb) {
+               static char hd_msgbuf[256];
+               struct retro_message msg;
+               snprintf(hd_msgbuf, sizeof(hd_msgbuf),
+                     "HD %s | cache %lu/%lu MB, %lu tex, %d fused",
+                     self->hd_textures_enabled ? "ON" : "OFF",
+                     (unsigned long)vram_used, (unsigned long)vram_budget,
+                     (unsigned long)vram_count, fused_count);
+               msg.msg    = hd_msgbuf;
+               msg.frames = 300; /* ~5s at 60fps */
+               environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
+            }
+         }
+
+         if (dbg_hotkey_query(&self->reload_key)) {
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "Reloading hd textures from disk\n");
+            texture_tracker_reload_textures_from_disk(self);
+         }
+
+         if (dbg_hotkey_query(&self->fastpath_key)) {
+            self->fastpath_enabled = !self->fastpath_enabled;
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "Toggling fastpath %s\n", self->fastpath_enabled ? "ON" : "OFF");
+         }
+      }
+   }
+
+   void texture_tracker_reload_textures_from_disk(struct TextureTracker *self) {
+      char rpath[PATH_MAX_TT];
+      char cfg[PATH_MAX_TT];
+      /* Reload the directory listing */
+      read_texture_directory(&self->known_files, replacements_path(rpath, sizeof(rpath)), false);
+      TT_LOG_VERBOSE(RETRO_LOG_INFO, "Found %d hd textures\n", (int)self->known_files.count);
+
+      /* Page-aligned experiment: reload the -pages listing too. */
+      read_texture_directory(&self->known_files_pages, replacements_pages_path(rpath, sizeof(rpath)), true);
+
+      /* Re-read the dump-ignore list from the (possibly relocated) dump folder. */
+      dump_path(cfg, sizeof(cfg));
+      snprintf(cfg + strlen(cfg), sizeof(cfg) - strlen(cfg), "/dump.cfg");
+      self->dump_ignore_count = parse_config_file(cfg, self->dump_ignore, DUMP_IGNORE_MAX);
+      memset(self->clut_rows, 0, sizeof(self->clut_rows));
+      self->clut_rows_count = parse_clut_rows_config(cfg, self->clut_rows, FB_HEIGHT);
+      self->page_ignore_count = parse_page_ignore_config(cfg, self->page_ignore, PAGE_IGNORE_MAX);
+      self->page_min_dump_w = 0; self->page_min_dump_h = 0;
+      parse_page_min_dump_config(cfg, &self->page_min_dump_w, &self->page_min_dump_h);
+
+      /* Drop all cached / loaded HD state so edited files on disk take effect. */
+      HdGpuCache_clear(&self->hd_gpu_cache);
+      HdImageCache_clear(&self->hd_cache);
+      hd_key_set_clear(&self->requested);
+      hd_key_set_clear(&self->inflight);
+      hd_key_set_clear(&self->pending_attach);
+      hd_key_set_clear(&self->pending_attach_pages);
+      hd_count_map_clear(&self->load_attempts);
+      hd_count_map_clear(&self->attach_retries);
+      /* Persist the journal, then reset only its SESSION state (seen/walked/
+       * chain tail) - the trained successor map itself survives reloads; the
+       * cleared caches mean everything re-records and re-predicts cleanly. */
+      tt_journal_save_file(&self->journal);
+      hd_key_set_clear(&self->journal_seen);
+      hd_key_set_clear(&self->journal_walked);
+      self->journal_prev_valid = false;
+      self->cached_page_hashes_count = 0;
+      self->cached_page_bounds_count = 0;
+      { int _ti; for (_ti = 0; _ti < self->tracker.textures.count; _ti++) {
+         EnduringTextureRect *texture = &self->tracker.textures.a[_ti];
+         hd_tex_map_clear(&texture->texture_rect.upload->textures);
+      } }
+      {
+      int _rri;
+      for (_rri = 0; _rri < rrvec_size(&self->restorable_rects); _rri++)
+      {
+         RestorableRect *restorable = &self->restorable_rects.items[_rri];
+         {
+            int _tri;
+            for (_tri = 0; _tri < ownedrects_size(&restorable->to_restore); _tri++) {
+               TextureRect *tr = &restorable->to_restore.v.items[_tri];
+               hd_tex_map_clear(&tr->upload->textures);
+            }
+         }
+      }
+      }
+
+      /* Delete fused textures */
+      {
+         TTRect _mdr;
+         _mdr.x = 0;
+         _mdr.y = 0;
+         _mdr.width = FB_WIDTH;
+         _mdr.height = FB_HEIGHT;
+         fused_pages_mark_dead(&self->fused_pages, _mdr);
+      }
+
+      /* Draws will lazily re-request and the cache repopulates. */
+   }
+
+   /* RectTracker */
+
+   static bool intersects(SRect a, SRect b) {
+      return !(
+            srect_left(&a) >= srect_right(&b) ||
+            srect_left(&b) >= srect_right(&a) ||
+            srect_top(&a) >= srect_bottom(&b) ||
+            srect_top(&b) >= srect_bottom(&a)
+         );
+   }
+
+   static SRect bounds(int left, int right, int top, int bottom) {
+      return make_srect(left, top, right - left, bottom - top);
+   }
+
+   static void split(SRect original,
+         SRect remove,
+         SRect *results,
+         unsigned *count)
+   {
+      SRect intersection;
+      SRectResult intersectionResult = intersect(original, remove);
+      if (!intersectionResult.valid)
+      {
+         results[(*count)++] = original;
+         return;
+      }
+
+      intersection = intersectionResult.rect;
+
+      /* Top rect */
+      if (srect_top(&intersection) > srect_top(&original)) {
+         results[(*count)++] = bounds(
+               srect_left(&original),
+               srect_right(&original),
+               srect_top(&original),
+               srect_top(&intersection)
+               );
+      }
+
+      /* Bottom rect */
+      if (srect_bottom(&intersection) < srect_bottom(&original)) {
+         results[(*count)++] = bounds(
+               srect_left(&original),
+               srect_right(&original),
+               srect_bottom(&intersection),
+               srect_bottom(&original)
+               );
+      }
+
+      /* Left rect */
+      if (srect_left(&intersection) > srect_left(&original)) {
+         results[(*count)++] = bounds(
+               srect_left(&original),
+               srect_left(&intersection),
+               srect_top(&intersection),
+               srect_bottom(&intersection)
+               );
+      }
+
+      /* Right rect */
+      if (srect_right(&intersection) < srect_right(&original)) {
+         results[(*count)++] = bounds(
+               srect_right(&intersection),
+               srect_right(&original),
+               srect_top(&intersection),
+               srect_bottom(&intersection)
+               );
+      }
+   }
+
+   static void rect_tracker_upload(struct RectTracker *self,
+         SRect rect,
+         TextureUpload *upload){
+      TextureRect texture = make_texture_rect(upload, 0, 0, rect);
+      rect_tracker_place(self, texture);
+      self->lookup_grid_dirty = true;
+   }
+
+   static SRect moved(SRect rect, int dx, int dy) {
+      return make_srect(rect.x + dx, rect.y + dy, rect.width, rect.height);
+   }
+
+   static void rect_tracker_blit(struct RectTracker *self,
+         SRect dst,
+         SRect src){
+      TextureRectVec to_place = { NULL, 0, 0 };
+      int moveX = dst.x - src.x;
+      int moveY = dst.y - src.y;
+      int _ti;
+      for (_ti = 0; _ti < self->textures.count; _ti++) {
+         EnduringTextureRect *eold = &self->textures.a[_ti];
+         if (eold->alive) {
+            TextureRect *old = &eold->texture_rect;
+            SRectResult intersection = intersect(old->vram_rect, src);
+            if (intersection.valid) {
+               TextureRect sub = subTexture(*old, intersection.rect);
+               TextureRect subMoved = make_texture_rect(sub.upload, sub.offset_x, sub.offset_y, moved(sub.vram_rect, moveX, moveY));
+               TextureRectVec_push(&to_place, &subMoved);
+            }
+         }
+      }
+      rect_tracker_clear_rect(self, &dst);
+      {
+         int _i;
+         for (_i = 0; _i < TextureRectVec_size(&to_place); _i++)
+            rect_tracker_place(self, *TextureRectVec_at(&to_place, _i));
+      }
+      TextureRectVec_free_storage(&to_place);
+      self->lookup_grid_dirty = true;
+   }
+
+   static void rect_tracker_releaseDeadHandles(struct RectTracker *self)
+   {
+      enduring_arr_compact(&self->textures);
+      self->lookup_grid_dirty = true;
+   }
+
+   static RectIndexSet *rect_tracker_overlapping(struct RectTracker *self,
+         TTRect uvrect,
+         RectIndexSet *results)
+   {
+      SRect rect;
+      if (self->lookup_grid_dirty)
+         rect_tracker_rebuild_lookup_grid(self);
+
+      /* TODO: remove this when renderer/build_attribs doesn't
+       * have an unnecessary - 1 */
+      if (uvrect.width == 0)
+         uvrect.width = 1;
+
+      rect = toSRect(uvrect);
+
+      rect_index_set_clear(results);
+      lookup_grid_get(&self->lookup_grid, rect, results);
+      return results;
+   }
+
+   static TextureRect *rect_tracker_get_index(struct RectTracker *self,
+         RectIndex index)
+   {
+      if (index < 0 || index >= self->textures.count)
+         return NULL;
+      return &self->textures.a[index].texture_rect;
+   }
+
+   static void rect_tracker_clear_rect(struct RectTracker *self, SRect *rect) {
+      SRect splits[4];
+      unsigned splits_count = 0;
+      int ti, ni;
+
+      TextureRectVec newTextures = { NULL, 0, 0 };
+      for (ti = 0; ti < self->textures.count; ti++) {
+         EnduringTextureRect *eold = &self->textures.a[ti];
+         if (eold->alive) {
+            TextureRect *old = &eold->texture_rect;
+
+            splits_count = 0;
+            split(old->vram_rect, *rect, splits, &splits_count);
+            /* The rect didn't split, do nothing */
+            if (splits_count == 1 && srect_eq(&splits[0], &old->vram_rect)) { }
+            else
+            {
+               /* The rect split, mark this texture as dead and push its splits to be added */
+               unsigned i;
+               eold->alive = false;
+               for (i = 0; i < splits_count; i++)
+                  {
+                     TextureRect _tr = subTexture(*old, splits[i]);
+                     TextureRectVec_push(&newTextures, &_tr);
+                  }
+            }
+         }
+      }
+      for (ni = 0; ni < newTextures.count; ni++)
+         enduring_arr_push(&self->textures, newTextures.items[ni], true);
+      TextureRectVec_free_storage(&newTextures);
+   }
+   static void rect_tracker_place(struct RectTracker *self,
+         TextureRect texture){
+      rect_tracker_clear_rect(self, &texture.vram_rect);
+      enduring_arr_push(&self->textures, texture, true);
+      /* The other mutators (upload/blit/clear) flag the spatial grid; place
+       * did not, so rects re-placed by the readback-restore path were invisible
+       * to rect_tracker_overlapping for the rest of the frame - a fully-cached
+       * sprite could draw native right after a restore. */
+      self->lookup_grid_dirty = true;
+   }
+
+   static void rect_tracker_rebuild_lookup_grid(struct RectTracker *self) {
+      int i;
+      lookup_grid_clear(&self->lookup_grid);
+      for (i = 0; i < self->textures.count; i++)
+      {
+         if (self->textures.a[i].alive)
+            lookup_grid_insert(&self->lookup_grid, self->textures.a[i].texture_rect.vram_rect, i);
+      }
+      self->lookup_grid_dirty = false;
+   }
+
+   static TextureUpload *rect_tracker_find_upload(struct RectTracker *self,
+         uint32_t hash){
+      int i;
+      for (i = 0; i < self->textures.count; i++)
+      {
+         EnduringTextureRect *eold = &self->textures.a[i];
+         if (eold->texture_rect.upload->hash == hash)
+            return eold->texture_rect.upload;
+      }
+      return NULL;
+   }
+
+static int clamp(int x, int low, int high)
+   {
+      if (x < low)  x = low;
+      if (x > high) x = high;
+      return x;
+   }
+
+   struct CellBounds
+   {
+      int lowX;
+      int highX; /* exclusive */
+      int lowY;
+      int highY; /* exclusive */
+   };
+
+   static CellBounds cellBounds(SRect vram) {
+      {
+         CellBounds _cb;
+         _cb.lowX  = clamp(srect_left(&vram) / LOOKUP_CELL_WIDTH, 0, LOOKUP_GRID_COLUMNS);
+         _cb.highX = clamp(ceil(srect_right(&vram) / (float)(LOOKUP_CELL_WIDTH)), 0, LOOKUP_GRID_COLUMNS);
+         _cb.lowY  = clamp(srect_top(&vram) / LOOKUP_CELL_HEIGHT, 0, LOOKUP_GRID_ROWS);
+         _cb.highY = clamp(ceil(srect_bottom(&vram) / (float)(LOOKUP_CELL_HEIGHT)), 0, LOOKUP_GRID_ROWS);
+         return _cb;
+      }
+   }
+
+   static void lookup_grid_init(LookupGrid *g) {
+      int i;
+      for (i = 0; i < LOOKUP_GRID_COLUMNS * LOOKUP_GRID_ROWS; i++) {
+         g->cells[i].entries = NULL;
+         g->cells[i].count = 0;
+         g->cells[i].cap = 0;
+      }
+   }
+
+   static void lookup_grid_deinit(LookupGrid *g) {
+      int i;
+      for (i = 0; i < LOOKUP_GRID_COLUMNS * LOOKUP_GRID_ROWS; i++)
+         free(g->cells[i].entries);
+   }
+
+   static void lookup_grid_insert(LookupGrid *self, SRect r, RectIndex index)
+   {
+      CellBounds c = cellBounds(r);
+      int x, y;
+      for (x = c.lowX; x < c.highX; x++) {
+         for (y = c.lowY; y < c.highY; y++) {
+            Cell *cell = &self->cells[y * LOOKUP_GRID_COLUMNS + x];
+            if (cell->count == cell->cap) {
+               int ncap = cell->cap ? cell->cap * 2 : 8;
+               LookupEntry *ne = (LookupEntry *)realloc(cell->entries, (size_t)ncap * sizeof(LookupEntry));
+               if (!ne)
+                  return;
+               cell->entries = ne;
+               cell->cap = ncap;
+            }
+            cell->entries[cell->count].rect = r;
+            cell->entries[cell->count].index = index;
+            cell->count++;
+         }
+      }
+   }
+
+   static void lookup_grid_get(LookupGrid *self, SRect r, RectIndexSet *results)
+   {
+      CellBounds c = cellBounds(r);
+      int x, y;
+      for (x = c.lowX; x < c.highX; x++)
+      {
+         for (y = c.lowY; y < c.highY; y++)
+         {
+            Cell *cell = &self->cells[y * LOOKUP_GRID_COLUMNS + x];
+            int e;
+            for (e = 0; e < cell->count; e++)
+            {
+               if (intersects(cell->entries[e].rect, r))
+                  rect_index_set_insert(results, cell->entries[e].index);
+            }
+         }
+      }
+   }
+   static void lookup_grid_clear(LookupGrid *self)
+   {
+      int i;
+      for (i = 0; i < LOOKUP_GRID_COLUMNS * LOOKUP_GRID_ROWS; i++)
+         self->cells[i].count = 0; /* keep allocation for reuse */
+   }
+
+   /* FusedPages */
+
+static int64_t page_bytes(FusionRects *fusion)
+   {
+      return fusion->scaleX * fusion->scaleY * fusion->vram_rect.width * fusion->vram_rect.height * 4;
+   }
+
+   static void fused_pages_dbg_print_info(struct FusedPages *self) {
+      int64_t num_bytes = 0;
+      int _i;
+      for (_i = 0; _i < fused_page_vec_size(&self->pages); _i++)
+         num_bytes += page_bytes(&fused_page_vec_at(&self->pages, _i)->fusion);
+      TT_LOG_VERBOSE(RETRO_LOG_INFO, "Fused Pages: %lu, Bytes: %ld (%.1f MiB)\n", (unsigned long)fused_page_vec_size(&self->pages), num_bytes, num_bytes / 1048576.0);
+   }
+
+   static bool srect_gt(const struct SRect *a, const struct SRect *b)
+   {
+      if (a->x != b->x)
+         return a->x > b->x;
+      if (a->y != b->y)
+         return a->y > b->y;
+      if (a->width != b->width)
+         return a->width > b->width;
+      return a->height > b->height;
+   }
+
+   static bool texture_rect_sort_gt(const struct TextureRect *a,
+         const struct TextureRect *b){
+      /* Compare .upload by pointer */
+      if (a->upload != b->upload)
+         return a->upload > b->upload;
+      if (!srect_eq(&a->vram_rect, &b->vram_rect))
+         return srect_gt(&a->vram_rect, &b->vram_rect);
+      {
+         SRect _sa = texture_rect_subrect(a);
+         SRect _sb = texture_rect_subrect(b);
+         return srect_gt(&_sa, &_sb);
+      }
+   }
+
+   /* qsort comparator: descending order, matching texture_rect_sort_gt. Equal
+    * elements (fully identical under the predicate) are interchangeable, so the
+    * unstable order among them does not affect the canonical-form comparison
+    * this sort exists to enable. */
+   static int texture_rect_qsort_cmp(const void *pa, const void *pb) {
+      const TextureRect *a = (const TextureRect *)(pa);
+      const TextureRect *b = (const TextureRect *)(pb);
+      if (texture_rect_sort_gt(a, b))
+         return -1;
+      if (texture_rect_sort_gt(b, a))
+         return 1;
+      return 0;
+   }
+
+   /* Per-upload effective palette hash for the FUSED-page path: the same
+    * reduced-range resolution the single-upload draw path applies (reduced hash
+    * preferred only when that replacement file exists, else the full hash), so
+    * a fused page finds/blits the images the draw path actually bound. Mode is
+    * implied by the fused page's width (64 = 4bpp, 128 = 8bpp). Without this,
+    * composited multi-upload draws (e.g. SotN's end-credits letter lines, built
+    * from dozens of 12x16 glyph uploads drawn by one 240x16 line prim) bind
+    * nothing when Reduce Palette Range is enabled: the images sit in
+    * upload->textures under reduced hashes while the fusion looked up only the
+    * full hash. */
+   static uint32_t fused_effective_palette_hash(TextureTracker *tt,
+         TextureUpload *upload,
+         unsigned page_width,
+         const uint16_t *pal_data,
+         unsigned pal_count,
+         uint32_t full_hash){
+      int mode;
+      uint32_t rh;
+      HdTextureId rid;
+      if (tt == NULL || !tt->reduce_palette_range || pal_data == NULL || pal_count == 0)
+         return full_hash;
+      if (page_width == 64)
+         mode = (int)TextureMode_Palette4bpp;
+      else if (page_width == 128)
+         mode = (int)TextureMode_Palette8bpp;
+      else
+         return full_hash;                     /* direct colour: no palette */
+      if (mode == (int)TextureMode_Palette8bpp && pal_count < 256)
+         return full_hash;
+      if (mode == (int)TextureMode_Palette4bpp && pal_count < 16)
+         return full_hash;
+      rh = texture_tracker_effective_palette_hash_upload(tt, upload, mode, pal_data, full_hash);
+      if (rh == full_hash)
+         return full_hash;
+      /* Same gating as the draw path: prefer the reduced hash only when a
+       * reduced-range file exists, so full-palette packs keep matching. */
+      rid.hash = upload->hash;
+      rid.palette_hash = rh;
+      rid.pages = false;
+      if (hd_key_set_contains(&tt->known_files, hd_pack_key(rid)))
+         return rh;
+      return full_hash;
+   }
+
+   static void fusion_rects(struct FusionRects *out,
+         TTRect full_page_rect,
+         uint32_t palette_hash,
+         struct RectTracker *tracker,
+         TextureTracker *tt,
+         const uint16_t *pal_data,
+         unsigned pal_count){
+      int _ei;
+      struct FusionRects *f = out;
+      fusionrects_init(f);
+
+      for (_ei = 0; _ei < tracker->textures.count; _ei++) {
+         EnduringTextureRect *e = &tracker->textures.a[_ei];
+         SRectResult intersection;
+         if (!e->alive)
+            continue;
+         intersection = intersect(toSRect(full_page_rect), e->texture_rect.vram_rect);
+         if (intersection.valid) {
+            TextureUpload *upload = e->texture_rect.upload;
+            uint32_t eff = fused_effective_palette_hash(tt, upload,
+                  (unsigned)full_page_rect.width, pal_data, pal_count, palette_hash);
+            HdTexEntry *hd_texture = hd_tex_map_find(&upload->textures, eff);
+            if (hd_texture != NULL) {
+               TTRect r;
+               /* Clip to the destination texture (important, otherwise it might blit out of bounds which may have wrought havoc upon my sanity) */
+               TextureRect clipped = subTexture(e->texture_rect, intersection.rect);
+               unsigned hd_scale_x = tt_img_width(hd_texture->image) / upload->width;
+               unsigned hd_scale_y = tt_img_height(hd_texture->image) / upload->height;
+               f->scaleX = max_(f->scaleX, hd_scale_x);
+               f->scaleY = max_(f->scaleY, hd_scale_y);
+               r = fromSRect(clipped.vram_rect);
+               if (f->vram_rect.width == 0)
+                  f->vram_rect = r;
+               else
+                  rect_extend_bounding_box(&f->vram_rect, &r);
+               ownedrects_push(&f->rects, clipped);
+            }
+         }
+      }
+
+      /* Sort rects so that the vector itself can be compared */
+      qsort(TextureRectVec_data(&f->rects.v), TextureRectVec_size(&f->rects.v), sizeof(TextureRect), texture_rect_qsort_cmp);
+
+   }
+
+   static void rebuild_page(FusedPage *page,
+         struct RectTracker *tracker,
+         TextureTracker *tt){
+      int texture_width;
+      TT_LOG_VERBOSE(RETRO_LOG_INFO, "Rebuilding page for %x, %d,%d %dx%d\n",
+            page->palette,
+            page->fusion.vram_rect.x,
+            page->fusion.vram_rect.y,
+            page->fusion.vram_rect.width,
+            page->fusion.vram_rect.height
+               );
+
+      page->dirty = false;
+      page->rebuilt_frame = tt ? tt->frame : (uint64_t)-1;
+
+      {
+         FusionRects fusion;
+         fusion_rects(&fusion, page->full_page_rect, page->palette, tracker, tt,
+               page->pal_count ? page->pal_data : NULL, page->pal_count);
+         if (fusionrects_eq(&page->fusion, &fusion)) {
+            TT_LOG_VERBOSE(RETRO_LOG_INFO, "Rebuilt page: no change\n");
+            fusionrects_destroy(&fusion);
+            return;
+         }
+         fusionrects_move(&page->fusion, &fusion);
+         fusionrects_destroy(&fusion);
+      }
+
+      if (ownedrects_size(&page->fusion.rects) == 0) {
+         page->dead = true;
+         ih_reset(&page->texture);
+         TT_LOG_VERBOSE(RETRO_LOG_INFO, "Rebuilt page: page is now dead\n");
+         return;
+      }
+
+      texture_width = page->fusion.vram_rect.width * page->fusion.scaleX;
+      { int texture_height = page->fusion.vram_rect.height * page->fusion.scaleY;
+
+      int mip_levels = log2(min_(page->fusion.scaleX, page->fusion.scaleY)) + 1;
+
+      /* page_begin returns a cleared (0,0,0,1-sentinel) transfer target,
+       * reusing the existing image when its dimensions still match (same
+       * handle back, no reference change) or creating a fresh one (+1 ref
+       * owned by us; the stale one is released below). The sentinel clear
+       * will not bleed into neighbors in the mipmaps, because the mipmaps
+       * are only used down to the original resolution, and hd textures are
+       * aligned to that original resolution's texels. */
+      {
+         TTGpuImage *cur = ih_get(&page->texture);
+         TTGpuImage *target = tt_backend.page_begin(tt_backend.ctx, cur,
+               texture_width, texture_height, mip_levels);
+         if (target != cur)
+            ih_move(&page->texture, ih_make(target));
+      }
+
+      /* Second pass to blit all the existing textures into the new texture */
+      {
+      int _fri;
+      for (_fri = 0; _fri < ownedrects_size(&page->fusion.rects); _fri++) {
+         TTGpuImage * image;
+         TextureRect *tex = &page->fusion.rects.v.items[_fri];
+         TextureUpload *upload = tex->upload;
+
+         HdTexEntry *hd_texture = hd_tex_map_find(&upload->textures,
+               fused_effective_palette_hash(tt, upload,
+                     (unsigned)page->full_page_rect.width,
+                     page->pal_count ? page->pal_data : NULL,
+                     page->pal_count, page->palette));
+         /* That's odd */
+         if (hd_texture == NULL)
+            continue;
+
+         image = hd_texture->image;
+
+         { int srcWidth = tt_img_width(image);
+         int srcHeight = tt_img_height(image);
+
+         int sx = srcWidth / upload->width;
+         int sy = srcHeight / upload->height;
+
+         int rx = page->fusion.scaleX / sx;
+         int ry = page->fusion.scaleY / sy;
+
+         SRect subrect = texture_rect_subrect(tex);
+
+         /* Blit into every mipmap level down to base vram. The backend
+          * replays the level-0 rects across the page's mip chain (source
+          * level = max(0, dstLevel - full_res_levels), source rect shifted
+          * per source level, destination rect halved per destination
+          * level) exactly like the old inline Vulkan loop. TODO: this
+          * isn't a great way to do this, will probably be blurrier than it
+          * could be if src and dst aspect ratios are different. */
+         {
+            TTPageBlit blit;
+            blit.dst_x = (tex->vram_rect.x - (int)(page->fusion.vram_rect.x)) * (int)(page->fusion.scaleX);
+            blit.dst_y = (tex->vram_rect.y - (int)(page->fusion.vram_rect.y)) * (int)(page->fusion.scaleY);
+            blit.dst_w = tex->vram_rect.width * (int)(page->fusion.scaleX);
+            blit.dst_h = tex->vram_rect.height * (int)(page->fusion.scaleY);
+            blit.src_x = sx * subrect.x;
+            blit.src_y = sy * subrect.y;
+            blit.src_w = sx * subrect.width;
+            blit.src_h = sy * subrect.height;
+            blit.full_res_levels = log2(max_(rx, ry)) + 1;
+            tt_backend.page_blit(tt_backend.ctx, ih_get(&page->texture), image, &blit);
+         }
+         }
+      }
+      }
+
+      /* Make the fused texture readable by shaders */
+      tt_backend.page_end(tt_backend.ctx, ih_get(&page->texture));
+
+      TT_LOG_VERBOSE(RETRO_LOG_INFO, "Rebuilt page: page now %ux%u, %ld bytes (%.1f MiB)\n",
+            page->fusion.vram_rect.width * page->fusion.scaleX, page->fusion.vram_rect.height * page->fusion.scaleY,
+            page_bytes(&page->fusion), page_bytes(&page->fusion) / 1048576.0
+               );
+      }
+   }
+
+   static HdTexture fused_pages_get_from_handle(struct FusedPages *self,
+         HdTextureHandle handle,
+         ImageHandle *default_hd_texture){
+      FusedPage *page;
+      if (handle.index < 0 || handle.index >= fused_page_vec_size(&self->pages)) {
+         HdTexture _r;
+         TT_LOG(RETRO_LOG_WARN, "BAD fused index!\n");
+         _r.vram_rect = (SRect){0, 0, 1, 1};
+         _r.texel_rect = (SRect){0, 0, (int)(tt_img_width(ih_get(default_hd_texture))), (int)(tt_img_height(ih_get(default_hd_texture)))};
+         _r.texture = tt_ih_owned_copy(default_hd_texture); /* owned +1 (released by the consumer) */
+         return _r;
+      }
+      page = fused_page_vec_at(&self->pages, handle.index);
+      if (!ih_is_valid(&page->texture)) {
+         HdTexture _r;
+         TT_LOG(RETRO_LOG_WARN, "Missing fused texture!\n");
+         _r.vram_rect = (SRect){0, 0, 1, 1};
+         _r.texel_rect = (SRect){0, 0, (int)(tt_img_width(ih_get(default_hd_texture))), (int)(tt_img_height(ih_get(default_hd_texture)))};
+         _r.texture = tt_ih_owned_copy(default_hd_texture); /* owned +1 (released by the consumer) */
+         return _r;
+      }
+      {
+         HdTexture _r;
+         _r.vram_rect = toSRect(page->fusion.vram_rect);
+         _r.texel_rect = (SRect){ 0, 0, (int)(tt_img_width(ih_get(&page->texture))), (int)(tt_img_height(ih_get(&page->texture))) };
+         _r.texture = tt_ih_owned_copy(&page->texture); /* owned +1 (released by the consumer) */
+         return _r;
+      }
+   }
+
+   static HdTextureHandle fused_pages_get_or_make(struct FusedPages *self,
+         TTRect page_rect,
+         uint32_t palette,
+         struct RectTracker *tracker,
+         TextureTracker *tt,
+         const uint16_t *pal_data,
+         unsigned pal_count){
+      int x;
+      FusedPage page;
+      if (pal_count > 256)
+         pal_count = 256;
+      for (x = 0; x < fused_page_vec_size(&self->pages); x++)
+      {
+         FusedPage *p = fused_page_vec_at(&self->pages, x);
+         /* return page */
+         if (!p->dead && p->palette == palette && rect_eq(&p->full_page_rect, &page_rect)) {
+            if (p->pal_count == 0 && pal_data != NULL && pal_count > 0) {
+               /* Page predates the palette snapshot (e.g. Reduce Palette Range
+                * toggled mid-session): adopt it and re-fuse so per-upload
+                * reduced hashes resolve. */
+               memcpy(p->pal_data, pal_data, (size_t)pal_count * sizeof(uint16_t));
+               p->pal_count = pal_count;
+               rebuild_page(p, tracker, tt);
+            }
+            /* Serve the page FRESH - but at most ONE rebuild per page per
+             * frame. The first serve of a frame rebuilds a dirty page (so
+             * bindings made since last frame show without a native flash, even
+             * in Lazy-sync); later same-frame serves of a re-dirtied page keep
+             * the image stable instead of clearing+re-blitting it while
+             * earlier draws of this frame still reference it (streaming text
+             * dirties a page per typed character - rebuilding per mutation
+             * produced transient partial composites = flicker). Re-dirtied
+             * pages catch up at the next safe point or next frame's first
+             * serve. rebuild_page early-outs via fusionrects_eq if unchanged. */
+            if (p->dirty && (tt == NULL || p->rebuilt_frame != tt->frame))
+               rebuild_page(p, tracker, tt);
+            p->last_used = ++self->tick; /* touch LRU */
+            return hd_handle_make_fused(x);
+         }
+      }
+
+      /* Make a new fused page */
+      TT_LOG_VERBOSE(RETRO_LOG_INFO, "Creating new fused page for palette %x\n", palette);
+
+      /* `page` is a raw stack FusedPage: its handle/heap-owning members MUST be
+       * initialised before rebuild_page reads them. rebuild_page checks
+       * ih_is_valid(&page->texture) (so texture must be a NULL handle, not garbage)
+       * and compares page->fusion via fusionrects_eq (so fusion.rects must be a
+       * valid empty vec). Leaving them uninitialised reads as zero at -O0 (safe) but
+       * garbage at -O3 (texture.data=0xffffffff -> ih_is_valid true -> deref crash). */
+      page.texture = ih_make(NULL);
+      fp_init_raw(&page); /* fusion.rects -> empty */
+      page.fusion.vram_rect = make_rect(0, 0, 0, 0);
+      page.fusion.scaleX = 0;
+      page.fusion.scaleY = 0;
+      page.dead = false;
+      page.dirty = false;
+      page.full_page_rect = page_rect;
+      page.palette = palette;
+      page.pal_count = 0;
+      if (pal_data != NULL && pal_count > 0) {
+         memcpy(page.pal_data, pal_data, (size_t)pal_count * sizeof(uint16_t));
+         page.pal_count = pal_count;
+      }
+      rebuild_page(&page, tracker, tt);
+      page.last_used = ++self->tick;
+      page.bytes = ih_is_valid(&page.texture)
+         ? (size_t)tt_img_width(ih_get(&page.texture)) * (size_t)tt_img_height(ih_get(&page.texture)) * 4u
+         : 0;
+      fused_page_vec_push(&self->pages, &page);
+      /* push copied the page, taking its own references: drop the stack
+       * page's, or its rects, their uploads and its image leak. */
+      fp_destroy(&page);
+      return hd_handle_make_fused(fused_page_vec_size(&self->pages) - 1);
+   }
+   static void fused_pages_mark_dirty(struct FusedPages *self, TTRect rect) {
+      int _i;
+      for (_i = 0; _i < fused_page_vec_size(&self->pages); _i++)
+      {
+         FusedPage *page = fused_page_vec_at(&self->pages, _i);
+         if (!page->dead && rect_intersects(&page->full_page_rect, &rect))
+            page->dirty = true;
+      }
+   }
+   static void fused_pages_mark_dead(struct FusedPages *self, TTRect rect) {
+      int _i;
+      for (_i = 0; _i < fused_page_vec_size(&self->pages); _i++)
+      {
+         FusedPage *page = fused_page_vec_at(&self->pages, _i);
+         if (!page->dead && rect_intersects(&page->full_page_rect, &rect))
+            page->dead = true;
+      }
+   }
+   static void fused_pages_rebuild_dirty(struct FusedPages *self,
+         struct RectTracker *tracker,
+         TextureTracker *tt){
+      bool changed = false;
+      int _i;
+      for (_i = 0; _i < fused_page_vec_size(&self->pages); _i++) {
+         FusedPage *page = fused_page_vec_at(&self->pages, _i);
+         if (!page->dead && page->dirty) {
+            rebuild_page(page, tracker, tt);
+            changed = true;
+         }
+      }
+      if (changed)
+         fused_pages_dbg_print_info(self);
+   }
+   static void fused_pages_remove_dead(struct FusedPages *self) {
+      int retained = 0;
+      int i;
+      for (i = 0; i < fused_page_vec_size(&self->pages); i++) {
+         if (!fused_page_vec_at(&self->pages, i)->dead) {
+            if (retained != i) {
+               FusedPage *dst = fused_page_vec_at(&self->pages, retained);
+               FusedPage *src = fused_page_vec_at(&self->pages, i);
+               fp_destroy(dst);
+               fp_copy(dst, src);
+            }
+            retained++;
+         }
+      }
+      fused_page_vec_truncate(&self->pages, retained);
+   }
+   /* LRU-evict live fused pages (mark them dead) until the total footprint is within
+    * budget. Run at the on_queues_reset safe point, immediately before remove_dead
+    * compacts and frees the marked pages. budget 0 = unlimited (disabled). */
+   static void fused_pages_evict(struct FusedPages *self) {
+      size_t total = 0;
+      int i;
+      if (self->budget_bytes == 0)
+         return;
+      for (i = 0; i < fused_page_vec_size(&self->pages); i++) {
+         FusedPage *p = fused_page_vec_at(&self->pages, i);
+         if (!p->dead)
+            total += p->bytes;
+      }
+      while (total > self->budget_bytes) {
+         int victim = -1;
+         uint64_t oldest = 0;
+         for (i = 0; i < fused_page_vec_size(&self->pages); i++) {
+            FusedPage *p = fused_page_vec_at(&self->pages, i);
+            if (p->dead)
+               continue;
+            if (victim < 0 || p->last_used < oldest) {
+               oldest = p->last_used;
+               victim = i;
+            }
+         }
+         if (victim < 0)
+            break; /* nothing left to evict */
+         { FusedPage *v = fused_page_vec_at(&self->pages, victim);
+           v->dead = true;
+           total -= v->bytes; }
+      }
+   }
+
+
+   /* ========================================
+    * Save State */
+
+   /* Allocate a new upload (refcount 1) that is a deep copy of to_copy with the
+    * HD textures map cleared. Replaces the old by-value copy initialiser flow. */
+   static TextureUpload *texture_upload_new_copy_without_handles(const TextureUpload *to_copy) {
+      TextureUpload *copy = texture_upload_new();
+      texture_upload_copy_contents(copy, to_copy);
+      hd_tex_map_clear(&copy->textures);
+      return copy;
+   }
+
+   /* Transient hash -> upload-pointer lookup used only while loading a save
+    * state. Non-owning (the pointers are owned by the +1 ref taken in
+    * load_state and dropped at the end), keys are unique and inserted once, so
+    * a flat POD array with a linear scan replaces the old
+    * a uint32_t -> TextureUpload* map. */
+   struct UploadPtrEntry { uint32_t key; TextureUpload *val; };
+   POD_VEC_DECLARE(UploadPtrVec, UploadPtrEntry);
+
+   static TextureRectSaveState to_save_state(const TextureRect *t,
+         UploadOwningMap *uploads){
+      uint32_t hash = t->upload->hash;
+      if (!uploadmap_contains(uploads, hash))
+         uploadmap_insert(uploads, hash, texture_upload_new_copy_without_handles(t->upload));
+      { TextureRectSaveState _ss; _ss.upload_hash = t->upload->hash; _ss.offset_x = t->offset_x;
+        _ss.offset_y = t->offset_y; _ss.vram_rect = t->vram_rect; return _ss; }
+   }
+
+   static TextureRect from_save_state(const TextureRectSaveState *t,
+         UploadPtrVec *uploads){
+      TextureUpload *found = NULL;
+      { int i; for (i = 0; i < uploads->count; i++) {
+         if (uploads->items[i].key == t->upload_hash) {
+            found = uploads->items[i].val;
+            break;
+         }
+      } }
+      if (!found) {
+         TT_LOG(RETRO_LOG_ERROR, "SaveState upload missing!\n");
+      }
+      { TextureRect _tr; _tr.upload = found; _tr.offset_x = t->offset_x; _tr.offset_y = t->offset_y;
+        _tr.vram_rect = t->vram_rect; return _tr; }
+   }
+
+   void texture_tracker_save_state(struct TextureTracker *self,
+         TextureTrackerSaveState *out)
+   {
+      TextureTrackerSaveState state;
+      tts_init(&state);
+
+      { int _ti; for (_ti = 0; _ti < self->tracker.textures.count; _ti++)
+      {
+         EnduringTextureRect *r = &self->tracker.textures.a[_ti];
+         if (r->alive)
+         {
+            TextureRectSaveState _ss = to_save_state(&r->texture_rect, &state.uploads);
+            TextureRectSaveStateVec_push(&state.rects, &_ss);
+         }
+      } }
+      {
+      int _sri;
+      for (_sri = 0; _sri < rrvec_size(&self->restorable_rects); _sri++)
+      {
+         RestorableRect *r = &self->restorable_rects.items[_sri];
+         RestorableRectSaveState saved;
+         rrss_init(&saved);
+         saved.hash = r->hash;
+         saved.rect = r->rect;
+         {
+         int _rti;
+         for (_rti = 0; _rti < ownedrects_size(&r->to_restore); _rti++)
+         {
+            TextureRect *t = &r->to_restore.v.items[_rti];
+            TextureRectSaveState _ss = to_save_state(t, &state.uploads);
+            TextureRectSaveStateVec_push(&saved.to_restore, &_ss);
+         }
+         }
+         RestorableRectSaveStateVec_push_move(&state.restorable, &saved);
+      }
+      }
+
+      /* The VRAM mirror travels with the rects: see TextureTrackerSaveState. */
+      if (self->vram_mirror != NULL) {
+         state.vram_mirror = (uint16_t*)malloc((size_t)FB_WIDTH * FB_HEIGHT * sizeof(uint16_t));
+         if (state.vram_mirror != NULL)
+            memcpy(state.vram_mirror, self->vram_mirror, (size_t)FB_WIDTH * FB_HEIGHT * sizeof(uint16_t));
+      }
+
+      tts_move(out, &state);
+      tts_destroy(&state);
+   }
+
+
+   void texture_tracker_load_state(struct TextureTracker *self,
+         const TextureTrackerSaveState *state)
+   {
+      UploadPtrVec uploads = { NULL, 0, 0 };
+      { int e; for (e = 0; e < state->uploads.count; e++) {
+         TextureUpload *ptr = texture_upload_new(); /* owns +1 */
+         texture_upload_copy_contents(ptr, state->uploads.items[e].val); /* deep-copy contents (refcount untouched) */
+         { UploadPtrEntry pe = { state->uploads.items[e].key, ptr };
+         UploadPtrVec_push(&uploads, &pe);
+         }
+      } }
+
+      {
+         TTRect _crr;
+         _crr.x = 0;
+         _crr.y = 0;
+         _crr.width = FB_WIDTH;
+         _crr.height = FB_HEIGHT;
+         texture_tracker_clearRegion(self, _crr, 0);
+      }
+      enduring_arr_clear(&self->tracker.textures); /* load_state should only be called right after creating this TextureTracker, so this ought to be empty already anyway */
+      {
+         int _i;
+         for (_i = 0; _i < TextureRectSaveStateVec_size(&state->rects); _i++)
+            rect_tracker_place(&self->tracker, from_save_state(TextureRectSaveStateVec_at((struct TextureRectSaveStateVec *)&state->rects, _i), &uploads));
+      }
+      rrvec_clear(&self->restorable_rects);
+      {
+         int _i;
+         for (_i = 0; _i < RestorableRectSaveStateVec_size(&state->restorable); _i++)
+         {
+            int _j;
+            RestorableRectSaveState *r = RestorableRectSaveStateVec_at((struct RestorableRectSaveStateVec *)&state->restorable, _i);
+            RestorableRect loaded;
+            restorablerect_init(&loaded);
+            loaded.hash = r->hash;
+            loaded.rect = r->rect;
+            for (_j = 0; _j < TextureRectSaveStateVec_size(&r->to_restore); _j++)
+               ownedrects_push(&loaded.to_restore, from_save_state(TextureRectSaveStateVec_at(&r->to_restore, _j), &uploads));
+            rrvec_push(&self->restorable_rects, &loaded);
+            restorablerect_destroy(&loaded);
+         }
+      }
+      /* Put the VRAM mirror back (the clearRegion above zeroed it):
+       * page-aligned replacements and CLUTs read outside a tracked upload
+       * hash from it. mirror_store also drops any memoised page hash. */
+      if (state->vram_mirror != NULL && self->vram_mirror != NULL) {
+         TTRect _full = { 0, 0, FB_WIDTH, FB_HEIGHT };
+         texture_tracker_mirror_store(self, _full, state->vram_mirror);
+         texture_tracker_clear_palette_cache(self, _full);
+      }
+      /* Need to reload the hd textures, too */
+      {
+         int e;
+         for (e = 0; e < state->uploads.count; e++)
+            texture_tracker_load_hd_texture(self, state->uploads.items[e].key);
+      }
+      /* Drop the map's construction refs; the placed/restorable TextureRects
+       * now hold their own references to each upload. */
+      {
+         int i;
+         for (i = 0; i < uploads.count; i++)
+            texture_upload_release(uploads.items[i].val);
+      }
+      UploadPtrVec_free_storage(&uploads);
+   }
+   /* End of Save State
+    * ======================================== */
+   static bool dbg_hotkey_query(struct DbgHotkey *self)
+   {
+      uint16_t state = dbg_input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, self->key);
+      bool is_key_down = state != 0;
+      bool just_pressed = is_key_down && !self->was_key_down;
+      self->was_key_down = is_key_down;
+      return just_pressed;
+   }
+
+/* ============================================================
+ * Public lifecycle + configuration adapters (rhi_tt.h). The
+ * tracker itself is heap-allocated and opaque to the renderers;
+ * the backend vtable is process-wide (one active RHI renderer at
+ * a time - see the shim block at the top of this file).
+ * ============================================================ */
+
+TextureTracker *texture_tracker_new(const TTGpuBackend *backend,
+      TTGpuImage *default_hd_texture)
+{
+   TextureTracker *self;
+
+   tt_backend     = *backend;
+   tt_backend_set = true;
+
+   self = (TextureTracker *)calloc(1, sizeof(*self));
+   if (!self)
+      return NULL;
+   /* init assumes zeroed storage for a few members (it historically ran
+    * inside a calloc'd Renderer), hence calloc above rather than malloc. */
+   texture_tracker_init(self);
+
+   if (default_hd_texture) {
+      tt_img_addref(default_hd_texture);
+      ih_move(&self->default_hd_texture, ih_make(default_hd_texture));
+   } else {
+      /* Build the 1x1 transparent fallback through the backend (the old
+       * set_texture_uploader body). */
+      LoadedLevels default_levels;
+      LoadedImage default_image;
+      loaded_levels_init(&default_levels);
+      loaded_image_init(&default_image);
+      loaded_image_alloc(&default_image, 1, 1);
+      default_image.owned_data[0] = 0;
+      default_image.owned_data[1] = 0;
+      default_image.owned_data[2] = 0;
+      default_image.owned_data[3] = 0;
+      loaded_levels_push_move(&default_levels, &default_image);
+      ih_move(&self->default_hd_texture, ih_make(tt_upload_levels(&default_levels)));
+      loaded_levels_reset(&default_levels); /* upload copied the pixels */
+   }
+   return self;
+}
+
+void texture_tracker_free(TextureTracker *self)
+{
+   if (!self)
+      return;
+   texture_tracker_fini(self);
+   free(self);
+   tt_backend_set = false;
+}
+
+void texture_tracker_set_config(TextureTracker *self,
+      const TextureTrackerConfig *cfg)
+{
+   /* Replace Textures follows the session latch: this setter runs every
+    * frame from the option-refresh path, and only a changed menu value
+    * overrides the in-game ']' toggle (texture_tracker_endFrame). */
+   self->dump_enabled           = cfg->dump_enabled;
+   /* Switching from a Lazy mode to Eager retires the journal (it is inert in
+    * Eager): persist any training now, synchronously - this is option-apply
+    * time, not mid-frame. No-op when there is nothing unsaved. */
+   if (!self->eager_textures && cfg->eager_textures)
+      tt_journal_save_file(&self->journal);
+   self->eager_textures         = cfg->eager_textures;
+   self->lazy_sync              = cfg->lazy_sync;
+   self->dump_mode_rect         = cfg->dump_mode_rect;
+   self->dump_mode_pages        = cfg->dump_mode_pages;
+   self->replacement_mode_pages = cfg->replacement_mode_pages;
+   self->replacement_fallback   = cfg->replacement_fallback;
+   self->reduce_palette_range   = cfg->reduce_palette_range;
+
+   {
+      bool on = tt_replace_latch_menu(&tt_replace, cfg->hd_textures_enabled);
+      if (self->hd_textures_enabled != on) {
+         self->hd_textures_enabled = on;
+         if (!on)
+            texture_tracker_flush_hd_state(self); /* free HD VRAM immediately when turned off */
+      }
+   }
+}
+
+bool texture_tracker_hd_textures_enabled(bool menu_enabled)
+{
+   return tt_replace_latch_enabled(&tt_replace, menu_enabled);
+}
+
+void texture_tracker_session_reset(void)
+{
+   /* A new game starts from the menu value again. */
+   tt_replace_latch_reset(&tt_replace);
+}
+
+void texture_tracker_set_texture_dir_mode(int mode)
+{
+   tt_dir_mode_set(&texture_dir_mode, mode);
+}
+
+TextureTrackerSaveState *tts_new(void)
+{
+   TextureTrackerSaveState *s =
+      (TextureTrackerSaveState *)malloc(sizeof(*s));
+   if (s)
+      tts_init(s);
+   return s;
+}
+
+void tts_free(TextureTrackerSaveState *s)
+{
+   if (!s)
+      return;
+   tts_destroy(s);
+   free(s);
+}

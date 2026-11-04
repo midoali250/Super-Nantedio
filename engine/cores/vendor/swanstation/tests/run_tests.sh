@@ -1,0 +1,314 @@
+#!/bin/sh
+# Regression tests that run the core headless with test ROMs in place of the BIOS.
+#
+# usage: tests/run_tests.sh core.so suite [args]
+#   mdec                              MDEC decode, compared with tests/mdec_decode.expected
+#   polyline                          long GPU poly-lines, compared with tests/gpu_polyline.expected
+#   regfuzz [first] [last] [frames]   register fuzzer, one run per seed (default 1 20 120)
+#   statefuzz [first] [last] [iters]  corrupted save states loaded into a fuzzed system (default 1 3 150)
+#   mdecstate                         MDEC states with table commands short of parameters, unknown
+#                                     states and a block write-out with nothing scheduled must be
+#                                     rejected, valid pending table commands loaded; all must save again
+#   eventstate                        timing events already due or that would run with negative elapsed
+#                                     time, and a GPU CRTC event postponed past a CPU slice or with
+#                                     another period or interval, must be rejected; in-range ones and
+#                                     real states loaded at the lowest and highest clocks; all must save
+#   rollback                          every byte of the CPU section head set to 0xFF in turn and
+#                                     loaded as a netplay rollback (no fallback copy); frames still run
+#                                     after each rejected load
+#   pad                               both ports polled continuously (DualShock, NeGcon Rumble); a
+#                                     save/load/save round trip leaves the Pad section unchanged, and
+#                                     a loaded state runs its next frame as the original run did; then
+#                                     each byte of the DualShock's state is corrupted and loaded in turn
+#   disk                              M3U entries swapped, removed and re-added through disk control,
+#                                     an empty drive closed and that state loaded,
+#                                     with a save state from before the swap loaded after it, and
+#                                     path/label queries with missing, empty and short buffers
+#   reload                            the core re-initialized under a new environment, with a
+#                                     second logger and then none; no call reaches a replaced logger
+#   vulkan                            the Vulkan renderer's device negotiated as RetroArch does (v2,
+#                                     made through the frontend's wrapper) and as a frontend without
+#                                     v2 does (v1), under the validation layer; needs a Vulkan
+#                                     driver, e.g. lavapipe
+#
+# UPDATE_EXPECTED=1 rewrites an expected file from the core under test.
+# Needs clang, ld.lld and llvm-objcopy for the MIPS test ROMs, python3, and a
+# host C compiler for the frontend. CC and FRONTEND_CFLAGS pick the host
+# compiler and its flags (match the core's sanitizers); FE_CPU and FE_FASTMEM
+# pick the core's CPU mode. A run fails on a nonzero exit, a sanitizer report
+# or a hang (TIMEOUT seconds per run, default 300).
+set -eu
+
+CORE=$(readlink -f "$1")
+SUITE=$2
+shift 2
+
+TESTS=$(cd "$(dirname "$0")" && pwd)
+WORK=${WORK:-$(mktemp -d)}
+CC=${CC:-cc}
+CLANG=${CLANG:-clang}
+LLD=${LLD:-ld.lld}
+OBJCOPY=${OBJCOPY:-llvm-objcopy}
+TIMEOUT=${TIMEOUT:-300}
+export FE_CPU=${FE_CPU:-Recompiler}
+export FE_FASTMEM=${FE_FASTMEM:-MMap}
+export ASAN_OPTIONS=${ASAN_OPTIONS:-halt_on_error=1:detect_leaks=1}
+export UBSAN_OPTIONS=${UBSAN_OPTIONS:-halt_on_error=1:print_stacktrace=1}
+
+mkdir -p "$WORK"
+
+build_rom()
+{
+  name=$1
+  flags="--target=mipsel-unknown-none -march=mips1 -mno-abicalls -fno-pic -G0 -O2 -ffreestanding -fno-builtin -nostdlib"
+  for src in crt0.S "$name.c"; do
+    if ! "$CLANG" $flags -c "$TESTS/guest/$src" -o "$WORK/${src%.*}.o" > "$WORK/cc.log" 2>&1; then
+      cat "$WORK/cc.log"
+      exit 1
+    fi
+    # clang calls MIPS I experimental; it is the console's CPU.
+    grep -v "experimental" "$WORK/cc.log" || true
+  done
+  "$LLD" -T "$TESTS/guest/rom.ld" "$WORK/crt0.o" "$WORK/$name.o" -o "$WORK/$name.elf"
+  "$OBJCOPY" -O binary -j .reset -j .magic -j .params -j .exc -j .text -j .rodata "$WORK/$name.elf" "$WORK/$name.rom"
+}
+
+build_frontend()
+{
+  "$CC" -O1 -g ${FRONTEND_CFLAGS:-} -I"$TESTS/../src/libretro" -I"$TESTS/../dep/libretro-common/include" \
+    "$TESTS/harness/frontend.c" -o "$WORK/frontend" -ldl
+}
+
+# run_rom rom seed mode frames [content]: runs one ROM in its own BIOS directory; output in $WORK/run.log
+run_rom()
+{
+  dir="$WORK/bios-$2"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  python3 "$TESTS/guest/mkrom.py" "$WORK/$1.rom" "$dir/bios.bin" "$2" "$3"
+  rc=0
+  FE_DIR="$dir" timeout "$TIMEOUT" "$WORK/frontend" "$CORE" "$4" ${5:-} > "$WORK/run.log" 2>&1 || rc=$?
+  rm -rf "$dir"
+  if [ $rc -ne 0 ] || grep -qE "runtime error|ERROR: (Address|Leak)Sanitizer|WARNING: ThreadSanitizer" "$WORK/run.log"; then
+    [ $rc -eq 124 ] && echo "timed out after $TIMEOUT s"
+    cat "$WORK/run.log"
+    return 1
+  fi
+  return 0
+}
+
+# run_golden rom frames dump_words cases [pairs=N]
+run_golden()
+{
+  build_rom "$1"
+  if ! RAMDUMP=0:$3 run_rom "$1" 1 0 "$2"; then
+    echo "$1: run failed"
+    exit 1
+  fi
+  python3 "$TESTS/check_expected.py" "$WORK/run.log" "$TESTS/$1.expected" "$4" ${5:-}
+}
+
+build_frontend
+
+case "$SUITE" in
+  mdec)
+    run_golden mdec_decode 1500 160 20 pairs=16
+    ;;
+
+  polyline)
+    run_golden gpu_polyline 600 80 4
+    ;;
+
+  regfuzz)
+    build_rom regfuzz
+    python3 "$TESTS/make_disc.py" "$WORK"
+    first=${1:-1}
+    last=${2:-20}
+    frames=${3:-120}
+    seed=$first
+    while [ "$seed" -le "$last" ]; do
+      if ! run_rom regfuzz "$seed" 0xFFFFFFFF "$frames" "$WORK/disc.cue"; then
+        echo "regfuzz: seed $seed failed"
+        exit 1
+      fi
+      seed=$((seed + 1))
+    done
+    echo "regfuzz: seeds $first-$last passed"
+    ;;
+
+  statefuzz)
+    build_rom regfuzz
+    python3 "$TESTS/make_disc.py" "$WORK"
+    first=${1:-1}
+    last=${2:-3}
+    iters=${3:-150}
+    seed=$first
+    while [ "$seed" -le "$last" ]; do
+      if ! STATEFUZZ=$iters SEED=$seed run_rom regfuzz "$seed" 0xFFFFFFFF 120 "$WORK/disc.cue"; then
+        echo "statefuzz: seed $seed failed"
+        exit 1
+      fi
+      grep "state fuzz:" "$WORK/run.log"
+      seed=$((seed + 1))
+    done
+    echo "statefuzz: seeds $first-$last passed"
+    ;;
+
+  mdecstate)
+    build_rom mdec_state
+    # MDEC section with both FIFOs empty: status (4), DMA in/out (1+1), FIFO sizes (4+4),
+    # state (1) at 14, remaining halfwords (4) at 15. States: 2 WritingMacroblock,
+    # 3 SetIqTable, 4 SetScaleTable, 5 NoCommand (last).
+    for c in 3:32:loaded 3:64:loaded 4:64:loaded 3:0:rejected 3:2:rejected 3:66:rejected \
+      4:0:rejected 4:32:rejected 2:0:rejected 6:0:rejected; do
+      state=${c%%:*}
+      rest=${c#*:}
+      halfwords=${rest%%:*}
+      expect=${rest#*:}
+      patch=$(printf 'MDEC+14:%x,MDEC+15:%x,MDEC+16:0,MDEC+17:0,MDEC+18:0' "$state" "$halfwords")
+      if ! STATEFUZZ=1 STATEFUZZ_PATCH="$patch" run_rom mdec_state 1 0 10; then
+        echo "mdecstate: state $state, $halfwords halfwords failed"
+        exit 1
+      fi
+      if ! grep -q "patched state $expect" "$WORK/run.log" || ! grep -q "patched state saved" "$WORK/run.log"; then
+        cat "$WORK/run.log"
+        echo "mdecstate: state $state, $halfwords halfwords: expected $expect and saved"
+        exit 1
+      fi
+    done
+    echo "mdecstate: passed"
+    ;;
+
+  eventstate)
+    build_rom mdec_state
+    # Each event record is its name (u32 length, bytes) then downcount, time since
+    # last run, period and interval, each a little-endian s32 at +0, +4, +8, +12.
+    le32()
+    {
+      v=$(( $3 & 0xFFFFFFFF ))
+      printf '%s+%d:%x,%s+%d:%x,%s+%d:%x,%s+%d:%x' "$1" "$2" $((v & 255)) "$1" $(($2 + 1)) $(((v >> 8) & 255)) \
+        "$1" $(($2 + 2)) $(((v >> 16) & 255)) "$1" $(($2 + 3)) $(((v >> 24) & 255))
+    }
+    crtc="GPU CRTC Tick"
+    spu="SPU Sample"
+    for c in \
+      "loaded 100 $(le32 "$crtc" 0 1),$(le32 "$crtc" 4 0)" \
+      "loaded 50 $(le32 "$crtc" 0 1),$(le32 "$crtc" 4 0)" \
+      "loaded 100 $(le32 "$spu" 0 1),$(le32 "$spu" 4 -1)" \
+      "rejected 100 $(le32 "$spu" 0 0),$(le32 "$spu" 4 0)" \
+      "rejected 100 $(le32 "$spu" 0 -1000),$(le32 "$spu" 4 2000)" \
+      "rejected 100 $(le32 "$crtc" 0 -1000),$(le32 "$crtc" 4 2000)" \
+      "rejected 100 $(le32 "$spu" 0 1),$(le32 "$spu" 4 -2)" \
+      "rejected 100 $(le32 "$crtc" 0 0x3FFFFFFF)" \
+      "rejected 160 $(le32 "$crtc" 0 0x3FFFFFFF)" \
+      "rejected 100 $(le32 "$crtc" 4 0x3FFFFFFF)" \
+      "rejected 100 $(le32 "$crtc" 8 2)" \
+      "rejected 100 $(le32 "$crtc" 12 2)"; do
+      expect=${c%% *}
+      rest=${c#* }
+      clock=${rest%% *}
+      patch=${rest#* }
+      if ! FE_OVERCLOCK=$clock STATEFUZZ=1 STATEFUZZ_PATCH="$patch" run_rom mdec_state 1 0 10; then
+        echo "eventstate: $patch at $clock% failed"
+        exit 1
+      fi
+      if ! grep -q "patched state $expect" "$WORK/run.log" || ! grep -q "patched state saved" "$WORK/run.log"; then
+        cat "$WORK/run.log"
+        echo "eventstate: $patch at $clock%: expected $expect and saved"
+        exit 1
+      fi
+    done
+    # States saved at frame ends across a run at the lowest and highest clocks load again.
+    build_rom gpu_polyline
+    for clock in 50 160; do
+      for frames in 1 17 60 121; do
+        if ! FE_OVERCLOCK=$clock STATEFUZZ=0 run_rom gpu_polyline 1 0 $frames; then
+          echo "eventstate: state saved after $frames frames at $clock% failed"
+          exit 1
+        fi
+      done
+    done
+    echo "eventstate: passed"
+    ;;
+
+  rollback)
+    build_rom regfuzz
+    python3 "$TESTS/make_disc.py" "$WORK"
+    if ! FE_STATE_CONTEXT=rollback STATEFUZZ=1 STATEFUZZ_SWEEP=CPU:400 \
+      run_rom regfuzz 1 0xFFFFFFFF 120 "$WORK/disc.cue"; then
+      echo "rollback: failed"
+      exit 1
+    fi
+    grep "state fuzz:" "$WORK/run.log"
+    ;;
+
+  pad)
+    build_rom pad_poll
+    python3 "$TESTS/make_disc.py" "$WORK"
+    # Interpreter only: the recompiler does not yet replay a frame identically after a state load.
+    if ! FE_CPU=Interpreter PADTEST=1 run_rom pad_poll 1 0 30 "$WORK/disc.cue"; then
+      echo "pad: failed"
+      exit 1
+    fi
+    grep "pad test:" "$WORK/run.log"
+    # Every byte of the DualShock's state set to 0xFF in turn, loaded as a rollback with frames run after each.
+    if ! FE_CPU=Interpreter FE_PADS=1 FE_STATE_CONTEXT=rollback STATEFUZZ=1 STATEFUZZ_SWEEP=Controller:96 \
+      run_rom pad_poll 1 0 30 "$WORK/disc.cue"; then
+      echo "pad: controller sweep failed"
+      exit 1
+    fi
+    grep "state fuzz:" "$WORK/run.log"
+    ;;
+
+  disk)
+    build_rom gpu_polyline
+    python3 "$TESTS/make_disc.py" "$WORK" disc1
+    python3 "$TESTS/make_disc.py" "$WORK" disc2
+    printf 'disc1.cue\ndisc2.cue\n' > "$WORK/discs.m3u"
+    if ! DISKTEST="$WORK/disc2.cue" run_rom gpu_polyline 1 0 120 "$WORK/discs.m3u"; then
+      echo "disk: failed"
+      exit 1
+    fi
+    grep "disk test:" "$WORK/run.log"
+    ;;
+
+  reload)
+    build_rom gpu_polyline
+    python3 "$TESTS/make_disc.py" "$WORK"
+    if ! RELOADTEST=1 run_rom gpu_polyline 1 0 30 "$WORK/disc.cue"; then
+      echo "reload: failed"
+      exit 1
+    fi
+    grep "reload test:" "$WORK/run.log"
+    ;;
+
+  vulkan)
+    build_rom gpu_polyline
+    python3 "$TESTS/make_disc.py" "$WORK"
+    "$CC" -O1 -g ${FRONTEND_CFLAGS:-} -I"$TESTS/../dep/libretro-common/include" -I"$TESTS/../dep/vulkan-loader/include" \
+      "$TESTS/harness/vk_negotiate.c" -o "$WORK/vk_negotiate" -ldl
+    # Each frontend: RetroArch's (negotiation v2: the device must be made through
+    # its wrapper), and one that predates v2.
+    for offer in 2 1; do
+      dir="$WORK/bios-vk"
+      rm -rf "$dir"
+      mkdir -p "$dir"
+      python3 "$TESTS/guest/mkrom.py" "$WORK/gpu_polyline.rom" "$dir/bios.bin" 1 0
+      expect=0
+      [ "$offer" -ge 2 ] && expect=1
+      if ! VKN_OFFER=$offer VKN_EXPECT_WRAPPER=$expect VKN_DIR="$dir" timeout "$TIMEOUT" "$WORK/vk_negotiate" "$CORE" "$WORK/disc.cue" \
+        swanstation_GPU_Renderer=Vulkan swanstation_CPU_ExecutionMode="$FE_CPU" \
+        swanstation_CPU_FastmemMode="$FE_FASTMEM" > "$WORK/run.log" 2>&1; then
+        cat "$WORK/run.log"
+        echo "vulkan: negotiation v$offer failed"
+        exit 1
+      fi
+      cat "$WORK/run.log"
+    done
+    ;;
+
+  *)
+    echo "unknown suite $SUITE"
+    exit 1
+    ;;
+esac

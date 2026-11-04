@@ -1,0 +1,138 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(constant_id = 8) const int EXPANDED_COLOR = 0;
+
+#include "common.h"
+#include "hdr.h"
+
+/* Scaled-framebuffer storage format. rgba16f under -DHDR16 (the wide HDR
+ * render target); rgba8 otherwise. The image the store targets is
+ * created to match (see renderer scaled_fb_format). */
+#if defined(HDR16)
+#define SCALED_STORE_FMT rgba16f
+#else
+#define SCALED_STORE_FMT rgba8
+#endif
+
+
+#if defined(SCALED)
+#if defined(MSAA)
+layout(set = 0, binding = 0, SCALED_STORE_FMT) uniform writeonly image2DMS uScaledMS;
+#else
+layout(set = 0, binding = 0, SCALED_STORE_FMT) uniform writeonly image2D uScaled;
+#endif
+layout(set = 0, binding = 1) uniform usampler2D uUnscaled;
+#else
+layout(set = 0, binding = 0, r32ui) uniform writeonly uimage2D uUnscaled;
+#if defined(MSAA)
+layout(set = 0, binding = 1) uniform sampler2DMS uScaledMS;
+#else
+layout(set = 0, binding = 1) uniform sampler2D uScaled;
+#endif
+
+layout(constant_id = 0) const int NUM_SAMPLES = 1;
+layout(constant_id = 1) const int FILTER_MODE = 0;
+layout(constant_id = 3) const int SCALE = 1;
+/* Transfer curve used to combine samples. Supersampling and multisampling both
+ * estimate how much light a pixel emits, so the samples have to be averaged as
+ * light - the curve belongs inside the mean, not after it. Averaging the
+ * gamma-encoded values instead is darker by Jensen's inequality: ~6% on a
+ * +-10% spread and up to 62% where a sample set straddles black and white,
+ * which is every polygon edge. Re-encoded on the way out because the
+ * framebuffer this feeds is a display-referred one. */
+layout(constant_id = 7) const int RESOLVE_EOTF = 0;
+#endif
+
+layout(set = 1, binding = 0, std140) uniform Rects
+{
+	// Have to pad due to silly std140-ness.
+	uvec4 offsets[1024];
+};
+
+layout(push_constant, std430) uniform PushMe
+{
+	vec2 inv_source_size;
+	uint scale;
+} registers;
+
+void main()
+{
+#if defined(SCALED)
+	uvec2 coord = gl_GlobalInvocationID.xy + offsets[gl_WorkGroupID.z].xy * registers.scale;
+	vec2 uv = (vec2(coord) + 0.5) * registers.inv_source_size;
+	uint value = textureLod(uUnscaled, uv, 0.0).x;
+	vec4 unorm = abgr1555_color(value, EXPANDED_COLOR != 0);
+	#if defined(MSAA)
+		int samples = imageSamples(uScaledMS);
+		for (int i = 0; i < samples; i++)
+			imageStore(uScaledMS, ivec2(coord), i, unorm);
+	#else
+		imageStore(uScaled, ivec2(coord), unorm);
+	#endif
+#else
+	uvec2 coord = gl_GlobalInvocationID.xy + offsets[gl_WorkGroupID.z].xy;
+	vec4 value;
+
+	if (FILTER_MODE == 0)
+	{
+	#if defined(MSAA)
+		value = texelFetch(uScaledMS, ivec2(coord * SCALE), 0);
+	#else
+		value = texelFetch(uScaled, ivec2(coord * SCALE), 0);
+	#endif
+	}
+	else
+	{
+	#if defined(MSAA)
+		value = vec4(0.0);
+		ivec2 uv = ivec2(coord * SCALE);
+		for (int y = 0; y < SCALE; y++)
+			for (int x = 0; x < SCALE; x++)
+				for (int i = 0; i < NUM_SAMPLES; i++)
+				{
+					vec4 t = texelFetch(uScaledMS, uv + ivec2(x, y), i);
+					value.rgb += sdr_to_linear(max(t.rgb, vec3(0.0)), RESOLVE_EOTF);
+					value.a   += t.a;
+				}
+		value /= SCALE * SCALE * NUM_SAMPLES;
+		value.rgb = linear_to_sdr(value.rgb, RESOLVE_EOTF);
+	#else
+		/* Explicit fetches rather than the bilinear ladder this used to
+		 * lean on. The texture unit averages in the framebuffer's own
+		 * encoding, which is exactly the wrong domain, and there is no way
+		 * to ask it for anything else. The cost is real - SCALE 16 goes
+		 * from 64 bilinear taps to 256 point fetches - but the samples are
+		 * adjacent and cache-resident, and it buys the difference between
+		 * averaging light and averaging voltage. */
+		ivec2 srcmax = textureSize(uScaled, 0) - 1;
+		ivec2 base   = ivec2(coord) * SCALE;
+		value = vec4(0.0);
+		for (int y = 0; y < SCALE; y++)
+		{
+			for (int x = 0; x < SCALE; x++)
+			{
+				vec4 t = texelFetch(uScaled, clamp(base + ivec2(x, y), ivec2(0), srcmax), 0);
+				value.rgb += sdr_to_linear(max(t.rgb, vec3(0.0)), RESOLVE_EOTF);
+				value.a   += t.a;
+			}
+		}
+		value /= float(SCALE * SCALE);
+		value.rgb = linear_to_sdr(value.rgb, RESOLVE_EOTF);
+	#endif
+	}
+
+	/* HDR: the rgba16f scaled framebuffer can contain NaN lanes (e.g. from
+	 * blend edge cases); clamp() inside pack_abgr1555 handles Inf and
+	 * out-of-range finite values but is undefined on NaN, which would pack
+	 * to a garbage 1555 word. This resolve feeds VRAM readback and
+	 * savestates, so a single bad word corrupts the saved state. Force NaN
+	 * lanes to 0 first. In SDR the source is UNORM and never NaN, so this is
+	 * a no-op. */
+	value = mix(value, vec4(0.0), isnan(value));
+
+	uint packed_color = pack_abgr1555(value);
+	if (EXPANDED_COLOR != 0)
+		packed_color |= ABGR1555_BYTE_COLOR;
+	imageStore(uUnscaled, ivec2(coord), uvec4(packed_color));
+#endif
+}
