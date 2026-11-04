@@ -1,0 +1,50 @@
+name: Desktop performance investigation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            wheel: pygame-2.6.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+          - os: windows-latest
+            wheel: pygame-2.6.1-cp311-cp311-win_amd64.whl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - name: Build Linux core
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cmake -S desktop/common -B desktop/native-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build desktop/native-build -j 2
+          cp desktop/native-build/libnesapp_host.so desktop/common/
+      - name: Build Windows core
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          cmake -S desktop/common -B desktop/native-build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build desktop/native-build
+          cp desktop/native-build/*nesapp_host.dll desktop/common/
+      - name: Install runtime
+        shell: bash
+        run: |
+          python -m pip install 'desktop/vendor/${{ matrix.wheel }}'
+          cp games/super-mario-world/app/src/main/assets/mario.nes desktop/common/mario.nes
+      - name: Measure 4K frames and save bottlenecks
+        shell: bash
+        run: python desktop/common/tests/benchmark.py
