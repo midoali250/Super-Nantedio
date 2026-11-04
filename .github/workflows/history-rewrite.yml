@@ -1,0 +1,45 @@
+name: Verify and rewrite project history
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        description: Verify without changes, or apply explicitly authorized rewrite
+        options: [check, apply]
+        required: true
+        default: check
+permissions:
+  contents: write
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install history tool
+        run: python -m pip install git-filter-repo==2.47.0
+      - name: Rewrite and validate history
+        env:
+          REWRITE_MODE: ${{ inputs.mode }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python tools/naming/rewrite_history.py
+      - name: Package verified rewritten objects for authenticated transfer
+        if: inputs.mode == 'check'
+        run: |
+          if git config --local --get-regexp 'http\..*extraheader|credential\.'; then echo 'Unexpected credentials in git config'; exit 1; fi
+          tar -cf "$RUNNER_TEMP/clean-history.tar" .git
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode == 'check'
+        with:
+          name: verified-history-transfer
+          path: |
+            ${{ runner.temp }}/clean-history.tar
+            ${{ runner.temp }}/history-refs-before.txt
+          retention-days: 1
+          if-no-files-found: error

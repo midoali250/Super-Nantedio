@@ -1,6 +1,6 @@
 import os,re,subprocess,json
-p=re.compile(b"(?i)"+b"sup"+b"er[-_ ]?"+b"nan"+b"tedio")
-arabic=re.compile(("سو"+"بر"+r"\s*"+"نان"+"تيدو").encode())
+p=re.compile(b"(?i)"+b"nan"+b"tedio")
+arabic=re.compile((r"(?:"+"نان"+"تيدو|"+"نان"+"تديو"+r")").encode())
 def hit(b):return bool(p.search(b) or arabic.search(b))
 paths=subprocess.check_output(["git","ls-files","-z"]).decode().split("\0");found=[]
 for path in paths:

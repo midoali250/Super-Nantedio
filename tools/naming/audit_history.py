@@ -1,6 +1,6 @@
 import subprocess,re,sys
-pattern=re.compile(rb'(?i)'+b'sup'+b'er[-_ ]?'+b'nan'+b'tedio')
-arabic=re.compile(('سو'+'بر'+r'\s*'+r'(?:'+'نان'+'تيدو|'+ 'نان'+'تديو'+')').encode())
+pattern=re.compile(rb'(?i)'+b'nan'+b'tedio')
+arabic=re.compile((r'(?:'+'نان'+'تيدو|'+ 'نان'+'تديو'+')').encode())
 def found(data):return bool(pattern.search(data) or arabic.search(data))
 def out(*args):return subprocess.check_output(args)
 objects=out('git','rev-list','--objects','--all')
