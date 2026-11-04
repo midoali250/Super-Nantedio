@@ -65,12 +65,13 @@ def system_notification(version):
         else:return False
     elif sys.platform=='darwin':cmd=['osascript','-e','display notification "'+message+'" with title "'+title+'"']
     elif sys.platform=='win32':
-        script="""[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] > $null
+        script=r"""$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] > $null
 [Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] > $null
 $xml=New-Object Windows.Data.Xml.Dom.XmlDocument
 $xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>Super Mario World update</text><text>Version VERSION is available. Open game settings to download.</text></binding></visual></toast>')
 $toast=[Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('bitvaultengine.MarioWorld').Show($toast)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show($toast)
 """.replace('VERSION',version)
         cmd=['powershell.exe','-NoProfile','-NonInteractive','-Command',script]
     else:return False
