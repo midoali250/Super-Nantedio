@@ -4,7 +4,7 @@ import ctypes as C
 import hashlib,json,os,re,sys,tempfile,threading,time,urllib.request
 from pathlib import Path
 import pygame
-VERSION='1.1.0'
+VERSION='1.2.0'
 CATALOG='https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/desktop/super-mario-world.json'
 ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 class Core:
@@ -113,6 +113,29 @@ def write_atomic(path,data):
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
 
+class SaveWorker:
+    """Only byte snapshots cross threads; the emulator stays on the main thread."""
+    def __init__(self,path,writer=write_atomic):
+        self.path=path;self.writer=writer;self.condition=threading.Condition();self.pending=None;self.closed=False;self.error=None
+        self.thread=threading.Thread(target=self._run,name='save-writer',daemon=True);self.thread.start()
+    def submit(self,data):
+        with self.condition:
+            if self.closed:raise RuntimeError('Save worker closed')
+            self.pending=data # coalesce outdated snapshots while a disk write is running
+            self.condition.notify()
+    def _run(self):
+        while True:
+            with self.condition:
+                while self.pending is None and not self.closed:self.condition.wait()
+                if self.pending is None and self.closed:return
+                data=self.pending;self.pending=None
+            try:self.writer(self.path,data);self.error=None
+            except (OSError,ValueError,RuntimeError) as exc:self.error=exc
+    def close(self,timeout=3):
+        with self.condition:self.closed=True;self.condition.notify()
+        self.thread.join(timeout)
+        return not self.thread.is_alive() and self.error is None
+
 def save_config(config):
     write_atomic(home_dir()/'settings-v2.json',json.dumps(config,indent=2).encode())
 
@@ -220,6 +243,14 @@ def self_test():
         path=Path(folder)/'autosave.state';write_atomic(path,state);restore(core,path.read_bytes())
     assert (r[0x86],r[0xce])==before,'Saved file restore failed'
     frame=pygame.Surface((256,240),0,16,(0xf800,0x07e0,0x001f,0));frame.get_buffer().write(core.framebuffer());assert pygame.transform.scale(frame,(2880,2160)).get_size()==(2880,2160)
+    scaled=pygame.Surface((320,240),0,16,(0xf800,0x07e0,0x001f,0));pygame.transform.scale(frame,(320,240),scaled)
+    smooth=pygame.Surface((320,240)).convert();pygame.transform.smoothscale(frame.convert(),(320,240),smooth)
+    with tempfile.TemporaryDirectory() as folder:
+        path=Path(folder)/'thread-save.state'
+        def slow_write(path,data):time.sleep(.25);write_atomic(path,data)
+        worker=SaveWorker(path,slow_write);t=time.perf_counter();worker.submit(b'first');worker.submit(b'latest')
+        assert time.perf_counter()-t<.15,'Save submission blocked on disk'
+        assert worker.close(timeout=3) and path.read_bytes()==b'latest','Background save failed'
     class Keys:
         def __getitem__(self,k):return k in (pygame.K_a,pygame.K_x)
     assert input_mask(DEFAULTS,Keys(),(False,)*5,[],0)&(1<<8)
@@ -246,7 +277,7 @@ def main():
         if sys.platform=='win32':os.environ['APPDATA']=test_home.name
         elif sys.platform=='darwin':os.environ['HOME']=test_home.name
         else:os.environ['XDG_CONFIG_HOME']=test_home.name
-    pygame.mixer.pre_init(48000,-16,2,512);pygame.init();pygame.joystick.init()
+    pygame.mixer.pre_init(48000,-16,2,1024);pygame.init();pygame.joystick.init()
     screen=pygame.display.set_mode((0,0),pygame.FULLSCREEN)
     pygame.display.set_caption('Super Mario Bros. World')
     core=Core();frame=pygame.Surface((core.w,core.h),0,16,(0xf800,0x07e0,0x001f,0))
@@ -257,6 +288,9 @@ def main():
     try:message='Previous game restored' if load_game(core) else 'New game'
     except (OSError,ValueError,RuntimeError):message='Save could not be loaded';
     clock=pygame.time.Clock();channel=pygame.mixer.Channel(0) if pygame.mixer.get_init() else None
+    save_worker=SaveWorker(home_dir()/'autosave.state');pending_audio=bytearray();scaled=None;scaled_key=None
+    fps_fn=core.lib.Java_com_midoali_nes_NesCore_nativeFps;fps_fn.argtypes=[C.c_void_p,C.c_void_p];fps_fn.restype=C.c_double
+    core_fps=fps_fn(None,None);interval=1.0/(core_fps if 30<core_fps<120 else 60.0988);next_frame=time.perf_counter()
     page=None;selected=0;group=0;waiting=None;fullscreen=True;running=True;tick=0;ui_frame=0;last_save=time.monotonic();buttons=[]
     main_rows=['Resume game','Controls','Cheats','Video & display','Save now','Load saved game','Check for updates','Download update','Exit game']
     cheat_rows=['Infinite lives','Enemy protection','Pit rescue','Back']
@@ -266,7 +300,7 @@ def main():
         except OSError:pass
     def save_now():
         nonlocal message,last_save
-        try:save_game(core);last_save=time.monotonic();message='Game saved'
+        try:save_worker.submit(snapshot(core));last_save=time.monotonic();message='Saving in background'
         except (OSError,ValueError,RuntimeError):message='Could not save game'
     def activate():
         nonlocal page,selected,group,waiting,running,screen,fullscreen,message
@@ -368,21 +402,40 @@ def main():
             elif key==pygame.K_BACKSPACE:back()
         if not running:break
         if not page:
-            tick+=1;mask=input_mask(controls,pygame.key.get_pressed(),pygame.mouse.get_pressed(5),pads,tick)
-            flags=(1 if cheat.get('lives') else 0)|(2 if cheat.get('enemy') else 0)|(4 if cheat.get('pit') else 0)
-            core.frame(mask,flags);frame.get_buffer().write(core.framebuffer());audio=core.samples()
-            if channel and audio:
+            now=time.perf_counter()
+            if now < next_frame:
+                time.sleep(next_frame-now);now=time.perf_counter()
+            # Catch up a few emulation frames if rendering was slow, without
+            # repeatedly presenting intermediate frames. Limit runaway catch-up.
+            steps=min(4,1+max(0,int((now-next_frame)/interval)))
+            if now-next_frame>0.25:next_frame=now
+            for _ in range(steps):
+                tick+=1;mask=input_mask(controls,pygame.key.get_pressed(),pygame.mouse.get_pressed(5),pads,tick)
+                flags=(1 if cheat.get('lives') else 0)|(2 if cheat.get('enemy') else 0)|(4 if cheat.get('pit') else 0)
+                core.frame(mask,flags);pending_audio.extend(core.samples());next_frame+=interval
+            frame.get_buffer().write(core.framebuffer())
+            # Bound queued audio so a hiccup cannot create an ever-growing delay.
+            if len(pending_audio)>19200:del pending_audio[:-19200]
+            if channel and pending_audio and (not channel.get_busy() or channel.get_queue() is None):
                 try:
-                    sound=pygame.mixer.Sound(buffer=audio)
+                    sound=pygame.mixer.Sound(buffer=bytes(pending_audio));pending_audio.clear()
                     if not channel.get_busy():channel.play(sound)
-                    elif channel.get_queue() is None:channel.queue(sound)
-                except pygame.error:pass
+                    else:channel.queue(sound)
+                except pygame.error:pending_audio.clear()
+            elif not channel:pending_audio.clear()
             if time.monotonic()-last_save>5:save_now()
+        else:
+            next_frame=time.perf_counter();pending_audio.clear()
         w,h=screen.get_size();screen.fill((7,10,18))
         if cfg['display']=='fill':dw,dh=w,h
         else:dw=min(w,int(h*4/3));dh=min(h,int(dw*3/4))
-        scaler=pygame.transform.smoothscale if cfg['filter']=='smooth' else pygame.transform.scale
-        screen.blit(scaler(frame,(max(1,dw),max(1,dh))),((w-dw)//2,(h-dh)//2))
+        dw=max(1,dw);dh=max(1,dh);key=(dw,dh,cfg['filter'])
+        if key!=scaled_key:
+            scaled=pygame.Surface((dw,dh),0,16,(0xf800,0x07e0,0x001f,0)) if cfg['filter']=='sharp' else pygame.Surface((dw,dh)).convert()
+            scaled_key=key
+        if cfg['filter']=='smooth':pygame.transform.smoothscale(frame.convert(),(dw,dh),scaled)
+        else:pygame.transform.scale(frame,(dw,dh),scaled)
+        screen.blit(scaled,((w-dw)//2,(h-dh)//2))
         # Persistent gear. No on-screen game controls.
         gear=pygame.Rect(w-62,10,52,52);pygame.draw.rect(screen,(21,29,46),gear,border_radius=14)
         cx,cy=gear.center;pygame.draw.circle(screen,(230,238,250),(cx,cy),14,4)
@@ -431,8 +484,9 @@ def main():
         pygame.display.flip()
         if ui_test and ui_frame==10 and os.environ.get('MARIO_UI_SCREENSHOT'):
             pygame.image.save(screen,os.environ['MARIO_UI_SCREENSHOT'])
-        clock.tick(60)
-    if ui_test:assert (home_dir()/'autosave.state').is_file(), 'Exit did not save game'
+        if page:clock.tick(30)
+    completed=save_worker.close()
+    if ui_test:assert completed and (home_dir()/'autosave.state').is_file(), 'Exit did not save game'
     pygame.quit()
 
 if __name__=='__main__':
