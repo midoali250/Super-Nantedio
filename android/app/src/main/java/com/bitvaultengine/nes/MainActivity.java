@@ -9,6 +9,7 @@ import android.widget.Button;
 import android.widget.TextView;
 import androidx.appcompat.app.AppCompatActivity;
 import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import android.util.Base64;
 
@@ -30,7 +31,7 @@ public class MainActivity extends AppCompatActivity {
         webSettings.setJavaScriptEnabled(true);
         webSettings.setDomStorageEnabled(true);
         webSettings.setAllowFileAccessFromFileURLs(true);
-        webSettings.setAllowUniversalAccessFromFileURLs(true);
+        webSettings.setAllowUniversalAccessFromFileURLs(false);
         webSettings.setCacheMode(WebSettings.LOAD_NO_CACHE);
         webSettings.setAllowContentAccess(true);
 
@@ -66,11 +67,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void loadROMFromAssets() {
         try {
-            InputStream is = getAssets().open("mario.nes");
-            byte[] romBytes = new byte[is.available()];
-            is.read(romBytes);
-            is.close();
-            romBase64 = Base64.encodeToString(romBytes, Base64.DEFAULT);
+            byte[] romBytes;
+            try (InputStream is = getAssets().open("mario.nes");
+                 ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[8192];
+                int n;
+                while ((n = is.read(buffer)) != -1) out.write(buffer, 0, n);
+                romBytes = out.toByteArray();
+            }
+            romBase64 = Base64.encodeToString(romBytes, Base64.NO_WRAP);
             statusText.setText("تم تحميل الروم من الأصول - Super Mario Bros.");
         } catch (IOException e) {
             e.printStackTrace();
@@ -78,7 +83,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private class NESInterface {
+    public class NESInterface {
         @JavascriptInterface
         public void onStatus(String status) {
             runOnUiThread(() -> statusText.setText(status));

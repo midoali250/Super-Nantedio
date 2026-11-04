@@ -100,7 +100,7 @@ OPCODES = {
     0x99: ('STA', 'ABY', 3, 4), 0x9A: ('TXS', 'IMP', 1, 2), 0x9D: ('STA', 'ABX', 3, 4),
     0xA0: ('LDY', 'IMM', 2, 2), 0xA1: ('LDA', 'IZX', 2, 6), 0xA2: ('LDX', 'IMM', 2, 2),
     0xA4: ('LDY', 'ZPG', 2, 3), 0xA5: ('LDA', 'ZPG', 2, 3), 0xA6: ('LDX', 'ZPG', 2, 3),
-    0xA8: ('TAY', 'IMP', 1, 2), 0xAA: ('TAX', 'IMP', 1, 2), 0xAC: ('LDY', 'ABS', 3, 4),
+    0xA8: ('TAY', 'IMP', 1, 2), 0xA9: ('LDA', 'IMM', 2, 2), 0xAA: ('TAX', 'IMP', 1, 2), 0xAC: ('LDY', 'ABS', 3, 4),
     0xAD: ('LDA', 'ABS', 3, 4), 0xAE: ('LDX', 'ABS', 3, 4), 0xB0: ('BCS', 'REL', 2, 2),
     0xB1: ('LDA', 'IZY', 2, 5), 0xB4: ('LDY', 'ZPX', 2, 4), 0xB5: ('LDA', 'ZPX', 2, 4),
     0xB6: ('LDX', 'ZPY', 2, 4), 0xB8: ('CLV', 'IMP', 1, 2), 0xB9: ('LDA', 'ABY', 3, 4),
@@ -158,8 +158,20 @@ def disassemble(rom, start_addr=0x8000, end_addr=None, output_file=None):
         opcode = prg[offset]
         if opcode in OPCODES:
             mnemonic, mode, size, cycles = OPCODES[opcode]
-            operand_str, operand_len = ADDRESS_MODES[mode](pc, prg)
-            # بناء 사طر التفكيك
+            if offset + size > len(prg):
+                lines.append(f"${pc:04X}: {opcode:02X}          .byte ${opcode:02X}  ; truncated instruction")
+                pc += 1
+                offset += 1
+                continue
+            # ADDRESS_MODES indexes the PRG buffer, not CPU address space.
+            if mode == 'REL':
+                displacement = prg[offset + 1]
+                if displacement >= 128:
+                    displacement -= 256
+                operand_str = f'${(pc + 2 + displacement) & 0xffff:04X}'
+            else:
+                operand_str, _ = ADDRESS_MODES[mode](offset, prg)
+            # بناء سطر التفكيك
             hex_bytes = ' '.join(f'{prg[offset + i]:02X}' for i in range(min(size, len(prg) - offset)))
             line = f"${pc:04X}: {hex_bytes:<8} {mnemonic:4} {operand_str}"
             lines.append(line)

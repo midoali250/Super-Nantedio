@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Super Mario Bros. NES</title>
-    <script src="https://cdn.jsdelivr.net/npm/jsnes@latest"></script>
+    <script src="vendor/jsnes/jsnes.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
         html, body {
@@ -219,6 +219,10 @@
 
 <script>
     var nes = null;
+    var playing = false;
+    var frameRequest = 0;
+    var lastFrameTime = 0;
+    var frameAccumulator = 0;
     var canvas = document.getElementById('canvas');
     var ctx = canvas.getContext('2d', { alpha: false });
     var imageData = null;
@@ -231,15 +235,17 @@
     }
 
     function initNES() {
-        nes = new JSNES({
+        nes = new jsnes.NES({
+            emulateSound: false,
             onFrame: function(frameBuffer) {
                 if (!imageData) {
                     imageData = ctx.createImageData(256, 240);
                 }
                 for (var i = 0; i < 256 * 240; i++) {
-                    imageData.data[i * 4 + 0] = frameBuffer[i * 3 + 0];
-                    imageData.data[i * 4 + 1] = frameBuffer[i * 3 + 1];
-                    imageData.data[i * 4 + 2] = frameBuffer[i * 3 + 2];
+                    var pixel = frameBuffer[i];
+                    imageData.data[i * 4 + 0] = (pixel >> 16) & 255;
+                    imageData.data[i * 4 + 1] = (pixel >> 8) & 255;
+                    imageData.data[i * 4 + 2] = pixel & 255;
                     imageData.data[i * 4 + 3] = 255;
                 }
                 ctx.putImageData(imageData, 0, 0);
@@ -251,47 +257,64 @@
         loadingDiv.style.display = 'flex';
         errorDiv.style.display = 'none';
 
-        // ROM filename EXACTLY as in the project: Super Mario Bros. + Duck Hunt (E) [!].nes
-        var romFilename = 'Super%20Mario%20Bros.%20%2B%20Duck%20Hunt%20(E)%20[%21].nes';
-
-        fetch('file:///android_asset/' + romFilename)
-            .then(function(response) {
-                if (!response.ok) throw new Error('HTTP error! status: ' + response.status);
-                return response.arrayBuffer();
-            })
-            .then(function(buffer) {
-                var romData = new Uint8Array(buffer);
-                nes.loadROM(romData);
-                loadingDiv.style.display = 'none';
-                nesPlay();
-            })
-            .catch(function(error) {
-                console.error('Error loading ROM:', error);
-                loadingDiv.style.display = 'none';
-                errorDiv.style.display = 'block';
-            });
+        try {
+            if (!window.NES || !NES.getROMBase64) throw new Error('ROM bridge unavailable');
+            var encoded = NES.getROMBase64();
+            if (!encoded) throw new Error('ROM unavailable');
+            var binary = atob(encoded);
+            var romData = new Uint8Array(binary.length);
+            for (var i = 0; i < binary.length; i++) romData[i] = binary.charCodeAt(i);
+            nes.loadROM(romData);
+            loadingDiv.style.display = 'none';
+            nesPlay();
+        } catch (error) {
+            console.error('Error loading ROM:', error);
+            loadingDiv.style.display = 'none';
+            errorDiv.style.display = 'block';
+        }
     }
 
-    function nesPlay()  { if (nes) nes.play(); }
-    function nesPause() { if (nes) nes.pause(); }
-    function nesReset() { if (nes) { nes.reset(); nesLoadROM(); } }
+    function frameLoop(time) {
+        if (!playing) return;
+        if (!lastFrameTime) lastFrameTime = time;
+        frameAccumulator += Math.min(100, Math.max(0, time - lastFrameTime));
+        lastFrameTime = time;
+        try {
+            var frames = 0;
+            while (frameAccumulator >= 1000 / 60 && frames++ < 3) {
+                nes.frame(); frameAccumulator -= 1000 / 60;
+            }
+        } catch (e) {
+            console.error('Emulation error:', e); nesPause(); errorDiv.style.display = 'block'; return;
+        }
+        frameRequest = requestAnimationFrame(frameLoop);
+    }
+    function nesPlay() {
+        if (!nes || playing) return;
+        playing = true; lastFrameTime = 0; frameAccumulator = 0;
+        frameRequest = requestAnimationFrame(frameLoop);
+    }
+    function nesPause() { playing = false; cancelAnimationFrame(frameRequest); }
+    function nesReset() { if (nes) { nesPause(); nesLoadROM(); } }
 
     var KEY = {
-        UP: JSNES.KEY_UP, DOWN: JSNES.KEY_DOWN, LEFT: JSNES.KEY_LEFT, RIGHT: JSNES.KEY_RIGHT,
-        A: JSNES.KEY_A, B: JSNES.KEY_B, SELECT: JSNES.KEY_SELECT, START: JSNES.KEY_START
+        UP: jsnes.Controller.BUTTON_UP, DOWN: jsnes.Controller.BUTTON_DOWN,
+        LEFT: jsnes.Controller.BUTTON_LEFT, RIGHT: jsnes.Controller.BUTTON_RIGHT,
+        A: jsnes.Controller.BUTTON_A, B: jsnes.Controller.BUTTON_B,
+        SELECT: jsnes.Controller.BUTTON_SELECT, START: jsnes.Controller.BUTTON_START
     };
 
     var activeKeys = {};
     function press(key) {
         if (!activeKeys[key]) {
             activeKeys[key] = true;
-            if (nes) nes.pressKey(key);
+            if (nes) nes.buttonDown(1, key);
         }
     }
     function release(key) {
         if (activeKeys[key]) {
             activeKeys[key] = false;
-            if (nes) nes.releaseKey(key);
+            if (nes) nes.buttonUp(1, key);
         }
     }
 
@@ -401,11 +424,11 @@
     };
     window.addEventListener('keydown', function(e) {
         var k = keyMapCode[e.key];
-        if (k) { e.preventDefault(); press(k); }
+        if (k !== undefined) { e.preventDefault(); press(k); }
     });
     window.addEventListener('keyup', function(e) {
         var k = keyMapCode[e.key];
-        if (k) { e.preventDefault(); release(k); }
+        if (k !== undefined) { e.preventDefault(); release(k); }
     });
 
     window.addEventListener('DOMContentLoaded', function() {

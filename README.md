@@ -33,7 +33,7 @@ android/app/build/outputs/apk/debug/app-debug.apk
 
 ### تشغيل أداة التفكيك
 ```bash
-python3 tools/nes_disassembler.py roms/*.nes --output tools/disassembly_output.txt --summary
+python3 tools/nes_disassembler.py "roms/Super Mario Bros. + Duck Hunt (E) [!].nes" --output tools/disassembly_output.txt
 ```
 
 ## سير العمل في GitHub Actions
@@ -61,7 +61,7 @@ python3 tools/nes_disassembler.py roms/*.nes --output tools/disassembly_output.t
 - **الملف:** `Super Mario Bros. + Duck Hunt + World Class Track Meet (U) (PRG0) [!].nes`
 - **الحجم:** 196,624 بايت (192 KB)
 - **النوع:** iNES ROM - 8x16k PRG, 8x8k CHR [H-mirror]
-- **المaber:** 0 (NROM)
+- **Mapper:** 1 (MMC1)
 
 ## الترخيص
 
@@ -70,9 +70,26 @@ python3 tools/nes_disassembler.py roms/*.nes --output tools/disassembly_output.t
 
 ## Mario + Duck Hunt Android project
 
-Source, controls, optional Mario cheats, and tests: [`games/nes-mario-duckhunt/`](games/nes-mario-duckhunt/). The existing `android/` project is unchanged. Download the published APK from [Releases](https://github.com/midoali250/bitvault-engine/releases).
+Source, controls, optional Mario cheats, and tests: [`games/nes-mario-duckhunt/`](games/nes-mario-duckhunt/). The separate `android/` directory contains the older WebView-based project. Download the published APK from [Releases](https://github.com/midoali250/bitvault-engine/releases).
 
 
 ## مركز معلومات التحديثات
 
 راجع [`updates/`](updates/) لملفات إصدارات الألعاب وطريقة إضافة تحديث. هذا المجلد لا يضيف التحديث التلقائي للألعاب بمفرده.
+
+
+## تجهيز المشاريع والاختبارات
+
+- مشروع WebView القديم يستخدم مكتبة jsnes **2.1.0** المرفقة محليًا في
+  `android/app/src/main/assets/vendor/jsnes/` مع ترخيصها، بدون تحميل المكتبة
+  وقت التشغيل. المسار مبني على Gradle Wrapper 8.4؛ يلزم JDK 17 وAndroid SDK 34.
+- هذا المشروع القديم مثال أولي: الصوت فيه غير مفعّل، ولم يُختبر على هاتف في
+  هذا التحديث، وهو منفصل عن إصدار Mario + Duck Hunt المرفوع في Releases.
+- مشروع Mario الأصلي في `games/nes-mario-duckhunt/` يضم FCEUmm ومكتبة صوت خاصة
+  به؛ يتطلب JDK 17 وSDK 35 وNDK 27.0.12077973 وCMake 3.22.1 عند البناء.
+- اختبارات GitHub: بناء المشروعين، محاكاة jsnes دون اتصال عبر Node، اختبارات
+  Python للتفكيك، واختبارات الكنترول وذاكرة اللعبة للنواة المحلية. اختبارات
+  النواة تتطلب Python 3 وPillow 11.3.0 وCMake ومترجم C.
+- قبل إنشاء لعبة جديدة: انسخ قالب عميل التحديثات في `updates/client/android/`,
+  وأضف ملف إصدار مستقل واحتفظ بمفتاح توقيع اللعبة في مكان آمن مع نسخة احتياطية.
+- بناء APK لا يمنح حقوق توزيع ROM: تحقق من الترخيص وحق التوزيع لكل لعبة.

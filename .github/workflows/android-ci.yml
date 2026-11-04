@@ -42,11 +42,10 @@ jobs:
         run: |
           ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Install Gradle
+      - name: Run offline emulator and disassembler tests
         run: |
-          wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip -O /tmp/gradle.zip
-          unzip -q /tmp/gradle.zip -d /opt
-          ln -sf /opt/gradle-8.4/bin/gradle /usr/local/bin/gradle
+          node tools/test_jsnes_offline.cjs
+          python3 -m unittest discover -s tools/tests -v
 
       - name: Create local.properties
         run: |
@@ -55,7 +54,7 @@ jobs:
       - name: Build Debug APK
         run: |
           cd android
-          gradle assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Verify APK exists
         run: |
@@ -71,7 +70,8 @@ jobs:
 
       - name: Disassemble NES ROM
         run: |
-          python3 tools/nes_disassembler.py roms/*.nes --output tools/disassembly_output.txt --summary
+          python3 tools/nes_disassembler.py "roms/Super Mario Bros. + Duck Hunt (E) [!].nes" --output tools/disassembly_output.txt
+          test -s tools/disassembly_output.txt
 
       - name: Upload Disassembly artifact
         uses: actions/upload-artifact@v4

@@ -33,6 +33,15 @@ jobs:
           mkdir -p /tmp/nes-vpad-test
           javac -d /tmp/nes-vpad-test app/src/main/java/com/midoali/nes/{VirtualPad,Zapper,ScreenMap}.java tools/vpad/VpadTest.java
           java -cp /tmp/nes-vpad-test com.midoali.nes.VpadTest
+      - name: Host core gameplay and protection tests
+        run: |
+          python3 -m pip install Pillow==11.3.0
+          cmake -S tools/host -B tools/host/build
+          cmake --build tools/host/build -j 2
+          python3 tools/host/test_lives.py
+          python3 tools/host/test_protection.py
+          python3 tools/host/test_enemy_collision.py 0
+          python3 tools/host/test_enemy_collision.py 2
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
