@@ -22,6 +22,10 @@ if len(sys.argv) == 2:
         if ram[0xb5] == 1: peak = min(peak, ram[0xce])
     print(f'{duration},{initial},{peak},{initial-peak}')
 else:
+    measurements = {}
     for d in (4, 22, 32, 40):
-        output = subprocess.check_output([sys.executable, __file__, str(d)], text=True)
-        print('HOLD_FRAMES,GROUND_Y,PEAK_Y,RISE_PIXELS:', output.strip())
+        output = subprocess.check_output([sys.executable, __file__, str(d)], text=True).strip()
+        print('HOLD_FRAMES,GROUND_Y,PEAK_Y,RISE_PIXELS:', output)
+        measurements[d] = int(output.split(',')[3])
+    assert measurements[32] > measurements[22], measurements
+    print('PASS: new big jump reaches higher than previous 22-frame jump')

@@ -52,6 +52,8 @@ public final class VpadTest {
                 (m & (1 << VirtualPad.BTN_RIGHT)) != 0 && (m & (1 << VirtualPad.BTN_UP)) != 0);
         p.setStick(0.05f, 0.05f);
         check("inside deadzone -> no direction", (frame(p) & 0x3F0) == 0);
+        p.setStick(0.18f, 0f);
+        check("light stick movement responds", (frame(p) & (1 << VirtualPad.BTN_RIGHT)) != 0);
     }
 
     private static void bigJump() {
@@ -60,7 +62,7 @@ public final class VpadTest {
         p.setButton(VirtualPad.BTN_BIG_JUMP, true);
         int on = 0;
         for (int i = 0; i < 40; i++) if ((frame(p) & (1 << VirtualPad.BTN_A)) != 0) on++;
-        check("single press holds A for a full-height jump (" + on + " frames)", on >= 20 && on <= 24);
+        check("single press holds A for a full-height jump (" + on + " frames)", on == 32);
         p.setButton(VirtualPad.BTN_BIG_JUMP, false);
         check("A released afterwards", (frame(p) & (1 << VirtualPad.BTN_A)) == 0);
     }

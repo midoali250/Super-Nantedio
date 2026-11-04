@@ -162,7 +162,7 @@ final class Emulator implements Runnable {
                             .setSampleRate(sampleRate)
                             .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                             .build())
-                    .setBufferSizeInBytes(Math.max(minBuffer * 2, 16384))
+                    .setBufferSizeInBytes(Math.max(minBuffer, 8192))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build();
             track.play();

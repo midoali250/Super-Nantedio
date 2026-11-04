@@ -50,3 +50,12 @@ ROM; ownership or distribution permission must be checked independently.
 ## Static ROM inspection
 
 `analysis/prg-linear-disassembly.asm` is a best-effort linear 6502 decoding of the ROM PRG, not a fully verified reconstruction or buildable game source. It can misinterpret data as instructions; gameplay uses the original ROM and FCEUmm.
+
+## Version 1.3
+
+The big jump holds A for 32 rather than 22 frames; host-ROM measurements
+show a 66-pixel rather than 62-pixel rise in the tested scenario. The stick
+dead zone was reduced from 0.22 to 0.16. The audio buffer targets at least
+8192 bytes or the device minimum, rather than 16384 bytes or twice minimum;
+actual latency and audio stability depend on the device. The on-screen Zapper
+indicator is intentionally unchanged.

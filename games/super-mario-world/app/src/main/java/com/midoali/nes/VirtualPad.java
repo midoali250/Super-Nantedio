@@ -5,7 +5,7 @@ package com.midoali.nes;
  * position/trigger for the light-gun games.
  *
  * Button layout (right hand side, 4 buttons):
- *   BIG JUMP     - one press performs a full-height jump (A held ~22 frames)
+ *   BIG JUMP     - one press performs a full-height jump (A held ~32 frames)
  *   SMALL JUMP   - repeat: while held, short hops are produced over and over
  *   FIRE (auto)  - while held, the B button is pulsed (rapid fireballs)
  *   FIRE (once)  - one press fires exactly one fireball
@@ -19,8 +19,8 @@ final class VirtualPad {
 
     static final int BTN_BIG_JUMP = 0, BTN_SMALL_JUMP = 1, BTN_FIRE_AUTO = 2, BTN_FIRE_ONCE = 3;
 
-    private static final float DEADZONE = 0.22f;
-    private static final int BIG_JUMP_FRAMES = 22;
+    private static final float DEADZONE = 0.16f;
+    private static final int BIG_JUMP_FRAMES = 32;
     private static final int SMALL_JUMP_ON = 4, SMALL_JUMP_PERIOD = 16;
     private static final int FIRE_AUTO_ON = 4, FIRE_AUTO_PERIOD = 9;
     private static final int FIRE_ONCE_FRAMES = 4;
