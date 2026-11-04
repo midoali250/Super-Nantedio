@@ -1,0 +1,8 @@
+{
+  "game": "super-mario-world-desktop",
+  "platforms": {
+    "windows": {"version":"1.0.0", "release_url":"https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0"},
+    "linux": {"version":"1.0.0", "release_url":"https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0"},
+    "macos": {"version":"1.0.0", "release_url":"https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0"}
+  }
+}
