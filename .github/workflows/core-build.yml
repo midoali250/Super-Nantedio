@@ -2,7 +2,7 @@ name: Multisystem core build probes
 on:
   workflow_dispatch:
   push:
-    branches: [engine/multisystem-foundation]
+    branches: [engine/clean-foundation]
     paths: ['engine/cores/**', '.github/workflows/core-build.yml']
 permissions:
   contents: read

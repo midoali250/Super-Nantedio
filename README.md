@@ -1,100 +1,11 @@
-# BitVaultEngine - NES Emulator for Android
+# BitVault Engine — experimental clean foundation
 
-تطبيق أندرويد لتشغيل ألعاب NES (نينتندو إنترتينمنت سيستم) مع أداة تفكيك لملفات الرويم (ROM) وسلسلة بناء آلية عبر GitHub Actions.
+This branch is a work-in-progress separation of the reusable engine from individual games. It contains no game projects, ROMs or game release binaries in its current tree. Existing games remain in their private migration repositories; this branch does not migrate or remove public history or existing releases.
 
-## محتويات المشروع
+## Current state
 
-| المسار | الوصف |
-|--------|-------|
-| `android/` | تطبيق أندرويد operates عبر WebView + محاكي jsnes |
-| `android/app/src/main/assets/emulator.html` | واجهة المحاكي والتحكمات على الشاشة |
-| `android/app/src/main/assets/*.nes` | لعبة罗马 مدمجة (Super Mario Bros. + Duck Hunt) |
-| `tools/nes_disassembler.py` | أداة بايثون لتفكيك ملفات NES ROM إلى 6502 Assembly |
-| `.github/workflows/android-ci.yml` | سير عمل GitHub Actions لبناء APK وتشغيل الاختبارات |
-| `roms/` | مجلد ملفات الرويم |
+- `engine/cores/registry.json`: pinned Linux build probes for NES (FCEUmm), SNES (Snes9x), Game Boy/Color (Gambatte), Mega Drive/Genesis (Genesis Plus GX) and Atari 2600 (Stella 2014).
+- `updates/client/android/`: reusable optional Android update client and a buildable example.
+- `tools/nes_disassembler.py`: NES ROM inspection tool.
 
-## كيفية البناء محلياً
-
-### المتطلبات
-- Java JDK 17 أو أعلى
-- Android SDK (بأدوات البناء 34)
-- Python 3 (لأداة التفكيك)
-
-### بناء APK
-```bash
-cd android
-chmod +x gradlew
-./gradlew assembleDebug
-```
-سيتم إخراج APK في:
-```
-android/app/build/outputs/apk/debug/app-debug.apk
-```
-
-### تشغيل أداة التفكيك
-```bash
-python3 tools/nes_disassembler.py "roms/Super Mario Bros. + Duck Hunt (E) [!].nes" --output tools/disassembly_output.txt
-```
-
-## سير العمل في GitHub Actions
-
-عند كل push أو pull request إلى فرع `main`:
-1. يتم إعداد JDK 17 و Android SDK
-2. يتم بناء APK للتصحيح (Debug APK)
-3. يتم تشغيل اختبارات الوحدة (Unit Tests)
-4. يتم رفع APK كـ Artifact للتنزيل
-5. يتم تفكيك روم NES وحفظ المخرجات
-6. يتم التحقق من وجود ملفات الروم والـ APK
-
-## التحكمات على الشاشة
-
-| الزر | الوصف |
-|------|-------|
-| ▲ ◀ ▼ ▶ | اتجاهية (D-Pad) |
-| A | زر A |
-| B | زر B |
-| SELECT | اختيار |
-| START | بدء |
-
-## ملخص ملف الروم المرفق
-
-- **الملف:** `Super Mario Bros. + Duck Hunt + World Class Track Meet (U) (PRG0) [!].nes`
-- **الحجم:** 196,624 بايت (192 KB)
-- **النوع:** iNES ROM - 8x16k PRG, 8x8k CHR [H-mirror]
-- **Mapper:** 1 (MMC1)
-
-## الترخيص
-
-هذا المشروع للأغراض التعليمية والتجريبية. ملفات الألعاب (ROMs) خاضعة لحقوق ملكية نينتندو الأصلية.
-
-
-## Mario + Duck Hunt Android project
-
-Source, controls, optional Mario cheats, and tests: [`games/nes-mario-duckhunt/`](games/nes-mario-duckhunt/). The separate `android/` directory contains the older WebView-based project. Download the published APK from [Releases](https://github.com/midoali250/bitvault-engine/releases).
-
-
-## مركز معلومات التحديثات
-
-راجع [`updates/`](updates/) لملفات إصدارات الألعاب وطريقة إضافة تحديث. هذا المجلد لا يضيف التحديث التلقائي للألعاب بمفرده.
-
-
-## تجهيز المشاريع والاختبارات
-
-- مشروع WebView القديم يستخدم مكتبة jsnes **2.1.0** المرفقة محليًا في
-  `android/app/src/main/assets/vendor/jsnes/` مع ترخيصها، بدون تحميل المكتبة
-  وقت التشغيل. المسار مبني على Gradle Wrapper 8.4؛ يلزم JDK 17 وAndroid SDK 34.
-- هذا المشروع القديم مثال أولي: الصوت فيه غير مفعّل، ولم يُختبر على هاتف في
-  هذا التحديث، وهو منفصل عن إصدار Mario + Duck Hunt المرفوع في Releases.
-- مشروع Mario الأصلي في `games/nes-mario-duckhunt/` يضم FCEUmm ومكتبة صوت خاصة
-  به؛ يتطلب JDK 17 وSDK 35 وNDK 27.0.12077973 وCMake 3.22.1 عند البناء.
-- اختبارات GitHub: بناء المشروعين، محاكاة jsnes دون اتصال عبر Node، اختبارات
-  Python للتفكيك، واختبارات الكنترول وذاكرة اللعبة للنواة المحلية. اختبارات
-  النواة تتطلب Python 3 وPillow 11.3.0 وCMake ومترجم C.
-- قبل إنشاء لعبة جديدة: انسخ قالب عميل التحديثات في `updates/client/android/`,
-  وأضف ملف إصدار مستقل واحتفظ بمفتاح توقيع اللعبة في مكان آمن مع نسخة احتياطية.
-- بناء APK لا يمنح حقوق توزيع ROM: تحقق من الترخيص وحق التوزيع لكل لعبة.
-
-
-## Super Mario Bros. (World) للأندرويد
-
-[مشروع اللعبة](games/super-mario-world/) — [تحميل إصدار 1.4](https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-v1.4/Super-Mario-Bros-World-1.4.apk).
+**This branch is not yet a usable multi-platform game packager.** The builds check core compilation and exported libretro symbols only. They do not provide a generic frontend, package applications, or prove game compatibility. Additional integration, homebrew ROM tests, Android/desktop builds, per-system updates and packaging must pass before replacing the existing main branch. Core sources are fetched from their pinned upstream revisions during the probe and are not yet vendored here.
