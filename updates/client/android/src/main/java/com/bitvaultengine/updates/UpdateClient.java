@@ -32,6 +32,11 @@ public final class UpdateClient {
     static final String EXTRA_OPEN = "com.bitvaultengine.updates.OPEN";
     private static final int JOB_ID = 132701;
     private static final int NOTIFICATION_ID = 132702;
+    /* The repository a game's release is published under. A game that lives in
+     * another account of the project sets com.bitvaultengine.UPDATE_OWNER in
+     * its manifest; everything else falls back to the original owner. */
+    private static final String DEFAULT_OWNER = "midoali250";
+    private static final String REPO = "bitvault-engine";
     private static final ExecutorService IO = Executors.newSingleThreadExecutor();
     private UpdateClient() { }
 
@@ -42,13 +47,25 @@ public final class UpdateClient {
             throw new IllegalArgumentException("Invalid game ID");
         return id;
     }
+
+    /** GitHub account that hosts this game's manifest and release. */
+    private static String owner(Context c) throws Exception {
+        String o = c.getPackageManager().getApplicationInfo(c.getPackageName(),
+                PackageManager.GET_META_DATA).metaData.getString("com.bitvaultengine.UPDATE_OWNER");
+        if (o == null) o = DEFAULT_OWNER;
+        if (!o.matches("[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?"))
+            throw new IllegalArgumentException("Invalid update owner");
+        return o;
+    }
     static final class Release {
         String name, notes, apkUrl, apkSha256;
         long code, apkSize;
     }
     static Release fetch(Context context) throws Exception {
         String id = gameId(context);
-        URL url = new URL("https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/games/" + id + ".json");
+        String owner = owner(context);
+        URL url = new URL("https://raw.githubusercontent.com/" + owner + "/" + REPO +
+                "/main/updates/games/" + id + ".json");
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
         c.setConnectTimeout(10000); c.setReadTimeout(10000);
         c.setInstanceFollowRedirects(false);
@@ -73,7 +90,7 @@ public final class UpdateClient {
             String path = apk.getPath();
             if (!"https".equals(apk.getScheme()) || !"github.com".equals(apk.getHost()) ||
                     apk.getPort() != -1 || apk.getUserInfo() != null || apk.getQuery() != null ||
-                    path == null || !path.startsWith("/midoali250/bitvault-engine/releases/download/") ||
+                    path == null || !path.startsWith("/" + owner + "/" + REPO + "/releases/download/") ||
                     !path.endsWith(".apk")) throw new IllegalStateException("Invalid APK URL");
             Release r = new Release();
             r.code = o.getLong("version_code");

@@ -17,6 +17,9 @@
         android:hardwareAccelerated="true"
         android:theme="@style/Theme.Snes">
         <meta-data android:name="com.bitvaultengine.GAME_ID" android:value="mazinger-z" />
+        <!-- This game's manifest and release live under a different account
+             of the project, so the update client has to look there. -->
+        <meta-data android:name="com.bitvaultengine.UPDATE_OWNER" android:value="mosalah30688-gif" />
         <provider android:name="com.bitvaultengine.updates.UpdateFileProvider"
             android:authorities="${applicationId}.updatefiles" android:exported="false"
             android:grantUriPermissions="true" />

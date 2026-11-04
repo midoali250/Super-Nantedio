@@ -21,6 +21,24 @@
 الرابط الثابت الذي سيقرأه عميل اللعبة مستقبلًا:
 `https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/games/nes-mario-duckhunt.json`
 
+## الحساب الذي ينشر الإصدار
+
+كل لعبة تقرأ بياناتها من حساب المستودع اللي اتبنت فيه. الحساب الافتراضي
+`midoali250`، و`mosalah30688-gif` مستخدمان فعلاً، فعشان كده العميل بيقرأ
+metadata اسمها `com.bitvaultengine.UPDATE_OWNER` من الـ Manifest:
+
+```xml
+<meta-data android:name="com.bitvaultengine.UPDATE_OWNER" android:value="mosalah30688-gif" />
+```
+
+من غيرها العميل بيرجع للحساب الافتراضي. الـ URL اللي بيتقرأ لازم يكون
+`https://raw.githubusercontent.com/<owner>/bitvault-engine/main/updates/games/<game_id>.json`،
+يعني **المستودع لازم يكون عام** — الـ raw endpoint مش بيقبل مستودع خاص من غير
+توكن، والعميل مصمم إنه ما يستعملش أي توكن.
+
+نفس القاعدة على رابط الـ APK: لازم يبدأ بـ
+`/<owner>/bitvault-engine/releases/download/` وينتهي بـ `.apk`.
+
 ملاحظة عن الحسابات: إصدارات مازينجر Z منشورة على
 `mosalah30688-gif/bitvault-engine`، وهو مستودع **خاص**، فالرابط بيستخدم
 endpoint الـ API بدل رابط التحميل العام. رابط `raw.githubusercontent.com` ما
@@ -40,7 +58,9 @@ endpoint الـ API بدل رابط التحميل العام. رابط `raw.git
 5. شغّل `python3 tools/validate_updates.py --check-downloads` ثم ارفع التعديل.
 
 لإضافة لعبة جديدة، انسخ ملف ماريو إلى اسم مناسب في `games/`، واجعل `game_id`
-مطابقًا لاسم الملف واستخدم اسم حزمة خاصًا بها. راجع نتائج GitHub Actions.
+مطابقًا لاسم الملف واستخدم اسم حزمة خاصًا بها. لو اللعبة هتنشر في حساب تاني
+من حسابات المشروع، ضيف `com.bitvaultengine.UPDATE_OWNER` في الـ Manifest.
+راجع نتائج GitHub Actions.
 
 ## الحقول
 

@@ -13,6 +13,16 @@ processor — so it needs its own core. The app reuses the same shape as the NES
 projects: a thin JNI bridge over the libretro API, a native host harness that
 runs the very same C code on a desktop, and the shared in-app updater.
 
+| | |
+| --- | --- |
+| Repository | <https://github.com/mosalah30688-gif/bitvault-engine> |
+| Release | <https://github.com/mosalah30688-gif/bitvault-engine/releases/tag/mazinger-z-v1.0> |
+| APK | [Mazinger-Z-SNES-1.0.apk](https://github.com/mosalah30688-gif/bitvault-engine/releases/download/mazinger-z-v1.0/Mazinger-Z-SNES-1.0.apk) |
+
+Because this game is published under the `mosalah30688-gif` account, its
+manifest also sets `com.bitvaultengine.UPDATE_OWNER`, so the update client
+reads the release data from the right repository.
+
 ## Controls
 
 Landscape, immersive, full screen. The picture is letterboxed to the SNES 4:3
