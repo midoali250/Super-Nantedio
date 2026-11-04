@@ -1,0 +1,19 @@
+name: Repository naming audit
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Find old naming in paths and source
+        run: python tools/naming/audit.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: naming-audit
+          path: brand-audit.json
