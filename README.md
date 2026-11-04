@@ -104,7 +104,7 @@ Source, controls, optional Mario cheats, and tests: [`games/nes-mario-duckhunt/`
 
 [مشروع اللعبة](games/mazinger-z/) — أول لعبة **SNES** في المستودع.
 
-[تحميل إصدار 1.0 (موقّع)](https://github.com/mosalah30688-gif/bitvault-engine/releases/download/mazinger-z-v1.0/Mazinger-Z-SNES-1.0.apk)
+[تحميل إصدار 1.1 (موقّع)](https://github.com/mosalah30688-gif/bitvault-engine/releases/download/mazinger-z-v1.1/Mazinger-Z-SNES-1.1.apk)
 — حجمه 6.5 ميجا، محتاج أندرويد 8.0 أو أحدث (arm64-v8a أو armeabi-v7a).
 
 الشنيس جهاز مختلف تماماً عن NES (معالج 65816 + معالج صوت SPC700 مستقل)،
