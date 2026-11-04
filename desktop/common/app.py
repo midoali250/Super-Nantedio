@@ -4,8 +4,8 @@ import ctypes as C
 import hashlib,json,os,re,subprocess,sys,tempfile,threading,time,urllib.request
 from pathlib import Path
 import pygame
-VERSION='1.3.0'
-CATALOG='https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/desktop/super-mario-world.json'
+VERSION='1.3.1'
+CATALOG='https://raw.githubusercontent.com/midoali250/bitvault-engine/refs/heads/main/updates/desktop/super-mario-world.json'
 ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 class Core:
     def __init__(self):
