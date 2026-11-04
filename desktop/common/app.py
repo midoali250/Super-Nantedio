@@ -43,7 +43,7 @@ def update_check(result):
         entry=d['platforms']['windows' if sys.platform=='win32' else ('macos' if sys.platform=='darwin' else 'linux')]
         def ver(s): return tuple(int(x) for x in s.split('.'))
         url=entry['release_url']
-        if not url.startswith('https://github.com/midoali250/bitvault-engine/releases/tag/'):
+        if not url.startswith(('https://github.com/midoali250/bitvault-engine/releases/tag/','https://github.com/midoali250/bitvault-engine/releases/tag/')):
             raise ValueError('invalid update URL')
         if ver(entry['version'])>ver(VERSION): result.update(text='Update '+entry['version']+' available: select Download update',url=url,entry=entry)
         else: result.update(text='You have the latest version',url='')
@@ -107,7 +107,7 @@ class UpdateMonitor:
 def download_update(result):
     try:
         entry=result['entry']; url=entry['download_url']; digest=entry['sha256'].lower(); size=int(entry['size'])
-        if not url.startswith('https://github.com/midoali250/bitvault-engine/releases/download/') or not re.fullmatch(r'[0-9a-f]{64}',digest) or not 0<size<=536870912:
+        if not url.startswith(('https://github.com/midoali250/bitvault-engine/releases/download/','https://github.com/midoali250/bitvault-engine/releases/download/')) or not re.fullmatch(r'[0-9a-f]{64}',digest) or not 0<size<=536870912:
             raise ValueError('invalid update metadata')
         filename=url.rsplit('/',1)[-1]
         if not re.fullmatch(r'[A-Za-z0-9._-]+',filename): raise ValueError('invalid filename')
