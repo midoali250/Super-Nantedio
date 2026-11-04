@@ -53,6 +53,14 @@ public final class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
         prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        // Enable all three cheats once when upgrading to v1.1 or installing it.
+        // The marker prevents overriding a player's later manual choices.
+        if (!prefs.getBoolean("v11_cheats_initialized", false)) {
+            prefs.edit().putBoolean("lives", true)
+                    .putBoolean("invincible", true)
+                    .putBoolean("pit", true)
+                    .putBoolean("v11_cheats_initialized", true).apply();
+        }
         applySettings();
         Button settings = new Button(this);
         settings.setText("⚙ الإعدادات");
