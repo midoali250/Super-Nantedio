@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "status": "build-probe-only",
+  "cores": [
+    {
+      "system": "NES",
+      "name": "FCEUmm",
+      "repository": "libretro/libretro-fceumm",
+      "revision": "e0f3086a8104f8fbbe49a2615b10401504a9533f",
+      "make_dir": ".",
+      "makefile": "Makefile"
+    },
+    {
+      "system": "SNES",
+      "name": "Snes9x",
+      "repository": "libretro/snes9x",
+      "revision": "fae2fea08f74180759ef540ee94259213f503480",
+      "make_dir": "libretro",
+      "makefile": "Makefile"
+    },
+    {
+      "system": "Game Boy / Game Boy Color",
+      "name": "Gambatte",
+      "repository": "libretro/gambatte-libretro",
+      "revision": "77f2567d718b8973d02caa2daa8dce4953faf811",
+      "make_dir": ".",
+      "makefile": "Makefile"
+    },
+    {
+      "system": "Sega Mega Drive / Genesis",
+      "name": "Genesis Plus GX",
+      "repository": "libretro/Genesis-Plus-GX",
+      "revision": "f27655b592ef43f317272d79883bcaa10d3ac8ad",
+      "make_dir": ".",
+      "makefile": "Makefile.libretro"
+    },
+    {
+      "system": "Atari 2600",
+      "name": "Stella 2014",
+      "repository": "libretro/stella2014-libretro",
+      "revision": "7d1361e407e63f29e52892655069e5fb4096e691",
+      "make_dir": ".",
+      "makefile": "Makefile"
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+name: Multisystem core build probes
+on:
+  workflow_dispatch:
+  push:
+    branches: [engine/multisystem-foundation]
+    paths: ['engine/cores/**', '.github/workflows/core-build.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        core: [0, 1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned core
+        shell: bash
+        run: |
+          python3 - '${{ matrix.core }}' <<'PYCODE'
+          import json,os,subprocess,sys
+          c=json.load(open('engine/cores/registry.json'))['cores'][int(sys.argv[1])]
+          os.mkdir('core-source')
+          subprocess.run(['git','init','-q','core-source'],check=True)
+          subprocess.run(['git','-C','core-source','remote','add','origin','https://github.com/'+c['repository']+'.git'],check=True)
+          subprocess.run(['git','-C','core-source','fetch','--depth=1','origin',c['revision']],check=True)
+          subprocess.run(['git','-C','core-source','checkout','--detach','FETCH_HEAD'],check=True)
+          assert subprocess.check_output(['git','-C','core-source','rev-parse','HEAD'],text=True).strip()==c['revision']
+          subprocess.run(['git','-C','core-source','submodule','update','--init','--recursive'],check=True)
+          print('Pinned core:',c['name'],c['system'],flush=True)
+          PYCODE
+      - name: Compile Linux libretro core and check ABI
+        shell: bash
+        run: |
+          python3 - '${{ matrix.core }}' <<'PYCODE'
+          import glob,json,os,subprocess,sys
+          c=json.load(open('engine/cores/registry.json'))['cores'][int(sys.argv[1])]
+          cwd=os.path.join('core-source',c['make_dir'])
+          subprocess.run(['make','-f',c['makefile'],'-j2','platform=unix'],cwd=cwd,check=True)
+          libs=glob.glob('core-source/**/*libretro.so',recursive=True)
+          if len(libs)!=1: raise SystemExit('Expected one libretro .so, got '+repr(libs))
+          symbols=subprocess.check_output(['nm','-D','--defined-only',libs[0]],text=True)
+          for sym in ('retro_init','retro_deinit','retro_run','retro_load_game','retro_set_environment'):
+              if not any(line.split()[-1]==sym for line in symbols.splitlines() if line.split()): raise SystemExit('Missing '+sym)
+          print('PASS',c['name'],'ABI:',libs[0])
+          PYCODE
