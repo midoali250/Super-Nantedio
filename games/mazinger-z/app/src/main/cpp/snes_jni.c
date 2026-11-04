@@ -35,6 +35,8 @@ static int16_t   g_audio[AUDIO_RING_FRAMES * 2];
 static volatile int g_audio_head, g_audio_tail;   /* in stereo frames */
 
 static unsigned  g_mask;          /* joypad bitmask, libretro button ids */
+static int       g_initialised;   /* retro_init() has run */
+static int       g_loaded;        /* a game is loaded and needs unloading */
 
 static char g_save_dir[512];
 static char g_content_path[600];
@@ -293,6 +295,7 @@ Java_com_midoali_snes_SnesCore_nativeStart(JNIEnv *env, jclass cls,
    retro_set_input_state(input_state_cb);
 
    retro_init();
+   g_initialised = 1;
 
    game.path = g_content_path;
    game.data = g_rom;
@@ -306,6 +309,8 @@ Java_com_midoali_snes_SnesCore_nativeStart(JNIEnv *env, jclass cls,
 
    sram_load();
 
+   g_loaded = 1;
+
    retro_run();          /* first frame also finalises AV info */
    return JNI_TRUE;
 }
@@ -314,9 +319,17 @@ JNIEXPORT void JNICALL
 Java_com_midoali_snes_SnesCore_nativeStop(JNIEnv *env, jclass cls)
 {
    (void)env; (void)cls;
-   sram_save();
-   retro_unload_game();
-   retro_deinit();
+   if (g_loaded)
+   {
+      sram_save();
+      retro_unload_game();
+      g_loaded = 0;
+   }
+   if (g_initialised)
+   {
+      retro_deinit();
+      g_initialised = 0;
+   }
    free(g_rom);
    g_rom = NULL;
    g_rom_len = 0;
