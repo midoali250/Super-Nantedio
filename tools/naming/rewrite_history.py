@@ -12,6 +12,8 @@ def run(*args,**kw):
 def out(*args):return subprocess.check_output(args,text=True).strip()
 mode=os.environ.get('REWRITE_MODE','check')
 if mode not in ('check','apply'):raise SystemExit('Unexpected mode')
+url='https://github.com/'+os.environ['GITHUB_REPOSITORY']+'.git'
+remote_before=out('git','ls-remote','--heads','--tags',url)
 # Checkout fetched all refs. Materialize remote branches before filtering.
 refs=out('git','for-each-ref','--format=%(refname:strip=3) %(objectname)','refs/remotes/origin').splitlines()
 for line in refs:
@@ -70,7 +72,7 @@ token=os.environ.get('GITHUB_TOKEN','')
 if not token:raise SystemExit('Missing temporary Actions credential')
 import base64
 auth=base64.b64encode(('x-access-token:'+token).encode()).decode()
-url='https://github.com/'+os.environ['GITHUB_REPOSITORY']+'.git'
+if out('git','ls-remote','--heads','--tags',url)!=remote_before:raise SystemExit('Remote refs changed during rewrite; aborting')
 obsolete='arena/c6b4a986-'+(b'super-'+b'vaultengine').decode()
 args=['git','-c','http.extraheader=AUTHORIZATION: basic '+auth,'push','--atomic','--force']
 if mode=='check':args.append('--dry-run')
