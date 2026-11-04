@@ -46,3 +46,7 @@ was available to test UI, notification delivery, or actual audio playback.
 
 FCEUmm is GPLv2; see COPYING and THIRD_PARTY_NOTICES.md. The user supplied the
 ROM; ownership or distribution permission must be checked independently.
+
+## Static ROM inspection
+
+`analysis/prg-linear-disassembly.asm` is a best-effort linear 6502 decoding of the ROM PRG, not a fully verified reconstruction or buildable game source. It can misinterpret data as instructions; gameplay uses the original ROM and FCEUmm.
