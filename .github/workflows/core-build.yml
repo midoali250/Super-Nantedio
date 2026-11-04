@@ -28,9 +28,13 @@ jobs:
           subprocess.run(['git','-C','core-source','fetch','--depth=1','origin',c['revision']],check=True)
           subprocess.run(['git','-C','core-source','checkout','--detach','FETCH_HEAD'],check=True)
           assert subprocess.check_output(['git','-C','core-source','rev-parse','HEAD'],text=True).strip()==c['revision']
-          subprocess.run(['git','-C','core-source','submodule','update','--init','--recursive'],check=True)
+          if os.path.isfile('core-source/.gitmodules'):
+              subprocess.run(['git','-C','core-source','submodule','update','--init','--recursive'],check=True)
           print('Pinned core:',c['name'],c['system'],flush=True)
           PYCODE
+      - name: Install PSP graphics build dependencies
+        if: matrix.core == 8
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev libx11-dev
       - name: Compile Linux libretro core and check ABI
         shell: bash
         run: |
