@@ -115,7 +115,7 @@ jobs:
           chmod +x /tmp/appimagetool
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 /tmp/appimagetool AppDir Super-Mario-World-Linux-x86_64.AppImage
           chmod +x Super-Mario-World-Linux-x86_64.AppImage
-          bash desktop/linux/tests/smoke.sh "$PWD/Super-Mario-World-Linux-x86_64.AppImage"
+          MARIO_UI_SCREENSHOT="$PWD/ui-controls.png" bash desktop/linux/tests/smoke.sh "$PWD/Super-Mario-World-Linux-x86_64.AppImage"
       - name: Package and test macOS app
         if: matrix.platform == 'macos'
         shell: bash
@@ -127,4 +127,12 @@ jobs:
         with:
           name: Super-Mario-World-${{ matrix.platform }}-${{ matrix.arch }}
           path: Super-Mario-World-${{ matrix.platform == 'linux' && 'Linux-x86_64.AppImage' || 'macOS-arm64.zip' }}
+          if-no-files-found: error
+
+      - name: Upload UI test screenshot
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-ui-test-screenshot
+          path: ui-controls.png
           if-no-files-found: error

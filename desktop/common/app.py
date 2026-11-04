@@ -45,7 +45,7 @@ def update_check(result):
         url=entry['release_url']
         if not url.startswith('https://github.com/midoali250/bitvault-engine/releases/tag/'):
             raise ValueError('invalid update URL')
-        if ver(entry['version'])>ver(VERSION): result.update(text='Update '+entry['version']+' available: press U to download',url=url,entry=entry)
+        if ver(entry['version'])>ver(VERSION): result.update(text='Update '+entry['version']+' available: select Download update',url=url,entry=entry)
         else: result.update(text='You have the latest version',url='')
     except Exception: result.update(text='Update check unavailable; retry in Settings',url='')
 
@@ -215,7 +215,10 @@ def self_test():
     assert r[0x770]==1 and r[0x0e]==8,'Game did not start'
     x=r[0x86];run(60,1<<7);assert r[0x86]>x,'Player did not move'
     y=r[0xce];run(12,(1<<7)|(1<<8));assert r[0xce]<y,'Player did not jump'
-    state=snapshot(core); before=(r[0x86],r[0xce]);run(30,1<<7);restore(core,state);assert (r[0x86],r[0xce])==before,'Save-state restore failed'
+    state=snapshot(core); before=(r[0x86],r[0xce]);run(30,1<<7)
+    with tempfile.TemporaryDirectory() as folder:
+        path=Path(folder)/'autosave.state';write_atomic(path,state);restore(core,path.read_bytes())
+    assert (r[0x86],r[0xce])==before,'Saved file restore failed'
     frame=pygame.Surface((256,240),0,16,(0xf800,0x07e0,0x001f,0));frame.get_buffer().write(core.framebuffer());assert pygame.transform.scale(frame,(2880,2160)).get_size()==(2880,2160)
     class Keys:
         def __getitem__(self,k):return k in (pygame.K_a,pygame.K_x)
@@ -425,7 +428,10 @@ def main():
                     text(font,label,x,y+8*k)
                 footer=notice['text'] if page=='main' else message
             text(small,footer[:110],x,panel.bottom-35*k,(99,216,232))
-        pygame.display.flip();clock.tick(60)
+        pygame.display.flip()
+        if ui_test and ui_frame==10 and os.environ.get('MARIO_UI_SCREENSHOT'):
+            pygame.image.save(screen,os.environ['MARIO_UI_SCREENSHOT'])
+        clock.tick(60)
     if ui_test:assert (home_dir()/'autosave.state').is_file(), 'Exit did not save game'
     pygame.quit()
 
