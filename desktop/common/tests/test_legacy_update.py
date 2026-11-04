@@ -1,7 +1,7 @@
-"""Exercise the exact published 1.0.0 and 1.1.0 updaters against the live catalog."""
+"""Exercise the exact published updaters against the live catalog after the repository rename."""
 import hashlib,importlib.util,os,pathlib,tempfile,urllib.request
-versions=[('1.0.0','3dcb56ad581bf5cca7e5b00619d25212e1927a01'),('1.1.0','f2c8473328296716dd63436724bd7a28c7020d88')]
-expected=os.environ.get('EXPECTED_VERSION','1.2.0')
+versions=[('1.0.0','3dcb56ad581bf5cca7e5b00619d25212e1927a01'),('1.1.0','f2c8473328296716dd63436724bd7a28c7020d88'),('1.2.0','ac975d717ca1e90e44c5ce0482c704f0c306bd7b')]
+expected=os.environ.get('EXPECTED_VERSION','1.3.0')
 for version,commit in versions:
     with tempfile.TemporaryDirectory() as tmp:
         os.environ['HOME']=tmp;os.environ['USERPROFILE']=tmp
