@@ -1,4 +1,4 @@
-# bitvaultengine - NES Emulator for Android
+# BitVaultEngine - NES Emulator for Android
 
 تطبيق أندرويد لتشغيل ألعاب NES (نينتندو إنترتينمنت سيستم) مع أداة تفكيك لملفات الرويم (ROM) وسلسلة بناء آلية عبر GitHub Actions.
 

@@ -82,7 +82,7 @@ final class InAppUpdater {
                     "release-assets.githubusercontent.com".equalsIgnoreCase(host))) throw new Exception("unsafe URL");
                 c = (HttpURLConnection)url.openConnection();
                 c.setConnectTimeout(15000); c.setReadTimeout(20000); c.setInstanceFollowRedirects(false);
-                c.setRequestProperty("User-Agent", "bitvaultengine-Android-Updater/1");
+                c.setRequestProperty("User-Agent", "BitVaultEngine-Android-Updater/1");
                 int status = c.getResponseCode();
                 if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
                     String location = c.getHeaderField("Location");

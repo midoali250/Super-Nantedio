@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">bitvaultengine NES</string>
+    <string name="app_name">NES Emulator</string>
     <string name="load_rom">تحميل روم NES</string>
     <string name="play">تشغيل</string>
     <string name="pause">إيقاف مؤقت</string>

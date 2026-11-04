@@ -4,7 +4,7 @@ import ctypes as C
 import hashlib,json,os,re,subprocess,sys,tempfile,threading,time,urllib.request
 from pathlib import Path
 import pygame
-VERSION='1.3.1'
+VERSION='1.4.0'
 CATALOG='https://raw.githubusercontent.com/midoali250/bitvault-engine/refs/heads/main/updates/desktop/super-mario-world.json'
 ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 class Core:
@@ -38,7 +38,7 @@ class Core:
 
 def update_check(result):
     try:
-        req=urllib.request.Request(CATALOG,headers={'Cache-Control':'no-cache','User-Agent':'bitvaultengineDesktop/1'})
+        req=urllib.request.Request(CATALOG,headers={'Cache-Control':'no-cache','User-Agent':'BitVaultEngineDesktop/1'})
         with urllib.request.urlopen(req,timeout=10) as response: d=json.load(response)
         entry=d['platforms']['windows' if sys.platform=='win32' else ('macos' if sys.platform=='darwin' else 'linux')]
         def ver(s): return tuple(int(x) for x in s.split('.'))
@@ -59,9 +59,9 @@ def system_notification(version):
         else:env.pop('LD_LIBRARY_PATH',None)
         import shutil
         if shutil.which('notify-send'):
-            cmd=['notify-send','--app-name=bitvaultengine','--expire-time=10000',title,message]
+            cmd=['notify-send','--app-name=Mario World','--expire-time=10000',title,message]
         elif shutil.which('gdbus'):
-            cmd=['gdbus','call','--session','--dest','org.freedesktop.Notifications','--object-path','/org/freedesktop/Notifications','--method','org.freedesktop.Notifications.Notify','bitvaultengine','0','',title,message,'[]','{}','10000']
+            cmd=['gdbus','call','--session','--dest','org.freedesktop.Notifications','--object-path','/org/freedesktop/Notifications','--method','org.freedesktop.Notifications.Notify','BitVaultEngine','0','',title,message,'[]','{}','10000']
         else:return False
     elif sys.platform=='darwin':cmd=['osascript','-e','display notification "'+message+'" with title "'+title+'"']
     elif sys.platform=='win32':
@@ -114,7 +114,7 @@ def download_update(result):
         folder=Path.home()/'Downloads';folder.mkdir(parents=True,exist_ok=True)
         fd,tmp=tempfile.mkstemp(prefix='.bitvault-engine-',suffix='.part',dir=str(folder)); done=0; h=hashlib.sha256()
         try:
-            with os.fdopen(fd,'wb') as out, urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'bitvaultengineDesktop/1'}),timeout=30) as response:
+            with os.fdopen(fd,'wb') as out, urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'BitVaultEngineDesktop/1'}),timeout=30) as response:
                 while True:
                     chunk=response.read(262144)
                     if not chunk: break
@@ -152,7 +152,7 @@ def home_dir():
     if sys.platform=='win32': root=Path(os.environ.get('APPDATA',Path.home()))
     elif sys.platform=='darwin': root=Path.home()/'Library'/'Application Support'
     else: root=Path(os.environ.get('XDG_CONFIG_HOME',Path.home()/'.config'))
-    p=root/'bitvaultengine'/'MarioWorld';p.mkdir(parents=True,exist_ok=True);return p
+    p=root/'bitvault-engine'/'MarioWorld';p.mkdir(parents=True,exist_ok=True);return p
 
 def read_json(path):
     try:

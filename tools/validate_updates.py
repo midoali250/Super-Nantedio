@@ -40,7 +40,7 @@ def validate(path, check_downloads):
     assert isinstance(date, str) and date.endswith('Z'), 'published_at must be UTC'
     dt.datetime.fromisoformat(date[:-1] + '+00:00')
     if check_downloads:
-        req = Request(d['apk_url'], headers={'User-Agent': 'bitvaultengine-update-validator/1'})
+        req = Request(d['apk_url'], headers={'User-Agent': 'BitVaultEngine-update-validator/1'})
         sha = hashlib.sha256()
         size = 0
         with urlopen(req, timeout=60) as response:
