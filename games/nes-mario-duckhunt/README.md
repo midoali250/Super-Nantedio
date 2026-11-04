@@ -115,4 +115,4 @@ and `2` compare an unprotected and protected enemy encounter in 1-1.
 
 ## Project migration
 
-This directory imports the source at `midoali250/nes-android` commit `05b3ea7124fe5d517eb7cb1c81f93732eeca3e0d`. Generated native build outputs were deliberately excluded. Prior commit history remains in the original repository.
+The Mario + Duck Hunt source is maintained in this directory. Generated native build outputs are deliberately excluded.

@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "nes-android"
+rootProject.name = "nes-mario-duckhunt"
 include(":app")
