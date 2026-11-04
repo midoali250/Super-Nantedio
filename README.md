@@ -98,3 +98,36 @@ Source, controls, optional Mario cheats, and tests: [`games/nes-mario-duckhunt/`
 ## Super Mario Bros. (World) للأندرويد
 
 [مشروع اللعبة](games/super-mario-world/) — [تحميل إصدار 1.4](https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-v1.4/Super-Mario-Bros-World-1.4.apk).
+
+
+## Mazinger Z (SNES) للأندرويد
+
+[مشروع اللعبة](games/mazinger-z/) — أول لعبة **SNES** في المستودع.
+
+الشنيس جهاز مختلف تماماً عن NES (معالج 65816 + معالج صوت SPC700 مستقل)،
+فمحتاج نواة محاكي خاصة. المشروع بيتبني بنفس نمط ألعاب NES الموجودة:
+
+- `app/src/main/cpp/snes_jni.c`: جسر JNI فوق واجهة libretro — بيغذّي الروم
+  في `retro_load_game()`، ويسلّم الفيديو RGB565 والصوت ستيريو، ويترجم قناع
+  أزرار الديد باد.
+- `app/src/main/cpp/snes9x2010-src/`: نواة Snes9x 2010 (انظر التراخيص في
+  `games/mazinger-z/THIRD_PARTY_NOTICES.md`).
+- `app/src/main/java/com/midoali/snes/`: طبقة الأندرويد — النشاط، خيط المحاكاة،
+  سطح العرض، ولوحة المفاتيح (عصا + X/Y/A/B + L/R).
+- `tools/host/`: مشغّل على سطح المكتب بيشغّل **نفس** كود C عشان تختبر النواة
+  من غير موبايل.
+- `tools/vpad/`: اختبار لطبقة التحكم على JVM عادي.
+
+اختبار النواة من غير جهاز:
+
+```bash
+cd games/mazinger-z
+cmake -S tools/host -B tools/host/build && cmake --build tools/host/build -j 2
+python3 tools/host/test_boot.py
+```
+
+الـ build على أندرويد يحتاج JDK 17 وSDK 35 وNDK 27.0.12077973 وCMake 3.22.1.
+نواة Snes9x بترخيص غير تجاري، فالمشروع ده للاستخدام الشخصي غير التجاري؛
+لو احتجت توزيع تجاري، بدّل النواة بـ bsnes (GPLv3) — جسر JNI بيتكلم مع
+واجهة libretro بس، فما فيوش حاجة تانية هتتغير.
+
