@@ -79,3 +79,5 @@ if mode=='check':args.append('--dry-run')
 args.extend([url,'refs/heads/*:refs/heads/*','refs/tags/*:refs/tags/*',':refs/heads/'+obsolete])
 run(*args)
 print('Verified atomic push without modifying the remote' if mode=='check' else 'Applied atomic rewrite and removed obsolete branch name',flush=True)
+if mode=='check':
+    Path(os.environ['RUNNER_TEMP'],'history-refs-before.txt').write_text(remote_before+'\n')

@@ -29,3 +29,17 @@ jobs:
           REWRITE_MODE: ${{ inputs.mode }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python tools/naming/rewrite_history.py
+      - name: Package verified rewritten objects for authenticated transfer
+        if: inputs.mode == 'check'
+        run: |
+          if git config --local --get-regexp 'http\..*extraheader|credential\.'; then echo 'Unexpected credentials in git config'; exit 1; fi
+          tar -cf "$RUNNER_TEMP/clean-history.tar" .git
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode == 'check'
+        with:
+          name: verified-history-transfer
+          path: |
+            ${{ runner.temp }}/clean-history.tar
+            ${{ runner.temp }}/history-refs-before.txt
+          retention-days: 1
+          if-no-files-found: error
