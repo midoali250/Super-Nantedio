@@ -82,3 +82,5 @@ SHA-256 يكشف اختلاف الملف عن البيانات المعلنة، 
 للسماح بالتثبيت من هذه اللعبة. يجب تسجيل `UpdateFileProvider` بصلاحية URI
 مؤقتة وإضافة `REQUEST_INSTALL_PACKAGES`، واستدعاء
 `UpdateClient.resumePendingInstall(this)` من `onResume`؛ راجع المثال.
+
+إصدار Mario + Duck Hunt 1.3 موقّع بمفتاح جديد؛ لا يمكن تثبيته فوق 1.2 الموقّع بالمفتاح السابق.

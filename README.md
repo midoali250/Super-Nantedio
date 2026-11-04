@@ -97,4 +97,4 @@ Source, controls, optional Mario cheats, and tests: [`games/nes-mario-duckhunt/`
 
 ## Super Mario Bros. (World) للأندرويد
 
-[مشروع اللعبة](games/super-mario-world/) — [تحميل إصدار 1.0](https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-v1.0/Super-Mario-Bros-World-1.0.apk).
+[مشروع اللعبة](games/super-mario-world/) — [تحميل إصدار 1.4](https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-v1.4/Super-Mario-Bros-World-1.4.apk).

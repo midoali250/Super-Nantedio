@@ -10,7 +10,7 @@ No external emulator, no browser, no second app: install, launch, play.
 
 ## Install
 
-**[⬇ Download NES-Mario-DuckHunt-1.2.apk](https://github.com/midoali250/bitvault-engine/releases/download/nes-mario-duckhunt-v1.2/NES-Mario-DuckHunt-1.2.apk)**
+**[⬇ Download the original signed NES-Mario-DuckHunt-1.2.apk](https://github.com/midoali250/bitvault-engine/releases/download/nes-mario-duckhunt-v1.2/NES-Mario-DuckHunt-1.2.apk)**
 
 Open the file on the phone (Android 8.0 / API 26 or newer, arm64 or armv7).
 All builds: [Releases page](https://github.com/midoali250/bitvault-engine/releases).
@@ -116,3 +116,7 @@ and `2` compare an unprotected and protected enemy encounter in 1-1.
 ## Project migration
 
 The Mario + Duck Hunt source is maintained in this directory. Generated native build outputs are deliberately excluded.
+
+## Version 1.3 signed build
+
+[Download Mario-Duck-Hunt-1.3.apk](https://github.com/midoali250/bitvault-engine/releases/download/nes-mario-duckhunt-v1.3/Mario-Duck-Hunt-1.3.apk). Version 1.3 uses a new signing key; Android requires uninstalling the old installation before installing it. The original 1.2 release is retained.
