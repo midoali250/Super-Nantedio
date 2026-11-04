@@ -20,4 +20,5 @@ jobs:
           java-version: '17'
       - name: Build example using shared update client
         working-directory: updates/client/android/sample
-        run: "$GITHUB_WORKSPACE/games/nes-mario-duckhunt/gradlew" :app:assembleDebug --no-daemon
+        run: |
+          "$GITHUB_WORKSPACE/games/nes-mario-duckhunt/gradlew" :app:assembleDebug --no-daemon
