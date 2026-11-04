@@ -90,6 +90,27 @@ to save. The app still wires the save RAM through the libretro
 `snes_jni.c`), so a cartridge that does have SRAM will persist its saves in the
 app's private files directory.
 
+## Release signing
+
+The release build is signed only when the signing environment is present, so
+no key ever lives in the repository:
+
+| Variable | Meaning |
+| --- | --- |
+| `SNES_KEYSTORE_PATH` | path to the `.jks` keystore |
+| `SNES_KEYSTORE_PASSWORD` | keystore password |
+| `SNES_KEY_ALIAS` | key alias inside the keystore |
+| `SNES_KEY_PASSWORD` | password for that key |
+
+The CI workflow feeds those from the `SNES_SIGNING_KEY_B64`,
+`SNES_SIGNING_PASSWORD` and `SNES_SIGNING_ALIAS` repository secrets. Without
+them the release APK is produced unsigned and the debug APK is signed with the
+standard Android debug key.
+
+Keep a backup of the keystore. Android refuses to install an update whose
+signature differs from the installed one, so losing the key means the next
+release has to be published under a new package name.
+
 ## Legal
 
 The emulator carries no game code of its own. The bundled cartridge image is
