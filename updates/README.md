@@ -8,13 +8,14 @@
 يفحص عند فتح اللعبة وبشكل دوري في الخلفية (أندرويد يحدد التوقيت)، ويعرض إشعارًا
 عند توفر إصدار أحدث إذا سمح المستخدم بالإشعارات. يمكن إضافة زر للتحقق داخل
 اللعبة، والتحميل والتثبيت اختياريان وبموافقة المستخدم. دمج العميل مطلوب لكل
-لعبة جديدة؛ الألعاب القديمة لم يتم تعديلها ولا تظهر الإشعارات تلقائيًا.
+لعبة جديدة؛ نسخة Super Mario Bros. (World) 1.0 تتضمنه، والألعاب القديمة لم يتم تعديلها.
 
 ## الألعاب المسجّلة
 
 | اللعبة | ملف بيانات التحديث | الحزمة |
 | --- | --- | --- |
 | ماريو + داك هانت | [`games/nes-mario-duckhunt.json`](games/nes-mario-duckhunt.json) | `com.midoali.nes` |
+| ماريو الأصلية (World) | [`games/super-mario-world.json`](games/super-mario-world.json) | `com.midoali.supermarioworld` |
 
 الرابط الثابت الذي سيقرأه عميل اللعبة مستقبلًا:
 `https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/games/nes-mario-duckhunt.json`
