@@ -9,10 +9,11 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        core: [0, 1, 2, 3, 4]
+        core: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
       - name: Fetch pinned core

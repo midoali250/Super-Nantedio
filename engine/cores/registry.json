@@ -41,6 +41,38 @@
       "revision": "7d1361e407e63f29e52892655069e5fb4096e691",
       "make_dir": ".",
       "makefile": "Makefile"
+    },
+    {
+      "system": "Sony PlayStation",
+      "name": "PCSX ReARMed",
+      "repository": "libretro/pcsx_rearmed",
+      "revision": "7b0e8f8fadfbce3d170d195b9d9eecaabfa08c8e",
+      "make_dir": ".",
+      "makefile": "Makefile.libretro"
+    },
+    {
+      "system": "Sony PlayStation",
+      "name": "Beetle PSX",
+      "repository": "libretro/beetle-psx-libretro",
+      "revision": "71ee81e77acd49296ecf4a683f5a61568ba80bf9",
+      "make_dir": ".",
+      "makefile": "Makefile"
+    },
+    {
+      "system": "Sony PlayStation",
+      "name": "SwanStation",
+      "repository": "libretro/swanstation",
+      "revision": "631f0fb31b809e0f889d7c551fe695788e39c1d3",
+      "make_dir": ".",
+      "makefile": "Makefile.libretro"
+    },
+    {
+      "system": "Sony PSP",
+      "name": "PPSSPP libretro",
+      "repository": "libretro/ppsspp",
+      "revision": "7b4ddb426bbe9e287bb7f19b0cfaebb4ea0d41d8",
+      "make_dir": "libretro",
+      "makefile": "Makefile"
     }
   ]
 }
