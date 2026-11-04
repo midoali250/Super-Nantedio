@@ -43,7 +43,7 @@ final class InAppUpdater {
         Handler main = new Handler(Looper.getMainLooper());
         new Thread(() -> {
             File target = apkFile(a);
-            File part = new File(target.getParentFile(), "download.part");
+            File part = new File(target.getParentFile(), "download-part.apk");
             try {
                 if (!target.getParentFile().exists() && !target.getParentFile().mkdirs()) throw new Exception("directory");
                 download(release, part, canceled, p -> main.post(() -> {
