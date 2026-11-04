@@ -19,4 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Verify manifest and downloadable APK checksum
+        env:
+          # Releases on a private repository are only served to an
+          # authenticated caller, so the download check needs a token.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/validate_updates.py --check-downloads

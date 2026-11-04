@@ -16,9 +16,17 @@
 | --- | --- | --- |
 | ماريو + داك هانت | [`games/nes-mario-duckhunt.json`](games/nes-mario-duckhunt.json) | `com.midoali.nes` |
 | ماريو الأصلية (World) | [`games/super-mario-world.json`](games/super-mario-world.json) | `com.midoali.supermarioworld` |
+| مازينجر Z (SNES) | [`games/mazinger-z.json`](games/mazinger-z.json) | `com.midoali.snes.mazingerz` |
 
 الرابط الثابت الذي سيقرأه عميل اللعبة مستقبلًا:
 `https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/games/nes-mario-duckhunt.json`
+
+ملاحظة عن الحسابات: إصدارات مازينجر Z منشورة على
+`mosalah30688-gif/bitvault-engine`، وهو مستودع **خاص**، فالرابط بيستخدم
+endpoint الـ API بدل رابط التحميل العام. رابط `raw.githubusercontent.com` ما
+بيوصلش لمستودع خاص من غير توكن — يعني زر «التحديث» جوه التطبيق بيفضل صامت
+طالما المستودع خاص. علشان التحديث يشتغل تلقائي، لازم يكون المستودع عام.
+
 
 ## إضافة تحديث
 

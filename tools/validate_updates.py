@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -15,6 +16,14 @@ MANIFESTS = ROOT / 'updates' / 'games'
 GAME_ID = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 PACKAGE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z][a-zA-Z0-9_]*)+$')
 HASH = re.compile(r'^[0-9a-f]{64}$')
+
+# Release assets may live on any of the project's own accounts. Set
+# BITVAULT_RELEASE_OWNERS to a comma separated list to override.
+RELEASE_OWNERS = tuple(
+    owner.strip() for owner in os.environ.get(
+        'BITVAULT_RELEASE_OWNERS', 'midoali250,mosalah30688-gif').split(',')
+    if owner.strip())
+RELEASE_REPO = 'bitvault-engine'
 
 
 def validate(path, check_downloads):
@@ -33,14 +42,36 @@ def validate(path, check_downloads):
     for name in ('apk_url', 'release_url'):
         assert isinstance(d.get(name), str), f'invalid {name}'
         u = urlparse(d[name])
-        assert u.scheme == 'https' and u.hostname == 'github.com' and not u.username and not u.password, f'invalid {name}'
-        assert u.path.startswith('/midoali250/bitvault-engine/releases/'), f'unexpected {name} path'
-    assert d['apk_url'].endswith('.apk'), 'apk_url must point to an APK'
+        assert u.scheme == 'https' and not u.username and not u.password, f'invalid {name}'
+        # A public repository uses the browser download URL; a private one has
+        # to go through the API, which is the only endpoint that serves a
+        # release asset to an authenticated caller.
+        if u.hostname == 'api.github.com':
+            assert u.path.startswith('/repos/'), f'invalid {name} path'
+            parts = u.path.split('/')
+            assert len(parts) >= 7 and parts[2] in RELEASE_OWNERS and parts[3] == RELEASE_REPO, \
+                f'unexpected {name} path (allowed owners: {", ".join(RELEASE_OWNERS)})'
+        else:
+            assert u.hostname == 'github.com', f'invalid {name} host'
+            allowed = (f'/{owner}/{RELEASE_REPO}/releases/' for owner in RELEASE_OWNERS)
+            assert any(u.path.startswith(prefix) for prefix in allowed), \
+                f'unexpected {name} path (allowed owners: {", ".join(RELEASE_OWNERS)})'
+        if name == 'apk_url' and u.hostname == 'github.com':
+            assert d['apk_url'].endswith('.apk'), 'apk_url must point to an APK'
     date = d.get('published_at', '')
     assert isinstance(date, str) and date.endswith('Z'), 'published_at must be UTC'
     dt.datetime.fromisoformat(date[:-1] + '+00:00')
     if check_downloads:
-        req = Request(d['apk_url'], headers={'User-Agent': 'BitVaultEngine-update-validator/1'})
+        headers = {'User-Agent': 'BitVaultEngine-update-validator/1'}
+        # A release that lives on a private repository needs a token to fetch.
+        token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        if urlparse(d['apk_url']).hostname == 'api.github.com':
+            # Without this the API answers with the asset metadata instead of
+            # the file itself.
+            headers['Accept'] = 'application/octet-stream'
+        req = Request(d['apk_url'], headers=headers)
         sha = hashlib.sha256()
         size = 0
         with urlopen(req, timeout=60) as response:
