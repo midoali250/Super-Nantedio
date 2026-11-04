@@ -66,14 +66,14 @@ p.stdin.close();p.wait();
 if p.returncode:raise SystemExit('git object scan failed')
 print('PASS rewritten history: commits',out('git','rev-list','--all','--count'),'text blobs checked',count,flush=True)
 print('HEAD',out('git','rev-parse','refs/heads/main'),flush=True)
-if mode=='apply':
- token=os.environ.get('GITHUB_TOKEN','')
- if not token:raise SystemExit('Missing temporary Actions credential')
- import base64
- auth=base64.b64encode(('x-access-token:'+token).encode()).decode()
- url='https://github.com/'+os.environ['GITHUB_REPOSITORY']+'.git'
- run('git','-c','http.extraheader=AUTHORIZATION: basic '+auth,'push','--force',url,'refs/heads/*:refs/heads/*','refs/tags/*:refs/tags/*')
- # Delete the obsolete remote branch only after the renamed branch is pushed.
- obsolete='arena/c6b4a986-'+(b'super-'+b'vaultengine').decode()
- run('git','-c','http.extraheader=AUTHORIZATION: basic '+auth,'push',url,':refs/heads/'+obsolete)
- print('Applied rewritten refs and removed obsolete branch name',flush=True)
+token=os.environ.get('GITHUB_TOKEN','')
+if not token:raise SystemExit('Missing temporary Actions credential')
+import base64
+auth=base64.b64encode(('x-access-token:'+token).encode()).decode()
+url='https://github.com/'+os.environ['GITHUB_REPOSITORY']+'.git'
+obsolete='arena/c6b4a986-'+(b'super-'+b'vaultengine').decode()
+args=['git','-c','http.extraheader=AUTHORIZATION: basic '+auth,'push','--atomic','--force']
+if mode=='check':args.append('--dry-run')
+args.extend([url,'refs/heads/*:refs/heads/*','refs/tags/*:refs/tags/*',':refs/heads/'+obsolete])
+run(*args)
+print('Verified atomic push without modifying the remote' if mode=='check' else 'Applied atomic rewrite and removed obsolete branch name',flush=True)
