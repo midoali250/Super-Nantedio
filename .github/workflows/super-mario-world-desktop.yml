@@ -33,6 +33,7 @@ jobs:
         run: |
           $wheel = Get-ChildItem desktop/vendor/*win_amd64.whl | Select-Object -First 1
           if ((Get-FileHash $wheel.FullName -Algorithm SHA256).Hash.ToLower() -ne '91476902426facd4bb0dad4dc3b2573bc82c95c71b135e0daaea072ed528d299') { throw 'pygame wheel checksum mismatch' }
+          python -m pip install setuptools==69.5.1
           python -m pip install $wheel.FullName pyinstaller==6.12.0
       - name: Test and package portable EXE
         shell: pwsh
@@ -86,6 +87,7 @@ jobs:
             wheel=$(find desktop/vendor -name '*macosx*arm64.whl')
             echo 'f3935459109da4bb0b3901da9904f0a3e52028a3332a355d298b1673a334cf21  '"$wheel" | shasum -a 256 -c -
           fi
+          python -m pip install setuptools==69.5.1
           python -m pip install "$wheel" pyinstaller==6.12.0
       - name: Build core and test input/gameplay
         shell: bash

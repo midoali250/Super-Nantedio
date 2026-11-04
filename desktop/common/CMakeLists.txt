@@ -30,7 +30,7 @@ set(SRCS
 add_library(nesapp_host SHARED ${SRCS})
 set_target_properties(nesapp_host PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 if(MINGW)
-  target_link_options(nesapp_host PRIVATE -static-libgcc)
+  target_link_options(nesapp_host PRIVATE -static-libgcc -Wl,--export-all-symbols)
 endif()
 target_include_directories(nesapp_host PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CORE} ${CORE}/drivers/libretro ${COMMON}/include ${CORE}/input ${CORE}/boards)
