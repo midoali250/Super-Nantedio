@@ -3,6 +3,8 @@ package com.midoali.nes;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.SharedPreferences;
+import android.content.Intent;
+import com.bitvaultengine.updates.UpdateClient;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.LinearLayout;
@@ -71,6 +73,10 @@ public final class MainActivity extends Activity {
                 Gravity.CENTER));
 
         setContentView(root);
+        UpdateClient.schedule(this);
+        UpdateClient.requestNotificationPermission(this);
+        if (!UpdateClient.consumeNotificationIntent(this, getIntent()))
+            UpdateClient.checkInBackground(this);
 
         final Handler main = new Handler(Looper.getMainLooper());
         new Thread(() -> {
@@ -128,6 +134,11 @@ public final class MainActivity extends Activity {
             prefs.edit().putBoolean("pit", checked).apply(); applySettings();
         });
         box.addView(pit);
+        Button checkUpdate = new Button(this);
+        checkUpdate.setText("التحقق من تحديث اللعبة");
+        checkUpdate.setAllCaps(false);
+        checkUpdate.setOnClickListener(v -> UpdateClient.checkNow(this));
+        box.addView(checkUpdate);
         CheckBox stretch = new CheckBox(this);
         stretch.setText("ملء عرض الشاشة (الصورة تتمدد بدون قص)");
         stretch.setChecked(prefs.getBoolean("stretch", false));
@@ -189,6 +200,13 @@ public final class MainActivity extends Activity {
                         | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                         | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                         | View.SYSTEM_UI_FLAG_FULLSCREEN);
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        UpdateClient.consumeNotificationIntent(this, intent);
     }
 
     @Override

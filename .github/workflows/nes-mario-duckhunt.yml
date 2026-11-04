@@ -4,10 +4,12 @@ on:
     branches: [ main ]
     paths:
       - 'games/nes-mario-duckhunt/**'
+      - 'updates/client/android/**'
       - '.github/workflows/nes-mario-duckhunt.yml'
   pull_request:
     paths:
       - 'games/nes-mario-duckhunt/**'
+      - 'updates/client/android/**'
       - '.github/workflows/nes-mario-duckhunt.yml'
   workflow_dispatch:
 jobs:
