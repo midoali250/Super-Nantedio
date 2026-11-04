@@ -93,3 +93,8 @@ Source, controls, optional Mario cheats, and tests: [`games/nes-mario-duckhunt/`
 - قبل إنشاء لعبة جديدة: انسخ قالب عميل التحديثات في `updates/client/android/`,
   وأضف ملف إصدار مستقل واحتفظ بمفتاح توقيع اللعبة في مكان آمن مع نسخة احتياطية.
 - بناء APK لا يمنح حقوق توزيع ROM: تحقق من الترخيص وحق التوزيع لكل لعبة.
+
+
+## Super Mario Bros. (World) للأندرويد
+
+[مشروع اللعبة](games/super-mario-world/) — [تحميل إصدار 1.0](https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-v1.0/Super-Mario-Bros-World-1.0.apk).
