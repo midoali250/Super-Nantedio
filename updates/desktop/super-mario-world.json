@@ -1,8 +1,26 @@
 {
   "game": "super-mario-world-desktop",
   "platforms": {
-    "windows": {"version":"1.0.0", "release_url":"https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0"},
-    "linux": {"version":"1.0.0", "release_url":"https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0"},
-    "macos": {"version":"1.0.0", "release_url":"https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0"}
+    "windows": {
+      "version": "1.0.0",
+      "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0",
+      "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-desktop-v1.0.0/Super-Mario-World-Windows-x64.exe",
+      "size": 16767417,
+      "sha256": "f7439f10fff30467f23242e51504674ebb4701bf0c5041f157c5a338ae5009c4"
+    },
+    "linux": {
+      "version": "1.0.0",
+      "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0",
+      "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-desktop-v1.0.0/Super-Mario-World-Linux-x86_64.AppImage",
+      "size": 27367928,
+      "sha256": "c2859a2fc2b95c90c3581f21558ccfec3cb4b17dd82532a282c206b22787d2f3"
+    },
+    "macos": {
+      "version": "1.0.0",
+      "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-desktop-v1.0.0",
+      "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-desktop-v1.0.0/Super-Mario-World-macOS-arm64.zip",
+      "size": 14914210,
+      "sha256": "362f5bb80f9489fcde870b7f01ed39a14d824b84b37ab57425b2c93afea16f36"
+    }
   }
 }
