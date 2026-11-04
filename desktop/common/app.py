@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Super Mario Bros. desktop frontend, FCEUmm core."""
 import ctypes as C
-import hashlib,json,os,re,sys,tempfile,threading,time,urllib.request
+import hashlib,json,os,re,subprocess,sys,tempfile,threading,time,urllib.request
 from pathlib import Path
 import pygame
-VERSION='1.2.0'
+VERSION='1.3.0'
 CATALOG='https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/desktop/super-mario-world.json'
 ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 class Core:
@@ -48,6 +48,60 @@ def update_check(result):
         if ver(entry['version'])>ver(VERSION): result.update(text='Update '+entry['version']+' available: select Download update',url=url,entry=entry)
         else: result.update(text='You have the latest version',url='')
     except Exception: result.update(text='Update check unavailable; retry in Settings',url='')
+
+def system_notification(version):
+    """Best effort OS notification; the game banner is independent."""
+    if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,3}',version):return False
+    title='Super Mario World update';message='Version '+version+' is available. Open game settings to download.'
+    env=os.environ.copy()
+    if sys.platform.startswith('linux'):
+        if 'LD_LIBRARY_PATH_ORIG' in env:env['LD_LIBRARY_PATH']=env['LD_LIBRARY_PATH_ORIG']
+        else:env.pop('LD_LIBRARY_PATH',None)
+        import shutil
+        if shutil.which('notify-send'):
+            cmd=['notify-send','--app-name=bitvaultengine','--expire-time=10000',title,message]
+        elif shutil.which('gdbus'):
+            cmd=['gdbus','call','--session','--dest','org.freedesktop.Notifications','--object-path','/org/freedesktop/Notifications','--method','org.freedesktop.Notifications.Notify','bitvaultengine','0','',title,message,'[]','{}','10000']
+        else:return False
+    elif sys.platform=='darwin':cmd=['osascript','-e','display notification "'+message+'" with title "'+title+'"']
+    elif sys.platform=='win32':
+        script="""[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] > $null
+$xml=New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>Super Mario World update</text><text>Version VERSION is available. Open game settings to download.</text></binding></visual></toast>')
+$toast=[Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('bitvaultengine.MarioWorld').Show($toast)
+""".replace('VERSION',version)
+        cmd=['powershell.exe','-NoProfile','-NonInteractive','-Command',script]
+    else:return False
+    try:
+        result=subprocess.run(cmd,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,timeout=8,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0) if sys.platform=='win32' else 0)
+        return result.returncode==0
+    except (OSError,subprocess.SubprocessError):return False
+
+class UpdateMonitor:
+    """Check at launch and every five minutes while the game is running."""
+    def __init__(self,status=None,checker=update_check,notifier=system_notification,interval=300):
+        self.status=status if status is not None else {'text':'Checking for updates...', 'url':''}
+        self.checker=checker;self.notifier=notifier;self.interval=interval;self.next_check=0
+        self.banner_until=0;self.notified=set();self.busy=False;self.lock=threading.Lock();self.thread=None
+    def check(self):
+        with self.lock:
+            if self.busy:return False
+            self.busy=True;self.next_check=time.monotonic()+self.interval
+        def run():
+            result={}
+            try:
+                self.checker(result);self.status.update(result)
+                entry=result.get('entry',{})
+                version=entry.get('version','') if result.get('url') else ''
+                if version and version not in self.notified:
+                    self.notified.add(version);self.banner_until=time.monotonic()+15;self.notifier(version)
+            finally:
+                with self.lock:self.busy=False
+        self.thread=threading.Thread(target=run,name='update-check',daemon=True);self.thread.start();return True
+    def poll(self):
+        if time.monotonic()>=self.next_check:self.check()
 
 def download_update(result):
     try:
@@ -267,8 +321,24 @@ def self_test():
         def get_axis(self,n):return .8 if n==0 else 0
         def get_numhats(self):return 0
     m=input_mask(DEFAULTS,Empty(),(False,)*5,[Pad()],0);assert m&(1<<7) and m&1
+    seen=[];fake_version=['9.0.0']
+    def fake_check(out):out.update(text='new',url='https://example.test',entry={'version':fake_version[0]})
+    monitor=UpdateMonitor(checker=fake_check,notifier=lambda v:seen.append(v),interval=0)
+    monitor.check();monitor.thread.join(3);assert seen==['9.0.0'] and monitor.banner_until>time.monotonic()
+    monitor.poll();monitor.thread.join(3);assert seen==['9.0.0'],'Duplicate notification'
+    fake_version[0]='9.1.0';monitor.poll();monitor.thread.join(3);assert seen==['9.0.0','9.1.0'],'New update notification missing'
     print('PASS: gameplay, save/restore, 4K scaling, keyboard/mouse/gamepad, repeated actions')
     pygame.quit()
+def update_network_test():
+    # Exercise the packaged Python/SSL/catalog path as an older version.
+    global VERSION
+    actual=VERSION;VERSION='1.0.0';result={}
+    try:
+        update_check(result)
+        assert result.get('url') and result.get('entry',{}).get('version') not in (None,'1.0.0'),result
+        print('PASS: packaged update check found version',result['entry']['version'])
+    finally:VERSION=actual
+
 def main():
     ui_test='--ui-test' in sys.argv
     if ui_test:
@@ -282,8 +352,8 @@ def main():
     pygame.display.set_caption('Super Mario Bros. World')
     core=Core();frame=pygame.Surface((core.w,core.h),0,16,(0xf800,0x07e0,0x001f,0))
     cfg=load_config();controls=cfg['controls'];cheat=cfg['cheats'];pads=devices()
-    notice={'text':'Checking for updates...', 'url':''}
-    if not ui_test:threading.Thread(target=update_check,args=(notice,),daemon=True).start()
+    notice={'text':'Checking for updates...', 'url':''};monitor=UpdateMonitor(status=notice)
+    if not ui_test:monitor.check()
     message=''
     try:message='Previous game restored' if load_game(core) else 'New game'
     except (OSError,ValueError,RuntimeError):message='Save could not be loaded';
@@ -314,7 +384,8 @@ def main():
             elif choice=='Load saved game':
                 try:message='Saved game loaded' if load_game(core) else 'No saved game yet'
                 except (OSError,ValueError,RuntimeError):message='Could not load save'
-            elif choice=='Check for updates':notice.update(text='Checking for updates...',url='');threading.Thread(target=update_check,args=(notice,),daemon=True).start()
+            elif choice=='Check for updates':
+                if not monitor.busy:notice.update(text='Checking for updates...',url='');monitor.check()
             elif choice=='Download update':
                 if notice.get('url'):notice.update(text='Starting download...',url='');threading.Thread(target=download_update,args=(notice,),daemon=True).start()
                 else:message='Check for an available update first'
@@ -376,6 +447,8 @@ def main():
             if e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
                 w,h=screen.get_size()
                 if pygame.Rect(w-62,10,52,52).collidepoint(e.pos):back();continue
+                if not page and time.monotonic()<monitor.banner_until and pygame.Rect(max(5,(w-560)//2),12,min(560,w-10),64).collidepoint(e.pos):
+                    page='main';selected=7;continue
                 if page:
                     for rect,row,col in buttons:
                         if rect.collidepoint(e.pos):
@@ -401,6 +474,7 @@ def main():
             elif key in (pygame.K_RETURN,pygame.K_KP_ENTER):activate()
             elif key==pygame.K_BACKSPACE:back()
         if not running:break
+        if not ui_test:monitor.poll()
         if not page:
             now=time.perf_counter()
             if now < next_frame:
@@ -438,6 +512,7 @@ def main():
         screen.blit(scaled,((w-dw)//2,(h-dh)//2))
         # Persistent gear. No on-screen game controls.
         gear=pygame.Rect(w-62,10,52,52);pygame.draw.rect(screen,(21,29,46),gear,border_radius=14)
+        if notice.get('url'):pygame.draw.circle(screen,(239,74,80),(gear.right-3,gear.top+3),8)
         cx,cy=gear.center;pygame.draw.circle(screen,(230,238,250),(cx,cy),14,4)
         for a in range(0,360,45):
             import math
@@ -481,6 +556,11 @@ def main():
                     text(font,label,x,y+8*k)
                 footer=notice['text'] if page=='main' else message
             text(small,footer[:110],x,panel.bottom-35*k,(99,216,232))
+        if not page and time.monotonic()<monitor.banner_until:
+            bw=min(560,w-10);banner=pygame.Rect(max(5,(w-bw)//2),12,bw,64);pygame.draw.rect(screen,(23,54,78),banner,border_radius=10);pygame.draw.rect(screen,(78,191,209),banner,2,border_radius=10)
+            banner_font=pygame.font.Font(None,24);banner_small=pygame.font.Font(None,20)
+            screen.blit(banner_font.render('UPDATE AVAILABLE',True,(255,255,255)),(banner.x+14,banner.y+9))
+            screen.blit(banner_small.render('Click here or use the gear to download',True,(175,230,237)),(banner.x+14,banner.y+34))
         pygame.display.flip()
         if ui_test and ui_frame==10 and os.environ.get('MARIO_UI_SCREENSHOT'):
             pygame.image.save(screen,os.environ['MARIO_UI_SCREENSHOT'])
@@ -492,6 +572,7 @@ def main():
 if __name__=='__main__':
     try:
         if '--self-test' in sys.argv:self_test()
+        elif '--update-test' in sys.argv:update_network_test()
         else:main()
     except Exception as e:
         print('Fatal:',e,file=sys.stderr);sys.exit(1)
