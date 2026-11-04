@@ -186,6 +186,9 @@ def self_test():
     pygame.quit()
 
 def main():
+    ui_test = "--ui-test" in sys.argv
+    if ui_test:
+        os.environ["SDL_VIDEODRIVER"]="dummy"; os.environ["SDL_AUDIODRIVER"]="dummy"
     pygame.mixer.pre_init(48000,-16,2,512)
     pygame.init();pygame.joystick.init()
     screen=pygame.display.set_mode((1024,768),pygame.RESIZABLE)
@@ -198,10 +201,26 @@ def main():
     if not isinstance(cheat,dict): cheat={'lives':True,'enemy':True,'pit':True}
     joysticks=devices(); menu=False; selected=0; waiting=None; fullscreen=False
     rows=ACTIONS+['INFINITE LIVES','ENEMY PROTECTION','PIT RESCUE','CHECK UPDATES','RESET CONTROLS','CLOSE SETTINGS']
-    notice={'text':'Checking updates...', 'url':''};threading.Thread(target=update_check,args=(notice,),daemon=True).start()
+    notice={'text':'Checking updates...', 'url':''}
+    if not ui_test: threading.Thread(target=update_check,args=(notice,),daemon=True).start()
     channel=pygame.mixer.Channel(0) if pygame.mixer.get_init() else None
-    running=True
+    running=True; ui_frame=0
     while running:
+        if ui_test:
+            ui_frame += 1
+            if ui_frame==5: pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_F1))
+            if ui_frame==7:
+                assert menu, 'Settings did not open'
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_RETURN))
+            if ui_frame==9:
+                assert waiting=='UP', 'Binding selection did not open'
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_w))
+            if ui_frame==11:
+                assert bindings['UP']==[('key',pygame.K_w)], 'Key remapping failed'
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_ESCAPE))
+            if ui_frame==15:
+                assert not menu, 'Settings did not close'
+                pygame.event.post(pygame.event.Event(pygame.QUIT))
         for event in pygame.event.get():
             if event.type==pygame.QUIT: running=False
             elif event.type in (pygame.JOYDEVICEADDED,pygame.JOYDEVICEREMOVED): joysticks=devices()
