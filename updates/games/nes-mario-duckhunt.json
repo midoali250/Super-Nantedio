@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "game_id": "nes-mario-duckhunt",
+  "game_name": "NES: Mario + Duck Hunt",
+  "package_name": "com.midoali.nes",
+  "version_code": 3,
+  "version_name": "1.2",
+  "min_android_sdk": 26,
+  "apk_url": "https://github.com/midoali250/bitvault-engine/releases/download/nes-mario-duckhunt-v1.2/NES-Mario-DuckHunt-1.2.apk",
+  "apk_sha256": "9353f046fbff2322d136baa1477fc6e29a0fd313b776b26ec4456e50d9ad61fa",
+  "apk_size_bytes": 6820550,
+  "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/nes-mario-duckhunt-v1.2",
+  "published_at": "2026-11-04T04:53:52Z",
+  "release_notes_ar": "حماية اختيارية من الأعداء والحفر وأرواح غير محدودة، مع إعدادات حجم وشفافية الأزرار.",
+  "required": false
+}

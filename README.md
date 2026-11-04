@@ -71,3 +71,8 @@ python3 tools/nes_disassembler.py roms/*.nes --output tools/disassembly_output.t
 ## Mario + Duck Hunt Android project
 
 Source, controls, optional Mario cheats, and tests: [`games/nes-mario-duckhunt/`](games/nes-mario-duckhunt/). The existing `android/` project is unchanged. Download the published APK from [Releases](https://github.com/midoali250/bitvault-engine/releases).
+
+
+## مركز معلومات التحديثات
+
+راجع [`updates/`](updates/) لملفات إصدارات الألعاب وطريقة إضافة تحديث. هذا المجلد لا يضيف التحديث التلقائي للألعاب بمفرده.
