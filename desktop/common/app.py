@@ -322,6 +322,18 @@ def self_test():
         def get_axis(self,n):return .8 if n==0 else 0
         def get_numhats(self):return 0
     m=input_mask(DEFAULTS,Empty(),(False,)*5,[Pad()],0);assert m&(1<<7) and m&1
+    # Check native notification command construction without relying on a desktop session.
+    import shutil
+    original_run=subprocess.run;original_which=shutil.which;calls=[]
+    class Success:returncode=0
+    try:
+        subprocess.run=lambda cmd,**kw:(calls.append(cmd) or Success())
+        shutil.which=lambda name:'/fake/'+name
+        assert system_notification('9.0.0') and calls,'Native notification command not dispatched'
+        if sys.platform=='win32':assert r'\WindowsPowerShell\v1.0\powershell.exe' in calls[0][-1],'Windows notification ID invalid'
+        if sys.platform.startswith('linux'):assert calls[0][0]=='notify-send'
+        if sys.platform=='darwin':assert calls[0][0]=='osascript'
+    finally:subprocess.run=original_run;shutil.which=original_which
     seen=[];fake_version=['9.0.0']
     def fake_check(out):out.update(text='new',url='https://example.test',entry={'version':fake_version[0]})
     monitor=UpdateMonitor(checker=fake_check,notifier=lambda v:seen.append(v),interval=0)
@@ -415,9 +427,12 @@ def main():
     while running:
         if ui_test:
             ui_frame+=1
-            if ui_frame==5:pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_F1))
+            if ui_frame==5:
+                monitor.banner_until=time.monotonic()+15;notice['url']='https://example.test'
+                pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN,button=1,pos=(screen.get_width()//2,20)))
             if ui_frame==7:
-                assert page=='main';pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_DOWN))
+                assert page=='main' and selected==7, 'Update banner did not open download menu'
+                selected=0;pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_DOWN))
             if ui_frame==8:pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_RETURN))
             if ui_frame==10:
                 assert page=='controls';pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_RETURN))
