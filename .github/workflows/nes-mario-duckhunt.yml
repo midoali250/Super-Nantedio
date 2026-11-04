@@ -43,18 +43,24 @@ jobs:
           python3 tools/host/test_enemy_collision.py 0
           python3 tools/host/test_enemy_collision.py 2
       - name: Configure signed release
+        id: signing
         env:
           KEY_B64: ${{ secrets.WORLD_SIGNING_KEY_B64 }}
           KEY_PASSWORD: ${{ secrets.WORLD_SIGNING_PASSWORD }}
           KEY_ALIAS: ${{ secrets.WORLD_SIGNING_ALIAS }}
         run: |
-          test -n "$KEY_B64" && test -n "$KEY_PASSWORD" && test -n "$KEY_ALIAS"
-          umask 077
-          printf '%s' "$KEY_B64" | base64 --decode > "$RUNNER_TEMP/game-release.jks"
-          echo "NES_KEYSTORE_PATH=$RUNNER_TEMP/game-release.jks" >> "$GITHUB_ENV"
-          echo "NES_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
-          echo "NES_KEYSTORE_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
-          echo "NES_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          if [ -n "$KEY_B64" ] && [ -n "$KEY_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
+            umask 077
+            printf '%s' "$KEY_B64" | base64 --decode > "$RUNNER_TEMP/game-release.jks"
+            echo "NES_KEYSTORE_PATH=$RUNNER_TEMP/game-release.jks" >> "$GITHUB_ENV"
+            echo "NES_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "NES_KEYSTORE_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "NES_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets on this repository; the release APK stays unsigned."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Build debug and signed release APK
         run: ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
@@ -64,7 +70,15 @@ jobs:
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
+        if: steps.signing.outputs.signed == 'true'
         with:
           name: nes-mario-duckhunt-release
           path: games/nes-mario-duckhunt/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: steps.signing.outputs.signed != 'true'
+        with:
+          name: nes-mario-duckhunt-release-unsigned
+          path: games/nes-mario-duckhunt/app/build/outputs/apk/release/app-release-unsigned.apk
           if-no-files-found: error
