@@ -41,6 +41,7 @@ jobs:
           cmake -S tools/host -B tools/host/build
           cmake --build tools/host/build -j 2
           python3 tools/host/test_world_gameplay.py
+          python3 tools/host/measure_jump.py
           python3 tools/host/test_lives.py
           python3 tools/host/test_protection.py
           python3 tools/host/test_enemy_collision.py 0
