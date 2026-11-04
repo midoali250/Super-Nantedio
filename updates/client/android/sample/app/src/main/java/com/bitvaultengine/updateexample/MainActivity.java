@@ -18,6 +18,10 @@ public class MainActivity extends Activity {
         UpdateClient.requestNotificationPermission(this);
         if (!UpdateClient.consumeNotificationIntent(this, getIntent())) UpdateClient.checkInBackground(this);
     }
+    @Override protected void onResume() {
+        super.onResume();
+        UpdateClient.resumePendingInstall(this);
+    }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);

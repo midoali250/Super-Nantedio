@@ -43,8 +43,8 @@ public final class UpdateClient {
         return id;
     }
     static final class Release {
-        String name, notes, apkUrl;
-        long code;
+        String name, notes, apkUrl, apkSha256;
+        long code, apkSize;
     }
     static Release fetch(Context context) throws Exception {
         String id = gameId(context);
@@ -81,6 +81,10 @@ public final class UpdateClient {
             r.name = o.getString("version_name");
             r.notes = o.optString("release_notes_ar", "");
             r.apkUrl = apk.toString();
+            r.apkSha256 = o.getString("apk_sha256");
+            r.apkSize = o.getLong("apk_size_bytes");
+            if (!r.apkSha256.matches("[0-9a-f]{64}") || r.apkSize <= 0 || r.apkSize > 500_000_000L)
+                throw new IllegalStateException("Invalid APK integrity metadata");
             return r;
         } finally { c.disconnect(); }
     }
@@ -137,8 +141,7 @@ public final class UpdateClient {
                             .setMessage(r.notes + "\n\nالتحميل والتثبيت اختياريان، وسيطلب أندرويد موافقتك.")
                             .setNegativeButton("لاحقًا", null)
                             .setPositiveButton("تحميل التحديث", (dialog, which) -> {
-                                try { activity.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(r.apkUrl))); }
-                                catch (Exception ex) { Toast.makeText(activity, "تعذر فتح رابط التحميل", Toast.LENGTH_LONG).show(); }
+                                InAppUpdater.start(activity, r);
                             }).show();
                 });
             } catch (Exception e) {
@@ -150,6 +153,9 @@ public final class UpdateClient {
                 });
             }
         });
+    }
+    public static void resumePendingInstall(Activity activity) {
+        InAppUpdater.resumePendingInstall(activity);
     }
     public static boolean consumeNotificationIntent(Activity activity, Intent intent) {
         if (intent == null || !intent.getBooleanExtra(EXTRA_OPEN, false)) return false;

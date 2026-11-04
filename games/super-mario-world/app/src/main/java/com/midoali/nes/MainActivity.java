@@ -143,7 +143,7 @@ public final class MainActivity extends Activity {
         });
         box.addView(pit);
         Button checkUpdate = new Button(this);
-        checkUpdate.setText("التحقق من تحديث اللعبة");
+        checkUpdate.setText("التحديث");
         checkUpdate.setAllCaps(false);
         checkUpdate.setOnClickListener(v -> UpdateClient.checkNow(this));
         box.addView(checkUpdate);
@@ -232,6 +232,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        UpdateClient.resumePendingInstall(this);
         hideSystemUi();
         if (emulator != null && !settingsOpen) emulator.setPaused(false);
     }
