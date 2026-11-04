@@ -1,0 +1,81 @@
+node v22.23.4 · jsdom: 30.1.3
+
+ROM & packaged assets  (01-rom.test.js)
+  ✓ the ROM is present and is a valid iNES file 1ms
+  ✓ the ROM is the exact dump we validated (md5) 0ms
+  ✓ the ROM header describes an MMC1 multicart 8ms
+  ✓ parseHeader rejects junk 0ms
+  ✓ the wasm core ships with its licence and is the pinned build 0ms
+  ✓ the legacy jsnes core is gone 0ms
+  ✓ JavaScript app files in the APK match the tested ones 2ms
+  ✓ the APK assets contain no stale files 2ms
+  ✓ index.html loads the local core only (works offline) 0ms
+  ✓ app.js never depends on the network or file:// fetch tricks 0ms
+
+Emulator core (SEN/WASM)  (02-core.test.js)
+  ✓ WASM core initialises once and reports ready 0ms
+  ✓ rejects a file that is not a NES ROM 0ms
+  ✓ boots the multicart and renders a real picture 555ms
+  ✓ animation runs during power-on (frame content changes) 230ms
+  ✓ emulation is deterministic for identical input 1415ms
+  ✓ button()/buttonDown()/buttonUp() keep a consistent mask 1ms
+  ✓ controller mask values match the NES bit order 1ms
+  ✓ pressing START really reaches the game (screen changes) 831ms
+  ✓ save state / load state round-trips losslessly 1851ms
+  ✓ base64 state helpers survive a round-trip 570ms
+  ✓ hardware reset returns to the power-on screen 2048ms
+  ✓ audio pipeline drains ~44.1 kHz samples every frame 239ms
+  ✓ takeAudioEnergy() reports real signal and is drained 2033ms
+  ✓ onFrame/onAudio hooks fire once per frame 122ms
+  ✓ blockSignature and whitePixelCount describe the frame 482ms
+
+Gameplay (Super Mario Bros. + Duck Hunt)  (03-gameplay.test.js)
+  ✓ multicart menu renders a real screen 481ms
+  ✓ START on the multicart boots Super Mario Bros. World 1-1 1655ms
+  ✓ Mario is drawn on screen 1695ms
+  ✓ RIGHT makes Mario walk to the right 2066ms
+  ✓ LEFT moves Mario back again 2332ms
+  ✓ A makes Mario jump (his sprite moves up) 1709ms
+  ✓ the game loop keeps running without input 2024ms
+  ✓ the game survives 60 seconds of play without crashing 16983ms
+  ✓ second game (Duck Hunt) boots from the same cart 3708ms
+  ✓ Duck Hunt keeps running when the light gun is triggered 2365ms
+  ✓ reset from gameplay returns to power-on 2153ms
+
+Golden frames (visual regression)  (04-golden.test.js)
+  ✓ Super Mario Bros. World 1-1 start frame matches the reference 1653ms
+  ✓ Mario walking + jumping frame matches the reference 2068ms
+  ✓ Duck Hunt round 1 frame matches the reference 2065ms
+  ✓ golden screenshots are the expected size 1ms
+  ✓ reference frames are not blank (guards against bogus goldens) 10ms
+
+Packaging tools  (05-tools.test.js)
+  ✓ python3 is available for the CI tooling 0ms
+  ✓ disassembler prints the ROM summary 66ms
+  ✓ disassembler writes a 6502 listing for the whole PRG ROM 261ms
+  ✓ disassembler refuses a non-NES file 41ms
+  ✓ APK verifier boots the app out of a packaged APK 6910ms
+  ✓ icon generator produces every icon the APK needs 669ms
+
+Web UI (index.html + app.js in a real DOM)  (06-webapp.test.js)
+  ✓ index.html boots the wasm core and starts the game 871ms
+  ✓ the boot overlay is hidden once the ROM is running 73ms
+  ✓ on-screen pad buttons reach the game (START boots World 1-1) 1754ms
+  ✓ holding RIGHT on the pad moves Mario 2160ms
+  ✓ keyboard controls work (Enter = START) 1822ms
+  ✓ menu sheet opens, saves and restores a state 343ms
+  ✓ the in-app self-test passes inside the real UI 7610ms
+  ✓ the app never reaches the network 1ms
+
+Android project  (07-android.test.js)
+  ✓ the Gradle wrapper is real and points at Gradle 8.7 1ms
+  ✓ the Gradle files are consistent 0ms
+  ✓ the manifest is valid and points at the real Activity 0ms
+  ✓ the WebView loads assets from the https origin, never file:// 0ms
+  ✓ the Java sources are syntactically balanced 1ms
+  ✓ every launcher icon exists at every density 0ms
+  ✓ the app declares no internet permission 0ms
+  ✓ the assets bundle the ROM and the wasm core 0ms
+
+────────────────────────────────────────────────────────
+ALL PASSED  63 tests, 289 assertions in 75967ms
