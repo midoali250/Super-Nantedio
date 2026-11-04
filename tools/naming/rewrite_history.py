@@ -36,7 +36,9 @@ return re.sub(PAT, b'bitvaultengine', filename)
 '''.replace('PAT',pat)
  msg_cb='import re\nreturn re.sub('+pat+", b'bitvault-engine', message)"
  ref_cb='import re\nreturn re.sub('+pat+", b'bitvault-engine', refname)"
- run('git','filter-repo','--force','--replace-text',str(rules),'--filename-callback',file_cb,'--message-callback',msg_cb,'--refname-callback',ref_cb)
+ name_cb='import re\nreturn re.sub('+pat+", b'bitvault-engine', name)"
+ email_cb='import re\nreturn re.sub('+pat+", b'bitvaultengine', email)"
+ run('git','filter-repo','--force','--replace-text',str(rules),'--filename-callback',file_cb,'--message-callback',msg_cb,'--name-callback',name_cb,'--email-callback',email_cb,'--refname-callback',ref_cb)
 # Check reachable filenames and commit/tag messages; blobs are checked below.
 pattern=re.compile(rb'(?i)super[-_ ]?'+b'vaultengine')
 objs=subprocess.check_output(['git','rev-list','--objects','--all'])
