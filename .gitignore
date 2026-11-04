@@ -1,0 +1,8 @@
+# Build outputs and local secrets must never be committed
+**/.gradle/
+**/.cxx/
+**/build/
+**/__pycache__/
+**/local.properties
+*.jks
+*.keystore
