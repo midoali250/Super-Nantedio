@@ -51,10 +51,23 @@ jobs:
         run: |
           echo "sdk.dir=${ANDROID_HOME}" > android/local.properties
 
-      - name: Build Debug APK
+      - name: Configure signed release
+        env:
+          KEY_B64: ${{ secrets.WORLD_SIGNING_KEY_B64 }}
+          KEY_PASSWORD: ${{ secrets.WORLD_SIGNING_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.WORLD_SIGNING_ALIAS }}
+        run: |
+          test -n "$KEY_B64" && test -n "$KEY_PASSWORD" && test -n "$KEY_ALIAS"
+          umask 077
+          printf '%s' "$KEY_B64" | base64 --decode > "$RUNNER_TEMP/game-release.jks"
+          echo "NES_KEYSTORE_PATH=$RUNNER_TEMP/game-release.jks" >> "$GITHUB_ENV"
+          echo "NES_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "NES_KEYSTORE_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          echo "NES_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+      - name: Build Debug and Release APK
         run: |
           cd android
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
 
       - name: Verify APK exists
         run: |
@@ -67,6 +80,13 @@ jobs:
           name: bitvault-engine-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
+
+      - name: Upload signed release
+        uses: actions/upload-artifact@v4
+        with:
+          name: nes-emulator-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
 
       - name: Disassemble NES ROM
         run: |

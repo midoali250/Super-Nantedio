@@ -42,10 +42,29 @@ jobs:
           python3 tools/host/test_protection.py
           python3 tools/host/test_enemy_collision.py 0
           python3 tools/host/test_enemy_collision.py 2
-      - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon
+      - name: Configure signed release
+        env:
+          KEY_B64: ${{ secrets.WORLD_SIGNING_KEY_B64 }}
+          KEY_PASSWORD: ${{ secrets.WORLD_SIGNING_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.WORLD_SIGNING_ALIAS }}
+        run: |
+          test -n "$KEY_B64" && test -n "$KEY_PASSWORD" && test -n "$KEY_ALIAS"
+          umask 077
+          printf '%s' "$KEY_B64" | base64 --decode > "$RUNNER_TEMP/game-release.jks"
+          echo "NES_KEYSTORE_PATH=$RUNNER_TEMP/game-release.jks" >> "$GITHUB_ENV"
+          echo "NES_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "NES_KEYSTORE_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          echo "NES_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+      - name: Build debug and signed release APK
+        run: ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: nes-mario-duckhunt-debug
           path: games/nes-mario-duckhunt/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nes-mario-duckhunt-release
+          path: games/nes-mario-duckhunt/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
