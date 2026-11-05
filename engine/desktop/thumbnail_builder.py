@@ -20,11 +20,21 @@ def main():
         rom=roms/(row['source_id']+ext)
         with LibretroHost(core,rom) as host:
             if host.game_hash!=row['rom_sha256']:raise ValueError('wrong game hash')
-            for n in range(240):
-                host.buttons={3} if 100<=n<103 else set();host.run_frame()
-            frame=frame_surface(host)
-            if frame is None:raise RuntimeError('no video for '+row['source_id'])
-            pygame.image.save(frame,str(out/(row['source_id']+'.png')))
+            best=None;best_score=-1
+            # Prefer a varied visible frame over a blank intro. This is a heuristic,
+            # not a claim that every screenshot shows gameplay or box art.
+            for n in range(720):
+                host.buttons={3} if n in (120,360,600) else set();host.run_frame()
+                if n in (119,239,359,479,599,719):
+                    candidate=frame_surface(host)
+                    if candidate is not None:
+                        reduced=pygame.transform.scale(candidate,(32,24))
+                        raw=pygame.image.tobytes(reduced,'RGB')
+                        colors={raw[j:j+3] for j in range(0,len(raw),3)}
+                        score=len(colors)+sum(raw)/(len(raw)*255)
+                        if score>best_score:best_score=score;best=candidate
+            if best is None:raise RuntimeError('no video for '+row['source_id'])
+            pygame.image.save(best,str(out/(row['source_id']+'.png')))
         print('Generated in-game screenshot',i,'/',len(rows),flush=True)
     pygame.quit()
 if __name__=='__main__':main()

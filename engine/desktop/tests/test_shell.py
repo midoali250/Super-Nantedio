@@ -18,6 +18,11 @@ class DesktopShellTests(unittest.TestCase):
     launcher.render(self.screen,[{'id':'test','title':'Test Title','system':'NES'}],'ALL','',0,set(),'',False,True,'FIT')
     self.assertIsNotNone(launcher.thumbnail('test'))
    finally:launcher.ROOT=old;launcher.THUMB_CACHE.clear()
+ def test_scroll_boundaries(self):
+  self.assertEqual(launcher.scroll_selection(0,-1,97),3)
+  self.assertEqual(launcher.scroll_selection(0,1,97),0)
+  self.assertEqual(launcher.scroll_selection(96,-1,97),96)
+  self.assertEqual(launcher.scroll_selection(0,-1,0),0)
  def test_uncropped_frame_fit(self):
   self.assertEqual(fit_frame((4,3),(1920,1080)).size,(1440,1080))
   self.assertEqual(fit_frame((4,3),(3840,2160)).size,(2880,2160))
