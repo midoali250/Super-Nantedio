@@ -15,6 +15,7 @@ public final class VpadTest {
 
     public static void main(String[] args) {
         dpad();
+        freeJoystick();
         faceButtons();
         shoulders();
         startSelect();
@@ -43,6 +44,24 @@ public final class VpadTest {
 
         p.setDpad(false, false, false, false);
         check("centre releases every direction", (p.mask() & 0x03F0) == 0);
+    }
+
+    private static void freeJoystick() {
+        System.out.println("free-floating joystick");
+        VirtualPad p = new VirtualPad();
+        float[] r = p.updateFreeStick(200f, 500f, 205f, 503f, 100f, true);
+        check("small touch inside deadzone keeps stick neutral", (p.mask() & 0x03F0) == 0);
+
+        r = p.updateFreeStick(200f, 500f, 350f, 500f, 100f, true);
+        check("dragging right engages RIGHT", (p.mask() & (1 << VirtualPad.BTN_RIGHT)) != 0);
+        check("free-floating base follows thumb when dragged past radius",
+                Math.abs(r[0] - 250f) < 0.5f && Math.abs(r[2] - 350f) < 0.5f);
+        check("stickNormX is +1.0 at full right deflection", Math.abs(p.stickNormX() - 1f) < 0.01f);
+
+        p.updateFreeStick(200f, 500f, 120f, 420f, 100f, true);
+        int m = p.mask();
+        check("dragging up-left engages UP+LEFT",
+                (m & (1 << VirtualPad.BTN_UP)) != 0 && (m & (1 << VirtualPad.BTN_LEFT)) != 0);
     }
 
     private static void faceButtons() {
@@ -106,6 +125,10 @@ public final class VpadTest {
 
     private static void screenMap() {
         System.out.println("screen mapping");
+        int[] full = ScreenMap.displayRect(2400, 1080, true);
+        check("widescreen mobile mode fills full display width (2400x1080 at 0,0)",
+                full[0] == 0 && full[1] == 0 && full[2] == 2400 && full[3] == 1080);
+
         int[] wide = ScreenMap.fitRect(1920, 1080);
         check("1920x1080 -> 4:3 pillarboxed (" + wide[2] + "x" + wide[3] + " at " + wide[0] + ")",
                 wide[2] == 1440 && wide[3] == 1080 && wide[0] == 240 && wide[1] == 0);

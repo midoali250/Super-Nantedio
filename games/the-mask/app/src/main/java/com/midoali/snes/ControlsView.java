@@ -11,28 +11,29 @@ import android.view.View;
 /**
  * On-screen SNES pad drawn over the video.
  *
- *  - a D-pad cross bottom left (touching an arm gives that direction, the
- *    corners give the diagonals)
+ *  - a 360-degree free-floating virtual analog joystick on the left side of the
+ *    screen (anchors where the thumb touches on the left half and follows the
+ *    thumb smoothly in all 8 directions)
  *  - the four face buttons in a diamond bottom right (X top, Y left, A right,
- *    B bottom) exactly like the real pad
- *  - L and R as shoulder buttons in the top corners
+ *    B bottom)
+ *  - L and R as shoulder buttons
  *  - START / SELECT pills at the top centre
  */
 final class ControlsView extends View {
-    private static final int ZONE_NONE = 0;
-
     private final VirtualPad pad;
 
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final RectF tmpRect = new RectF();
 
     private float controlScale = 1f;
+    private boolean freeStick = true;
 
-    private float dpadCx, dpadCy, dpadArm, dpadRadius;
-    private int dpadPointer = -1;
-    private boolean dpadUp, dpadDown, dpadLeft, dpadRight;
+    private float stickHomeX, stickHomeY;
+    private float stickBaseX, stickBaseY;
+    private float stickKnobX, stickKnobY;
+    private float stickRadius, stickKnobRadius;
+    private int stickPointer = -1;
 
     private final float[] faceCx = new float[4];
     private final float[] faceCy = new float[4];
@@ -65,6 +66,21 @@ final class ControlsView extends View {
         invalidate();
     }
 
+    void setFreeStick(boolean free) {
+        freeStick = free;
+        if (stickPointer < 0) {
+            stickBaseX = stickHomeX;
+            stickBaseY = stickHomeY;
+            stickKnobX = stickHomeX;
+            stickKnobY = stickHomeY;
+        }
+        invalidate();
+    }
+
+    boolean isFreeStick() {
+        return freeStick;
+    }
+
     private float dp(float v) {
         return v * getResources().getDisplayMetrics().density;
     }
@@ -74,11 +90,17 @@ final class ControlsView extends View {
         super.onLayout(changed, left, top, right, bottom);
         float w = getWidth(), h = getHeight();
 
-        /* D-pad cross, bottom left. */
-        dpadArm = Math.min(h * 0.115f, w * 0.062f) * controlScale;
-        dpadRadius = dpadArm * 1.5f;
-        dpadCx = dpadArm * 1.9f;
-        dpadCy = h - dpadArm * 1.9f;
+        /* Free-floating virtual joystick home position, bottom left. */
+        stickRadius = Math.min(h * 0.165f, w * 0.092f) * controlScale;
+        stickKnobRadius = stickRadius * 0.46f;
+        stickHomeX = stickRadius * 1.45f + dp(12f);
+        stickHomeY = h - stickRadius * 1.35f - dp(12f);
+        if (stickPointer < 0) {
+            stickBaseX = stickHomeX;
+            stickBaseY = stickHomeY;
+            stickKnobX = stickHomeX;
+            stickKnobY = stickHomeY;
+        }
 
         /* Face buttons in a diamond, bottom right: X up, Y left, A right, B down. */
         faceRadius = Math.min(h * 0.082f, w * 0.043f) * controlScale;
@@ -94,24 +116,24 @@ final class ControlsView extends View {
         faceCx[VirtualPad.FACE_B] = fx;
         faceCy[VirtualPad.FACE_B] = fy + spread;
 
-        /* Shoulders, top corners. */
+        /* Shoulders: L below the top-left menu buttons, R at top-right corner. */
         float shW = Math.min(w * 0.12f, dp(110f)) * controlScale;
         float shH = Math.min(h * 0.075f, dp(44f)) * controlScale;
-        lRect.set(dp(8f), dp(8f), dp(8f) + shW, dp(8f) + shH);
-        rRect.set(w - dp(8f) - shW, dp(8f), w - dp(8f), dp(8f) + shH);
+        lRect.set(dp(10f), dp(58f), dp(10f) + shW, dp(58f) + shH);
+        rRect.set(w - dp(10f) - shW, dp(10f), w - dp(10f), dp(10f) + shH);
 
         /* START / SELECT, top centre. */
-        float pillW = Math.min(w * 0.13f, dp(120f));
-        float pillH = Math.min(h * 0.085f, dp(46f));
-        float cx = w * 0.5f;
-        startRect.set(cx + dp(10f), dp(10f), cx + dp(10f) + pillW, dp(10f) + pillH);
-        selectRect.set(cx - dp(10f) - pillW, dp(10f), cx - dp(10f), dp(10f) + pillH);
+        float pillW = Math.min(w * 0.12f, dp(110f));
+        float pillH = Math.min(h * 0.08f, dp(42f));
+        float cx = w * 0.54f;
+        startRect.set(cx + dp(8f), dp(10f), cx + dp(8f) + pillW, dp(10f) + pillH);
+        selectRect.set(cx - dp(8f) - pillW, dp(10f), cx - dp(8f), dp(10f) + pillH);
     }
 
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
-        drawDpad(canvas);
+        drawFreeJoystick(canvas);
         drawFace(canvas);
         drawShoulder(canvas, lRect, "L", lPointer >= 0);
         drawShoulder(canvas, rRect, "R", rPointer >= 0);
@@ -119,36 +141,52 @@ final class ControlsView extends View {
         drawPill(canvas, selectRect, "SELECT", selectPointer >= 0);
     }
 
-    private void drawDpad(Canvas canvas) {
-        float a = dpadArm;
-        float[] xs = {dpadCx, dpadCx, dpadCx - a, dpadCx + a};
-        float[] ys = {dpadCy - a, dpadCy + a, dpadCy, dpadCy};
-        boolean[] active = {dpadUp, dpadDown, dpadLeft, dpadRight};
+    private void drawFreeJoystick(Canvas canvas) {
+        boolean active = stickPointer >= 0;
 
-        fill.setColor(0x33000000);
-        canvas.drawRect(dpadCx - a, dpadCy - a, dpadCx + a, dpadCy + a, fill);
+        /* Outer base circle */
+        fill.setColor(active ? 0x4416A34A : 0x38101820);
+        canvas.drawCircle(stickBaseX, stickBaseY, stickRadius, fill);
 
-        for (int i = 0; i < 4; i++) {
-            float hw = (i < 2) ? a : a;
-            float hh = (i < 2) ? a : a;
-            float x0 = (i == 0 || i == 2) ? xs[i] - hw : dpadCx - hw;
-            float y0 = (i == 0 || i == 1) ? ys[i] - hh : dpadCy - hh;
-            float x1 = (i == 1 || i == 3) ? xs[i] + hw : dpadCx + hw;
-            float y1 = (i == 2 || i == 3) ? ys[i] + hh : dpadCy + hh;
-            fill.setColor(active[i] ? 0x99E04040 : 0x55101010);
-            canvas.drawRect(x0, y0, x1, y1, fill);
-            stroke.setColor(active[i] ? 0xFFFFFFFF : 0x99FFFFFF);
-            stroke.setStrokeWidth(dp(1.5f));
-            canvas.drawRect(x0, y0, x1, y1, stroke);
+        stroke.setColor(active ? 0xCC4ADE80 : 0x88FFFFFF);
+        stroke.setStrokeWidth(dp(2.2f));
+        canvas.drawCircle(stickBaseX, stickBaseY, stickRadius, stroke);
+
+        /* Inner deadzone ring */
+        stroke.setColor(0x44FFFFFF);
+        stroke.setStrokeWidth(dp(1.2f));
+        canvas.drawCircle(stickBaseX, stickBaseY, stickRadius * VirtualPad.STICK_DEADZONE, stroke);
+
+        /* 8-direction guide ticks around the base ring */
+        for (int a = 0; a < 360; a += 45) {
+            double rad = Math.toRadians(a);
+            float r0 = stickRadius * 0.78f;
+            float r1 = stickRadius * 0.93f;
+            float x0 = stickBaseX + (float) Math.cos(rad) * r0;
+            float y0 = stickBaseY + (float) Math.sin(rad) * r0;
+            float x1 = stickBaseX + (float) Math.cos(rad) * r1;
+            float y1 = stickBaseY + (float) Math.sin(rad) * r1;
+            stroke.setColor(a % 90 == 0 ? 0x99FFFFFF : 0x55FFFFFF);
+            stroke.setStrokeWidth(dp(a % 90 == 0 ? 2f : 1.2f));
+            canvas.drawLine(x0, y0, x1, y1, stroke);
         }
 
-        /* Direction arrows. */
-        text.setColor(Color.WHITE);
-        text.setTextSize(a * 0.8f);
-        canvas.drawText("▲", dpadCx, dpadCy - a * 0.35f, text);
-        canvas.drawText("▼", dpadCx, dpadCy + a * 1.25f, text);
-        canvas.drawText("◀", dpadCx - a * 0.9f, dpadCy + a * 0.35f, text);
-        canvas.drawText("▶", dpadCx + a * 0.9f, dpadCy + a * 0.35f, text);
+        /* Shaft connecting base center to movable thumb knob */
+        stroke.setColor(active ? 0xBBFACC15 : 0x66FFFFFF);
+        stroke.setStrokeWidth(dp(4f));
+        canvas.drawLine(stickBaseX, stickBaseY, stickKnobX, stickKnobY, stroke);
+
+        /* Movable thumb stick knob */
+        fill.setColor(active ? 0xCC22C55E : 0x88202830);
+        canvas.drawCircle(stickKnobX, stickKnobY, stickKnobRadius, fill);
+        stroke.setColor(active ? 0xFFFDE047 : 0xCCFFFFFF);
+        stroke.setStrokeWidth(dp(2.5f));
+        canvas.drawCircle(stickKnobX, stickKnobY, stickKnobRadius, stroke);
+
+        /* Inner highlight cap on knob */
+        fill.setColor(0x44FFFFFF);
+        canvas.drawCircle(stickKnobX - stickKnobRadius * 0.2f,
+                stickKnobY - stickKnobRadius * 0.2f, stickKnobRadius * 0.42f, fill);
     }
 
     private void drawFace(Canvas canvas) {
@@ -223,21 +261,6 @@ final class ControlsView extends View {
     }
 
     private void handleDown(int id, float x, float y) {
-        /* D-pad: any touch inside the cross's bounding circle grabs it. */
-        float dist = (float) Math.hypot(x - dpadCx, y - dpadCy);
-        if (dpadPointer < 0 && dist <= dpadRadius * 1.25f) {
-            dpadPointer = id;
-            updateDpad(x, y);
-            return;
-        }
-        for (int i = 0; i < 4; i++) {
-            if (facePointer[i] < 0
-                    && Math.hypot(x - faceCx[i], y - faceCy[i]) <= faceRadius * 1.3f) {
-                facePointer[i] = id;
-                pad.setFace(i, true);
-                return;
-            }
-        }
         if (lPointer < 0 && lRect.contains(x, y)) {
             lPointer = id;
             pad.setShoulder(VirtualPad.SHOULDER_L, true);
@@ -258,18 +281,43 @@ final class ControlsView extends View {
             pad.setButton(VirtualPad.BTN_SELECT, true);
             return;
         }
+        for (int i = 0; i < 4; i++) {
+            if (facePointer[i] < 0
+                    && Math.hypot(x - faceCx[i], y - faceCy[i]) <= faceRadius * 1.3f) {
+                facePointer[i] = id;
+                pad.setFace(i, true);
+                return;
+            }
+        }
+        /* Free-floating joystick on the left side of the screen */
+        float distFromHome = (float) Math.hypot(x - stickHomeX, y - stickHomeY);
+        boolean inFreeZone = freeStick && x <= getWidth() * 0.48f && y >= lRect.bottom + dp(6f);
+        if (stickPointer < 0 && (inFreeZone || distFromHome <= stickRadius * 1.45f)) {
+            stickPointer = id;
+            if (freeStick && distFromHome > stickRadius * 0.85f) {
+                stickBaseX = x;
+                stickBaseY = y;
+            } else {
+                stickBaseX = stickHomeX;
+                stickBaseY = stickHomeY;
+            }
+            updateStick(x, y);
+        }
     }
 
     private void handleMove(int id, float x, float y) {
-        if (id == dpadPointer) {
-            updateDpad(x, y);
+        if (id == stickPointer) {
+            updateStick(x, y);
         }
     }
 
     private void handleUp(int id) {
-        if (id == dpadPointer) {
-            dpadPointer = -1;
-            dpadUp = dpadDown = dpadLeft = dpadRight = false;
+        if (id == stickPointer) {
+            stickPointer = -1;
+            stickBaseX = stickHomeX;
+            stickBaseY = stickHomeY;
+            stickKnobX = stickHomeX;
+            stickKnobY = stickHomeY;
             pad.setDpad(false, false, false, false);
         }
         for (int i = 0; i < 4; i++) {
@@ -297,8 +345,11 @@ final class ControlsView extends View {
     }
 
     void releaseAll() {
-        dpadPointer = -1;
-        dpadUp = dpadDown = dpadLeft = dpadRight = false;
+        stickPointer = -1;
+        stickBaseX = stickHomeX;
+        stickBaseY = stickHomeY;
+        stickKnobX = stickHomeX;
+        stickKnobY = stickHomeY;
         pad.setDpad(false, false, false, false);
         for (int i = 0; i < 4; i++) {
             facePointer[i] = -1;
@@ -312,24 +363,11 @@ final class ControlsView extends View {
         pad.setButton(VirtualPad.BTN_SELECT, false);
     }
 
-    /** Maps a touch on the cross to one of the eight pad directions. */
-    private void updateDpad(float x, float y) {
-        float dx = (x - dpadCx) / dpadArm;
-        float dy = (y - dpadCy) / dpadArm;
-        boolean up = false, down = false, left = false, right = false;
-
-        if (Math.abs(dx) > 0.28f || Math.abs(dy) > 0.28f) {
-            double deg = Math.toDegrees(Math.atan2(dy, dx));
-            right = deg > -67.5 && deg < 67.5;
-            left = deg > 112.5 || deg < -112.5;
-            down = deg >= 22.5 && deg <= 157.5;
-            up = deg <= -22.5 && deg >= -157.5;
-        }
-
-        dpadUp = up;
-        dpadDown = down;
-        dpadLeft = left;
-        dpadRight = right;
-        pad.setDpad(up, down, left, right);
+    private void updateStick(float x, float y) {
+        float[] res = pad.updateFreeStick(stickBaseX, stickBaseY, x, y, stickRadius, freeStick);
+        stickBaseX = res[0];
+        stickBaseY = res[1];
+        stickKnobX = res[2];
+        stickKnobY = res[3];
     }
 }

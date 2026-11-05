@@ -5,6 +5,8 @@ int  host_start(const unsigned char *rom, int len);
 void host_stop(void);
 void host_frame(void);
 void host_input(int mask);
+void host_set_cheats(int mask);
+int  host_get_cheats(void);
 int  host_width(void);
 int  host_height(void);
 int  host_video(unsigned char *out, int cap);

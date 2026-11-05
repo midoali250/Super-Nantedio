@@ -22,4 +22,6 @@ assert (m_keys & (1 << 0)) and (m_keys & (1 << 1)) and (m_keys & (1 << 10))
 assert app.input_mask(app.DEFAULTS, Empty(), (True, False, False, False, False), [], 0) & (1 << 0)
 m_pad = app.input_mask(app.DEFAULTS, Empty(), (False,) * 5, [Pad()], 0)
 assert (m_pad & (1 << 6)) and (m_pad & (1 << 8)) and (m_pad & (1 << 11))
-print('PASS: SNES 12-button keyboard, mouse, and gamepad bindings')
+assert len(app.CHEAT_ITEMS) == 6 and app.CHEAT_ALL == 0x3F
+assert '**Ahmed Kamal Elgandy**' in app.ABOUT_RAW_MARKDOWN
+print('PASS: SNES 12-button keyboard, mouse, gamepad bindings, cheats, and About metadata')

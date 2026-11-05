@@ -25,6 +25,14 @@
 #define FB_MAX_H 512
 #define AUDIO_RING_FRAMES 16384
 
+/* Built-in cheat bitmask for The Mask (USA) [SNES] */
+#define CHEAT_INF_HEALTH      (1u << 0)
+#define CHEAT_INF_MASK_POWER  (1u << 1)
+#define CHEAT_INF_LIVES       (1u << 2)
+#define CHEAT_INVINCIBLE      (1u << 3)
+#define CHEAT_MOON_JUMP       (1u << 4)
+#define CHEAT_LEVEL_SELECT    (1u << 5)
+
 static uint8_t  *g_rom;
 static size_t    g_rom_len;
 static uint16_t  g_fb[FB_MAX_W * FB_MAX_H];
@@ -35,6 +43,7 @@ static int16_t   g_audio[AUDIO_RING_FRAMES * 2];
 static volatile int g_audio_head, g_audio_tail;   /* in stereo frames */
 
 static unsigned  g_mask;          /* joypad bitmask, libretro button ids */
+static unsigned  g_cheats;        /* active cheat bitmask */
 static int       g_initialised;   /* retro_init() has run */
 static int       g_loaded;        /* a game is loaded and needs unloading */
 
@@ -203,6 +212,104 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
 }
 
 /* ---------------------------------------------------------------------------
+ * Cheat engine for The Mask (USA)
+ *
+ * Applies active WRAM cheats before/after each frame so health, morph power,
+ * lives, ghost invincibility, super moon-jump, and map stage select work
+ * seamlessly on both Android and Desktop.
+ * ------------------------------------------------------------------------- */
+static void apply_cheats(void)
+{
+   uint8_t *wram;
+   size_t size;
+   if (!g_loaded || !g_cheats)
+      return;
+   wram = (uint8_t *)retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+   size = retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
+   if (!wram || size < 0x2000)
+      return;
+
+   if (g_cheats & CHEAT_INF_HEALTH)
+   {
+      wram[0x0110] = 1;
+      wram[0x0111] = 0;
+      if (wram[0x0364] || wram[0x0365])
+      {
+         wram[0x18AF] = wram[0x0364];
+         wram[0x18B0] = wram[0x0365];
+      }
+      else
+      {
+         wram[0x18AF] = 0x00;
+         wram[0x18B0] = 0x05;
+      }
+   }
+
+   if (g_cheats & CHEAT_INF_MASK_POWER)
+   {
+      wram[0x0112] = 1;
+      wram[0x0113] = 0;
+      if (wram[0x0362] || wram[0x0363])
+      {
+         wram[0x008F] = wram[0x0362];
+         wram[0x0090] = wram[0x0363];
+      }
+      else
+      {
+         wram[0x008F] = 0x00;
+         wram[0x0090] = 0x05;
+      }
+   }
+
+   if (g_cheats & CHEAT_INF_LIVES)
+   {
+      wram[0x010E] = 1;
+      wram[0x010F] = 0;
+      if (wram[0x0095] < 9)
+         wram[0x0095] = 9;
+   }
+
+   if (g_cheats & CHEAT_INVINCIBLE)
+   {
+      wram[0x18B9] = 0x46;
+   }
+
+   if ((g_cheats & CHEAT_MOON_JUMP) && (g_mask & (1u << RETRO_DEVICE_ID_JOYPAD_B)))
+   {
+      wram[0x1894] = 0x80;
+      wram[0x1895] = 0xF9;
+      wram[0x1896] = 0xFF;
+      wram[0x18BC] = 0x80;
+      wram[0x18BD] = 0xF9;
+      wram[0x18BE] = 0xFF;
+   }
+
+   if (g_cheats & CHEAT_LEVEL_SELECT)
+   {
+      wram[0x0114] = 1;
+      wram[0x0115] = 0;
+   }
+}
+
+static void sync_cheat_flags(unsigned old_cheats, unsigned new_cheats)
+{
+   uint8_t *wram;
+   size_t size;
+   unsigned cleared = old_cheats & ~new_cheats;
+   if (!g_loaded || !cleared)
+      return;
+   wram = (uint8_t *)retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+   size = retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
+   if (!wram || size < 0x2000)
+      return;
+   if (cleared & CHEAT_INF_HEALTH)     { wram[0x0110] = 0; wram[0x0111] = 0; }
+   if (cleared & CHEAT_INF_MASK_POWER) { wram[0x0112] = 0; wram[0x0113] = 0; }
+   if (cleared & CHEAT_INF_LIVES)      { wram[0x010E] = 0; wram[0x010F] = 0; }
+   if (cleared & CHEAT_INVINCIBLE)     { wram[0x18B9] = 0; }
+   if (cleared & CHEAT_LEVEL_SELECT)   { wram[0x0114] = 0; wram[0x0115] = 0; }
+}
+
+/* ---------------------------------------------------------------------------
  * Battery-backed SRAM
  *
  * The core exposes the cart's save RAM through RETRO_MEMORY_SAVE_RAM; the
@@ -340,7 +447,9 @@ Java_com_midoali_snes_SnesCore_nativeRunFrame(JNIEnv *env, jclass cls)
 {
    (void)env; (void)cls;
    g_have_frame = 0;
+   apply_cheats();
    retro_run();
+   apply_cheats();
 }
 
 JNIEXPORT jint JNICALL
@@ -375,6 +484,45 @@ Java_com_midoali_snes_SnesCore_nativeSetInput(JNIEnv *env, jclass cls, jint mask
 {
    (void)env; (void)cls;
    g_mask = (unsigned)mask;
+}
+
+JNIEXPORT void JNICALL
+Java_com_midoali_snes_SnesCore_nativeSetCheats(JNIEnv *env, jclass cls, jint mask)
+{
+   unsigned next = (unsigned)mask;
+   (void)env; (void)cls;
+   sync_cheat_flags(g_cheats, next);
+   g_cheats = next;
+   apply_cheats();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_midoali_snes_SnesCore_nativeGetCheats(JNIEnv *env, jclass cls)
+{
+   (void)env; (void)cls;
+   return (jint)g_cheats;
+}
+
+JNIEXPORT void JNICALL
+Java_com_midoali_snes_SnesCore_nativeApplyCheatCode(JNIEnv *env, jclass cls,
+                                                    jint index, jboolean enabled, jstring code)
+{
+   (void)cls;
+   if (!g_loaded)
+      return;
+   if (!code)
+   {
+      retro_cheat_reset();
+      return;
+   }
+   {
+      const char *c = (*env)->GetStringUTFChars(env, code, NULL);
+      if (c)
+      {
+         retro_cheat_set((unsigned)index, enabled ? true : false, c);
+         (*env)->ReleaseStringUTFChars(env, code, c);
+      }
+   }
 }
 
 JNIEXPORT jint JNICALL

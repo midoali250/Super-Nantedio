@@ -46,13 +46,16 @@ def main():
     app.lib.retro_serialize.restype = C.c_bool
     app.lib.retro_unserialize.argtypes = [C.c_void_p, C.c_size_t]
     app.lib.retro_unserialize.restype = C.c_bool
+    app.lib.host_set_cheats.argtypes = [C.c_int]
+    app.lib.host_get_cheats.argtypes = []
+    app.lib.host_get_cheats.restype = C.c_int
 
     print("geometry")
     check("frame is 256x224 (SNES NTSC)", (app.w, app.h) == (256, 224), f"{app.w}x{app.h}")
 
     print("video & boot")
     signatures = []
-    for i in range(1, 2001):
+    for i in range(1, 2401):
         m = mask_of("START") if i in (600, 601, 900, 901, 1200, 1201, 1500, 1501, 1800, 1801) else 0
         app.frame(m)
         if i % 200 == 0:
@@ -83,16 +86,41 @@ def main():
     check("pressing B (jump) updates player state", snap1 != snap2,
           f"{sum(a != b for a, b in zip(snap1, snap2))} WRAM bytes updated")
 
+    print("cheats engine")
+    for _ in range(40):
+        app.frame(0)
+    app.lib.host_set_cheats(0x3F)
+    check("host_get_cheats reflects 0x3F", app.lib.host_get_cheats() == 0x3F)
+    y_before = wram[0x1860] | (wram[0x1861] << 8)
+    for _ in range(25):
+        app.frame(mask_of("B", "X"))
+    y_after = wram[0x1860] | (wram[0x1861] << 8)
+    check("Infinite Health cheat locks 7E0110=1 and 7E18B0=5",
+          wram[0x0110] == 1 and wram[0x18B0] == 5, f"7E0110={wram[0x0110]}, 7E18B0={wram[0x18B0]}")
+    check("Infinite Mask Power cheat keeps morph meter at 0x0500 despite X attacks",
+          wram[0x0112] == 1 and wram[0x0090] == 5, f"7E0112={wram[0x0112]}, 7E0090={wram[0x0090]}")
+    check("Infinite Lives cheat sets 9 lives and 7E010E=1",
+          wram[0x010E] == 1 and wram[0x0095] >= 9, f"lives={wram[0x0095]}")
+    check("Invincibility & Stage Select cheats set 7E18B9=0x46 and 7E0114=1",
+          wram[0x18B9] == 0x46 and wram[0x0114] == 1)
+    check("Moon Jump cheat lifts player upward while holding B",
+          y_after < y_before, f"Y {y_before} -> {y_after}")
+    app.lib.host_set_cheats(0)
+    app.frame(0)
+    check("disabling cheats clears built-in WRAM cheat flags",
+          wram[0x0110] == 0 and wram[0x0112] == 0 and wram[0x010E] == 0 and wram[0x0114] == 0)
+
     print("save states")
     sz = app.lib.retro_serialize_size()
     buf = C.create_string_buffer(sz)
+    snap_pre_save = bytes(wram[:4096])
     saved = bool(app.lib.retro_serialize(buf, sz))
     for _ in range(30):
         app.frame(mask_of("RIGHT"))
     restored = bool(app.lib.retro_unserialize(buf, sz))
     snap_restored = bytes(wram[:4096])
     check("retro_serialize / retro_unserialize round-trips state",
-          saved and restored and snap_restored == snap2, f"{sz} bytes")
+          saved and restored and snap_restored == snap_pre_save, f"{sz} bytes")
 
     app.stop()
     print("ALL TESTS PASSED" if not failures else f"{len(failures)} TEST(S) FAILED")

@@ -4,22 +4,27 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.widget.Button;
-
-import com.bitvaultengine.updates.UpdateClient;
-
-import android.widget.CheckBox;
-import android.widget.LinearLayout;
-import android.widget.ScrollView;
-import android.widget.SeekBar;
+import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.StyleSpan;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
+import android.widget.Toast;
+
+import com.bitvaultengine.updates.UpdateClient;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -27,6 +32,30 @@ import java.io.InputStream;
 
 public final class MainActivity extends Activity {
     private static final String ROM_ASSET = "themask.sfc";
+
+    public static final String ABOUT_RAW_MARKDOWN =
+            "This application has been developed by **Ahmed Kamal Elgandy** to serve as a digital archive and platform for running and optimizing classic retro and Atari-style games on mobile devices. The project aims to revive memories and preserve the software heritage of classic games with a smooth, lightweight experience, while fully respecting the intellectual property rights of the original production companies.";
+
+    public static final String ABOUT_PLAIN_TEXT =
+            "This application has been developed by Ahmed Kamal Elgandy to serve as a digital archive and platform for running and optimizing classic retro and Atari-style games on mobile devices. The project aims to revive memories and preserve the software heritage of classic games with a smooth, lightweight experience, while fully respecting the intellectual property rights of the original production companies.";
+
+    private static final int[] CHEAT_FLAGS = {
+            SnesCore.CHEAT_INF_HEALTH,
+            SnesCore.CHEAT_INF_MASK_POWER,
+            SnesCore.CHEAT_INF_LIVES,
+            SnesCore.CHEAT_INVINCIBLE,
+            SnesCore.CHEAT_MOON_JUMP,
+            SnesCore.CHEAT_LEVEL_SELECT,
+    };
+
+    private static final String[] CHEAT_LABELS = {
+            "طاقة وصحة لا نهائية (Infinite Health)",
+            "قوة القناع والأسلحة لا نهائية (Infinite Mask Power)",
+            "أرواح لا نهائية - 9 أرواح (Infinite Lives)",
+            "عدم التضرر واختراق الأعداء (Invincibility / Ghost)",
+            "قفزة خارقة / طيران عند الضغط على B (Moon Jump)",
+            "فتح جميع المراحل في الخريطة (Unlock All Stages)",
+    };
 
     private Emulator emulator;
     private GameView gameView;
@@ -56,14 +85,31 @@ public final class MainActivity extends Activity {
 
         prefs = getSharedPreferences("settings", MODE_PRIVATE);
         applySettings();
+
+        LinearLayout topMenuBar = new LinearLayout(this);
+        topMenuBar.setOrientation(LinearLayout.HORIZONTAL);
         Button settings = new Button(this);
-        settings.setText("⚙ الإعدادات");
+        settings.setText("⚙ القائمة");
         settings.setAllCaps(false);
         settings.setOnClickListener(v -> showSettings());
+        topMenuBar.addView(settings);
+
+        Button cheatsQuick = new Button(this);
+        cheatsQuick.setText("🎮 الغش");
+        cheatsQuick.setAllCaps(false);
+        cheatsQuick.setOnClickListener(v -> showCheatsDialog());
+        topMenuBar.addView(cheatsQuick);
+
+        Button aboutQuick = new Button(this);
+        aboutQuick.setText("About");
+        aboutQuick.setAllCaps(false);
+        aboutQuick.setOnClickListener(v -> showAboutDialog());
+        topMenuBar.addView(aboutQuick);
+
         FrameLayout.LayoutParams menuParams = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.LEFT);
-        root.addView(settings, menuParams);
+        root.addView(topMenuBar, menuParams);
 
         status = new TextView(this);
         status.setTextColor(0xFFFFFFFF);
@@ -101,7 +147,11 @@ public final class MainActivity extends Activity {
     private void applySettings() {
         controls.setControlScale(prefs.getInt("size", 100) / 100f);
         controls.setAlpha(prefs.getInt("opacity", 75) / 100f);
-        gameView.setStretch(prefs.getBoolean("stretch", false));
+        controls.setFreeStick(prefs.getBoolean("free_stick", true));
+        gameView.setStretch(prefs.getBoolean("stretch", true));
+        if (emulator != null) {
+            emulator.setCheats(prefs.getInt("cheats", 0));
+        }
     }
 
     private void showSettings() {
@@ -112,28 +162,180 @@ public final class MainActivity extends Activity {
         box.setOrientation(LinearLayout.VERTICAL);
         int padding = (int) (20 * getResources().getDisplayMetrics().density);
         box.setPadding(padding, padding, padding, padding);
+
         CheckBox stretch = new CheckBox(this);
-        stretch.setText("ملء عرض الشاشة (الصورة تتمدد بدون قص)");
-        stretch.setChecked(prefs.getBoolean("stretch", false));
+        stretch.setText("شاشة عريضة بعرض شاشة الموبايل (Widescreen)");
+        stretch.setChecked(prefs.getBoolean("stretch", true));
         stretch.setOnCheckedChangeListener((v, checked) -> {
-            prefs.edit().putBoolean("stretch", checked).apply(); applySettings();
+            prefs.edit().putBoolean("stretch", checked).apply();
+            applySettings();
         });
         box.addView(stretch);
+
+        CheckBox freeStick = new CheckBox(this);
+        freeStick.setText("عصاية تحكم حرة الحركة (Free-Floating Joystick)");
+        freeStick.setChecked(prefs.getBoolean("free_stick", true));
+        freeStick.setOnCheckedChangeListener((v, checked) -> {
+            prefs.edit().putBoolean("free_stick", checked).apply();
+            applySettings();
+        });
+        box.addView(freeStick);
+
+        Button cheatsBtn = new Button(this);
+        cheatsBtn.setText("🎮 أكواد الغش (Cheats)");
+        cheatsBtn.setAllCaps(false);
+        cheatsBtn.setOnClickListener(v -> showCheatsDialog());
+        box.addView(cheatsBtn);
+
         Button checkUpdate = new Button(this);
         checkUpdate.setText("التحديث");
         checkUpdate.setAllCaps(false);
         checkUpdate.setOnClickListener(v -> UpdateClient.checkNow(this));
         box.addView(checkUpdate);
+
+        Button aboutBtn = new Button(this);
+        aboutBtn.setText("About");
+        aboutBtn.setAllCaps(false);
+        aboutBtn.setOnClickListener(v -> showAboutDialog());
+        box.addView(aboutBtn);
+
         addSlider(box, "حجم الأزرار والعصاية", "size", 70, 120, 100);
         addSlider(box, "وضوح الأزرار", "opacity", 25, 100, 75);
+
         TextView hint = new TextView(this);
-        hint.setText("لوحة المفاتيح كاملة: عصا يسار + الأزرار الأربعة + L و R. الصورة الأصلية ٤:٣ بدون قص. "
-                + "الملء يمدد الصورة بدون تغيير نسبة العرض. التعديلات تُحفظ تلقائيًا.");
+        hint.setText("عصاية تحكم حرة بزاوية 360° على يسار الشاشة + أزرار SNES الكاملة + شاشة عريضة بعرض شاشة الموبايل + قائمة أكواد الغش.");
         box.addView(hint);
+
         ScrollView scroll = new ScrollView(this);
         scroll.addView(box);
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("إعدادات اللعبة")
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("القائمة والإعدادات")
                 .setView(scroll).setPositiveButton("تم", (d, w) -> {}).create();
+        dialog.setOnDismissListener(d -> {
+            settingsOpen = false;
+            if (emulator != null && hasWindowFocus()) emulator.setPaused(false);
+        });
+        dialog.show();
+    }
+
+    private void showCheatsDialog() {
+        settingsOpen = true;
+        controls.releaseAll();
+        if (emulator != null) emulator.setPaused(true);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int padding = (int) (18 * getResources().getDisplayMetrics().density);
+        box.setPadding(padding, padding, padding, padding);
+
+        final CheckBox[] boxes = new CheckBox[CHEAT_FLAGS.length];
+        int currentMask = prefs.getInt("cheats", 0);
+
+        for (int i = 0; i < CHEAT_FLAGS.length; i++) {
+            final int flag = CHEAT_FLAGS[i];
+            CheckBox cb = new CheckBox(this);
+            cb.setText(CHEAT_LABELS[i]);
+            cb.setChecked((currentMask & flag) != 0);
+            cb.setOnCheckedChangeListener((v, checked) -> {
+                int m = prefs.getInt("cheats", 0);
+                if (checked) m |= flag;
+                else m &= ~flag;
+                prefs.edit().putInt("cheats", m).apply();
+                applySettings();
+            });
+            boxes[i] = cb;
+            box.addView(cb);
+        }
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        Button enableAll = new Button(this);
+        enableAll.setText("تفعيل الكل");
+        enableAll.setAllCaps(false);
+        enableAll.setOnClickListener(v -> {
+            prefs.edit().putInt("cheats", SnesCore.CHEAT_ALL).apply();
+            for (CheckBox cb : boxes) cb.setChecked(true);
+            applySettings();
+        });
+        actions.addView(enableAll);
+
+        Button disableAll = new Button(this);
+        disableAll.setText("إيقاف الكل");
+        disableAll.setAllCaps(false);
+        disableAll.setOnClickListener(v -> {
+            prefs.edit().putInt("cheats", 0).apply();
+            for (CheckBox cb : boxes) cb.setChecked(false);
+            if (emulator != null) emulator.applyCheatCode(0, false, null);
+            applySettings();
+        });
+        actions.addView(disableAll);
+        box.addView(actions);
+
+        TextView customLabel = new TextView(this);
+        customLabel.setText("إدخال كود Game Genie (XXXX-XXXX) أو Action Replay (7EXXXXYY):");
+        box.addView(customLabel);
+
+        final EditText customCode = new EditText(this);
+        customCode.setHint("مثال: 7E009509 أو C22B-C461");
+        customCode.setSingleLine(true);
+        customCode.setText(prefs.getString("custom_cheat", ""));
+        box.addView(customCode);
+
+        Button applyCodeBtn = new Button(this);
+        applyCodeBtn.setText("تطبيق الكود المخصص");
+        applyCodeBtn.setAllCaps(false);
+        applyCodeBtn.setOnClickListener(v -> {
+            String code = customCode.getText().toString().trim().toUpperCase();
+            prefs.edit().putString("custom_cheat", code).apply();
+            if (emulator != null && !code.isEmpty()) {
+                emulator.applyCheatCode(0, true, code);
+                Toast.makeText(this, "تم تفعيل الكود: " + code, Toast.LENGTH_SHORT).show();
+            }
+        });
+        box.addView(applyCodeBtn);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(box);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("🎮 أكواد الغش — The Mask")
+                .setView(scroll)
+                .setPositiveButton("عودة للعبة", (d, w) -> {})
+                .create();
+        dialog.setOnDismissListener(d -> {
+            settingsOpen = false;
+            if (emulator != null && hasWindowFocus()) emulator.setPaused(false);
+        });
+        dialog.show();
+    }
+
+    private void showAboutDialog() {
+        settingsOpen = true;
+        controls.releaseAll();
+        if (emulator != null) emulator.setPaused(true);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int padding = (int) (22 * getResources().getDisplayMetrics().density);
+        box.setPadding(padding, padding, padding, padding);
+
+        TextView body = new TextView(this);
+        body.setTextSize(16f);
+        SpannableString span = new SpannableString(ABOUT_PLAIN_TEXT);
+        int nameIdx = ABOUT_PLAIN_TEXT.indexOf("Ahmed Kamal Elgandy");
+        if (nameIdx >= 0) {
+            span.setSpan(new StyleSpan(Typeface.BOLD),
+                    nameIdx, nameIdx + "Ahmed Kamal Elgandy".length(),
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        body.setText(span);
+        box.addView(body);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(box);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("About")
+                .setView(scroll)
+                .setPositiveButton("OK", (d, w) -> {})
+                .create();
         dialog.setOnDismissListener(d -> {
             settingsOpen = false;
             if (emulator != null && hasWindowFocus()) emulator.setPaused(false);

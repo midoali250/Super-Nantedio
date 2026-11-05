@@ -11,16 +11,20 @@ import android.view.SurfaceView;
 
 /**
  * Surface that shows the emulator output. The emulator thread draws directly
- * onto the surface so video and audio stay in step; frames are letterboxed to
- * the SNES 4:3 aspect ratio and never cropped.
+ * onto the surface so video and audio stay in step. Defaults to full mobile
+ * widescreen across the entire display width, with an option in Settings to
+ * switch to 4:3 pillarboxed mode.
  */
 final class GameView extends SurfaceView implements SurfaceHolder.Callback {
     private final Paint paint = new Paint();
     private final Paint clear = new Paint();
     private final Rect dst = new Rect();
     private volatile int viewWidth, viewHeight;
-    private volatile boolean stretch;
+    private volatile boolean stretch = true;
+
     void setStretch(boolean value) { stretch = value; }
+
+    boolean isStretch() { return stretch; }
 
     GameView(Context context) {
         super(context);
@@ -58,8 +62,8 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
             int h = canvas.getHeight();
             viewWidth = w;
             viewHeight = h;
-            if (stretch) dst.set(0, 0, w, h);
-            else frameRect(w, h, bitmap.getWidth(), bitmap.getHeight(), dst);
+            int[] r = ScreenMap.displayRect(w, h, stretch);
+            dst.set(r[0], r[1], r[0] + r[2], r[1] + r[3]);
             canvas.drawRect(0, 0, w, h, clear);
             canvas.drawBitmap(bitmap, null, dst, paint);
         } catch (IllegalArgumentException ignored) {
@@ -75,13 +79,10 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
 
     /** Area (in view pixels) the emulator image occupies right now. */
     Rect imageRect() {
-        int w = getWidth() > 0 ? getWidth() : viewWidth;
-        int h = getHeight() > 0 ? getHeight() : viewHeight;
-        Rect r = new Rect();
-        if (stretch) r.set(0, 0, w, h);
-        else frameRect(w > 0 ? w : 1920, h > 0 ? h : 1080,
-                ScreenMap.SNES_WIDTH, ScreenMap.SNES_HEIGHT, r);
-        return r;
+        int w = getWidth() > 0 ? getWidth() : (viewWidth > 0 ? viewWidth : 1920);
+        int h = getHeight() > 0 ? getHeight() : (viewHeight > 0 ? viewHeight : 1080);
+        int[] r = ScreenMap.displayRect(w, h, stretch);
+        return new Rect(r[0], r[1], r[0] + r[2], r[1] + r[3]);
     }
 
     /** Fits the frame into the view keeping the SNES 4:3 display aspect. */

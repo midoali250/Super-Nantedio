@@ -43,7 +43,7 @@ def main():
         "apk_size_bytes": apk_size,
         "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/the-mask-v1.0",
         "published_at": now_utc,
-        "release_notes_ar": "الإصدار الأول 1.0 للعبة The Mask (SNES) على أندرويد مع أيقونة مخصصة ودعم مركز تحديثات BitVaultEngine.",
+        "release_notes_ar": "إصدار The Mask (SNES) مع شاشة عريضة بعرض شاشة الموبايل، وعصاية تحكم حرة 360°، وقائمة أكواد الغش (Cheats)، وزر About.",
         "required": False,
     }
     (ROOT / "updates/games/the-mask.json").write_text(

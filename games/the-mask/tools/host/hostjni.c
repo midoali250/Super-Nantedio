@@ -54,6 +54,8 @@ jint     Java_com_midoali_snes_SnesCore_nativeFrameWidth(JNIEnv *, jclass);
 jint     Java_com_midoali_snes_SnesCore_nativeFrameHeight(JNIEnv *, jclass);
 jint     Java_com_midoali_snes_SnesCore_nativeCopyVideo(JNIEnv *, jclass, jobject);
 void     Java_com_midoali_snes_SnesCore_nativeSetInput(JNIEnv *, jclass, jint);
+void     Java_com_midoali_snes_SnesCore_nativeSetCheats(JNIEnv *, jclass, jint);
+jint     Java_com_midoali_snes_SnesCore_nativeGetCheats(JNIEnv *, jclass);
 jint     Java_com_midoali_snes_SnesCore_nativeReadAudio(JNIEnv *, jclass, jshortArray, jint);
 
 static unsigned char g_video[1024 * 1024];
@@ -82,6 +84,16 @@ void host_frame(void)
 void host_input(int mask)
 {
    Java_com_midoali_snes_SnesCore_nativeSetInput(&g_env, NULL, mask);
+}
+
+void host_set_cheats(int mask)
+{
+   Java_com_midoali_snes_SnesCore_nativeSetCheats(&g_env, NULL, mask);
+}
+
+int host_get_cheats(void)
+{
+   return Java_com_midoali_snes_SnesCore_nativeGetCheats(&g_env, NULL);
 }
 
 int host_width(void) { return Java_com_midoali_snes_SnesCore_nativeFrameWidth(&g_env, NULL); }

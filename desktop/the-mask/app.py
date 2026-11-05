@@ -1,13 +1,32 @@
 #!/usr/bin/env python3
 """SNES: The Mask desktop frontend, Snes9x 2010 core."""
 import ctypes as C
-import hashlib, json, math, os, re, subprocess, sys, tempfile, threading, time, urllib.request
+import hashlib, json, math, os, re, subprocess, sys, tempfile, textwrap, threading, time, urllib.request
 from pathlib import Path
 import pygame
 
 VERSION = '1.0.0'
 CATALOG = 'https://raw.githubusercontent.com/midoali250/bitvault-engine/refs/heads/main/updates/desktop/the-mask.json'
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+
+ABOUT_RAW_MARKDOWN = (
+    'This application has been developed by **Ahmed Kamal Elgandy** to serve as a digital archive '
+    'and platform for running and optimizing classic retro and Atari-style games on mobile devices. '
+    'The project aims to revive memories and preserve the software heritage of classic games with '
+    'a smooth, lightweight experience, while fully respecting the intellectual property rights of '
+    'the original production companies.'
+)
+ABOUT_PLAIN_TEXT = ABOUT_RAW_MARKDOWN.replace('**', '')
+
+CHEAT_ITEMS = [
+    ('Infinite Health / Energy', 1 << 0),
+    ('Infinite Mask Morph Power', 1 << 1),
+    ('Infinite Lives (9 Lives)', 1 << 2),
+    ('Invincibility (Ghost Mode)', 1 << 3),
+    ('Super Moon Jump (Hold B)', 1 << 4),
+    ('Unlock All Stages (Map Select)', 1 << 5),
+]
+CHEAT_ALL = 0x3F
 
 
 class Core:
@@ -24,6 +43,9 @@ class Core:
         self.lib.host_stop.argtypes = []
         self.lib.host_frame.argtypes = []
         self.lib.host_input.argtypes = [C.c_int]
+        self.lib.host_set_cheats.argtypes = [C.c_int]
+        self.lib.host_get_cheats.argtypes = []
+        self.lib.host_get_cheats.restype = C.c_int
         self.lib.host_width.argtypes = []
         self.lib.host_width.restype = C.c_int
         self.lib.host_height.argtypes = []
@@ -45,6 +67,12 @@ class Core:
     def frame(self, mask):
         self.lib.host_input(mask)
         self.lib.host_frame()
+
+    def set_cheats(self, mask):
+        self.lib.host_set_cheats(int(mask) & CHEAT_ALL)
+
+    def get_cheats(self):
+        return int(self.lib.host_get_cheats())
 
     def framebuffer(self):
         size = self.lib.host_video(self.video, len(self.video))
@@ -343,6 +371,7 @@ def load_config():
         cfg['display'] = 'fill'
     if cfg.get('filter') not in ('sharp', 'smooth'):
         cfg['filter'] = 'sharp'
+    cfg['cheats'] = int(cfg.get('cheats', 0)) & CHEAT_ALL if isinstance(cfg.get('cheats', 0), int) else 0
     return cfg
 
 
@@ -463,6 +492,7 @@ def self_test():
     pygame.init()
     pygame.display.set_mode((256, 224))
     apply_window_icon()
+    assert 'Ahmed Kamal Elgandy' in ABOUT_RAW_MARKDOWN and 'intellectual property rights' in ABOUT_PLAIN_TEXT
     core = Core()
     assert (core.w, core.h) == (256, 224), f'Unexpected geometry: {core.w}x{core.h}'
 
@@ -472,7 +502,7 @@ def self_test():
             core.samples()
 
     # Boot into Level 1 of The Mask
-    for i in range(1, 2001):
+    for i in range(1, 2401):
         m = (1 << 3) if i in (600, 601, 900, 901, 1200, 1201, 1500, 1501, 1800, 1801) else 0
         core.frame(m)
         core.samples()
@@ -487,6 +517,18 @@ def self_test():
     run(20, 1 << 0)  # B (Jump)
     snap2 = bytes(wram[:4096])
     assert snap1 != snap2, 'Player did not jump on B'
+
+    # Verify built-in Cheats engine on Desktop
+    core.set_cheats(CHEAT_ALL)
+    assert core.get_cheats() == CHEAT_ALL, 'Cheats mask not set'
+    run(10, (1 << 0) | (1 << 9))
+    assert wram[0x0110] == 1 and wram[0x18B0] == 5, 'Infinite Health cheat failed'
+    assert wram[0x0112] == 1 and wram[0x0090] == 5, 'Infinite Mask Power cheat failed'
+    assert wram[0x010E] == 1 and wram[0x0095] >= 9, 'Infinite Lives cheat failed'
+    core.set_cheats(0)
+    run(1, 0)
+    assert wram[0x0110] == 0 and wram[0x0112] == 0 and wram[0x010E] == 0, 'Cheats did not clear'
+    snap2 = bytes(wram[:4096])
 
     state = snapshot(core)
     run(30, 1 << 7)
@@ -570,12 +612,12 @@ def self_test():
     monitor.thread.join(3)
     assert seen == ['9.0.0', '9.1.0'], 'New update notification missing'
     core.stop()
-    print('PASS: The Mask SNES gameplay, save/restore, 4K scaling, keyboard/mouse/gamepad, notifications')
+    print('PASS: The Mask SNES gameplay, cheats, save/restore, 4K scaling, keyboard/mouse/gamepad, notifications')
     pygame.quit()
 
 
 def update_network_test():
-    # Exercise the packaged Python/SSL/catalog path as an older version (0.1.0 < 1.0.0).
+    # Exercise the packaged Python/SSL/catalog path as an older version (0.1.0 < 1.1.0).
     global VERSION
     actual = VERSION
     VERSION = '0.1.0'
@@ -609,6 +651,7 @@ def main():
     core = Core()
     frame = pygame.Surface((core.w, core.h), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
     cfg = load_config()
+    core.set_cheats(cfg.get('cheats', 0))
     controls = cfg['controls']
     pads = devices()
     notice = {'text': 'Checking for updates...', 'url': ''}
@@ -643,9 +686,9 @@ def main():
     last_save = time.monotonic()
     buttons = []
     main_rows = [
-        'Resume game', 'Controls', 'Video & display',
+        'Resume game', 'Controls', 'Cheats', 'Video & display',
         'Save now', 'Load saved game', 'Check for updates',
-        'Download update', 'Exit game'
+        'Download update', 'About', 'Exit game'
     ]
     video_rows = ['Screen:', 'Filter:', 'Toggle fullscreen', 'Back']
 
@@ -674,6 +717,9 @@ def main():
                 page = 'controls'
                 selected = 0
                 group = 0
+            elif choice == 'Cheats':
+                page = 'cheats'
+                selected = 0
             elif choice == 'Video & display':
                 page = 'video'
                 selected = 0
@@ -694,6 +740,9 @@ def main():
                     threading.Thread(target=download_update, args=(notice,), daemon=True).start()
                 else:
                     message = 'Check for an available update first'
+            elif choice == 'About':
+                page = 'about'
+                selected = 0
             elif choice == 'Exit game':
                 save_now()
                 running = False
@@ -710,6 +759,26 @@ def main():
             else:
                 page = 'main'
                 selected = 1
+        elif page == 'cheats':
+            if selected < len(CHEAT_ITEMS):
+                _, bit = CHEAT_ITEMS[selected]
+                cfg['cheats'] = cfg.get('cheats', 0) ^ bit
+                core.set_cheats(cfg['cheats'])
+                persist()
+                message = 'Cheat updated'
+            elif selected == len(CHEAT_ITEMS):
+                cfg['cheats'] = CHEAT_ALL
+                core.set_cheats(CHEAT_ALL)
+                persist()
+                message = 'All cheats enabled'
+            elif selected == len(CHEAT_ITEMS) + 1:
+                cfg['cheats'] = 0
+                core.set_cheats(0)
+                persist()
+                message = 'All cheats disabled'
+            else:
+                page = 'main'
+                selected = 2
         elif page == 'video':
             if selected == 0:
                 cfg['display'] = 'fit' if cfg['display'] == 'fill' else 'fill'
@@ -723,7 +792,10 @@ def main():
                                                  pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
             else:
                 page = 'main'
-                selected = 2
+                selected = 3
+        elif page == 'about':
+            page = 'main'
+            selected = 8
 
     def back():
         nonlocal page, selected, waiting
@@ -746,7 +818,7 @@ def main():
                 notice['url'] = 'https://example.test'
                 pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(screen.get_width() // 2, 20)))
             if ui_frame == 7:
-                assert page == 'main' and selected == 6, 'Update banner did not open download menu'
+                assert page == 'main' and selected == 7, 'Update banner did not open download menu'
                 selected = 0
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN))
             if ui_frame == 8:
@@ -762,8 +834,25 @@ def main():
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
             if ui_frame == 16:
                 assert page == 'main'
-                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+                selected = 2  # Cheats
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
             if ui_frame == 18:
+                assert page == 'cheats'
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
+            if ui_frame == 20:
+                assert (cfg['cheats'] & 1) == 1 and (core.get_cheats() & 1) == 1
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+            if ui_frame == 22:
+                assert page == 'main'
+                selected = 8  # About
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
+            if ui_frame == 24:
+                assert page == 'about'
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+            if ui_frame == 26:
+                assert page == 'main'
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+            if ui_frame == 28:
                 assert page is None
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
 
@@ -812,7 +901,7 @@ def main():
                     continue
                 if not page and time.monotonic() < monitor.banner_until and pygame.Rect(max(5, (w - min(560, w - 10)) // 2), 12, min(560, w - 10), 64).collidepoint(e.pos):
                     page = 'main'
-                    selected = 6
+                    selected = 7
                     continue
                 if page:
                     for rect, row, col in buttons:
@@ -825,7 +914,13 @@ def main():
                     continue
             if not page:
                 continue
-            n = {'main': len(main_rows), 'controls': len(ACTIONS) + 2, 'video': len(video_rows)}[page]
+            n = {
+                'main': len(main_rows),
+                'controls': len(ACTIONS) + 2,
+                'cheats': len(CHEAT_ITEMS) + 3,
+                'video': len(video_rows),
+                'about': 1,
+            }[page]
             key = None
             if e.type == pygame.KEYDOWN:
                 key = e.key
@@ -939,7 +1034,14 @@ def main():
                 screen.blit(f.render(str(s), True, c), (int(x), int(y)))
             x = panel.x + 24 * k
             top = panel.y + 20 * k
-            text(title, {'main': 'SNES: THE MASK — PAUSED', 'controls': 'SNES CONTROLS', 'video': 'VIDEO & DISPLAY'}[page], x, top)
+            titles = {
+                'main': 'SNES: THE MASK — PAUSED',
+                'controls': 'SNES CONTROLS',
+                'cheats': 'CHEAT CODES — THE MASK',
+                'video': 'VIDEO & DISPLAY',
+                'about': 'ABOUT',
+            }
+            text(title, titles[page], x, top)
             text(small, 'F1 / Esc: back    •    Arrows + Enter / click    •    F11: fullscreen', x, top + 35 * k, (143, 165, 190))
             start = panel.y + 80 * k
             buttons = []
@@ -969,6 +1071,32 @@ def main():
                         pygame.draw.rect(screen, (35, 53, 77), rect, border_radius=6)
                     text(small, label, x, y + 8 * k)
                 footer = ('Press ' + GROUPS[waiting[1]] + ' input now (Esc cancels)' if waiting else 'Choose a column with Left/Right, then Enter or click.')
+            elif page == 'cheats':
+                cheat_rows = [
+                    f"[{'ON ' if (cfg.get('cheats', 0) & bit) else 'OFF'}]  {label}"
+                    for label, bit in CHEAT_ITEMS
+                ] + ['Enable all cheats', 'Disable all cheats', 'Back']
+                rowh = min(46 * k, (ph - 155 * k) / len(cheat_rows))
+                for i, label in enumerate(cheat_rows):
+                    y = start + i * rowh
+                    rect = pygame.Rect(panel.x + 14 * k, y, pw - 28 * k, rowh - 4 * k)
+                    buttons.append((rect, i, None))
+                    if i == selected:
+                        pygame.draw.rect(screen, (35, 69, 92), rect, border_radius=max(3, int(7 * k)))
+                    col = (103, 240, 155) if label.startswith('[ON ') else (230, 237, 248)
+                    text(font, label, x, y + 8 * k, col)
+                footer = 'Toggle any cheat with Enter or mouse click. Changes apply immediately.'
+            elif page == 'about':
+                text(font, 'Developed by Ahmed Kamal Elgandy', x, start + 10 * k, (250, 214, 75))
+                y_line = start + 55 * k
+                for line in textwrap.wrap(ABOUT_PLAIN_TEXT, width=72):
+                    text(font, line, x, y_line, (225, 235, 248))
+                    y_line += 34 * k
+                rect = pygame.Rect(panel.x + 14 * k, panel.bottom - 95 * k, 220 * k, 44 * k)
+                buttons.append((rect, 0, None))
+                pygame.draw.rect(screen, (35, 69, 92), rect, border_radius=max(3, int(7 * k)))
+                text(font, 'Back', x, rect.y + 9 * k)
+                footer = 'Press Enter, Backspace, or Esc to return to the menu.'
             else:
                 rows = main_rows if page == 'main' else video_rows
                 rowh = min(51 * k, (ph - 155 * k) / len(rows))
@@ -997,7 +1125,7 @@ def main():
             screen.blit(banner_small.render('Click here or use the gear to download', True, (175, 230, 237)), (banner.x + 14, banner.y + 34))
 
         pygame.display.flip()
-        if ui_test and ui_frame == 10 and os.environ.get('THE_MASK_UI_SCREENSHOT'):
+        if ui_test and ui_frame == 18 and os.environ.get('THE_MASK_UI_SCREENSHOT'):
             pygame.image.save(screen, os.environ['THE_MASK_UI_SCREENSHOT'])
         if page:
             clock.tick(30)

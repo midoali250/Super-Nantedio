@@ -12,7 +12,7 @@ final class ScreenMap {
 
     private ScreenMap() { }
 
-    /** Fits the picture into the view (letterboxed, never cropped): {l, t, w, h}. */
+    /** Fits the picture into the view (letterboxed 4:3, never cropped): {l, t, w, h}. */
     static int[] fitRect(int viewW, int viewH) {
         if (viewW <= 0 || viewH <= 0) return new int[] {0, 0, 0, 0};
         int w = viewW;
@@ -22,6 +22,17 @@ final class ScreenMap {
             w = (int) Math.round(h * SNES_ASPECT);
         }
         return new int[] {(viewW - w) / 2, (viewH - h) / 2, w, h};
+    }
+
+    /** Full-width mobile widescreen rectangle filling the entire view: {0, 0, viewW, viewH}. */
+    static int[] widescreenRect(int viewW, int viewH) {
+        if (viewW <= 0 || viewH <= 0) return new int[] {0, 0, 0, 0};
+        return new int[] {0, 0, viewW, viewH};
+    }
+
+    /** Returns either the full-width widescreen rect or the 4:3 letterboxed rect. */
+    static int[] displayRect(int viewW, int viewH, boolean widescreen) {
+        return widescreen ? widescreenRect(viewW, viewH) : fitRect(viewW, viewH);
     }
 
     static int snesX(float screenX, int left, int width) {

@@ -25,6 +25,7 @@ final class Emulator implements Runnable {
 
     private volatile boolean running;
     private volatile boolean paused;
+    private volatile int cheatMask;
     private final Object pauseLock = new Object();
     private Thread thread;
     private AudioTrack track;
@@ -45,6 +46,23 @@ final class Emulator implements Runnable {
     int frameWidth() { return frameWidth; }
 
     int frameHeight() { return frameHeight; }
+
+    void setCheats(int mask) {
+        cheatMask = mask;
+        try {
+            SnesCore.nativeSetCheats(mask);
+        } catch (Throwable ignored) { }
+    }
+
+    int getCheats() {
+        return cheatMask;
+    }
+
+    void applyCheatCode(int index, boolean enabled, String code) {
+        try {
+            SnesCore.nativeApplyCheatCode(index, enabled, code);
+        } catch (Throwable ignored) { }
+    }
 
     void start() {
         if (running) return;
@@ -88,6 +106,7 @@ final class Emulator implements Runnable {
                 Log.e(TAG, "core rejected the ROM");
                 return;
             }
+            SnesCore.nativeSetCheats(cheatMask);
             frameWidth = SnesCore.nativeFrameWidth();
             frameHeight = SnesCore.nativeFrameHeight();
             if (frameWidth <= 0 || frameHeight <= 0) {
@@ -112,6 +131,7 @@ final class Emulator implements Runnable {
                 }
 
                 SnesCore.nativeSetInput(pad.mask());
+                SnesCore.nativeSetCheats(cheatMask);
                 SnesCore.nativeRunFrame();
 
                 int frames = SnesCore.nativeReadAudio(audioBuffer, AUDIO_FRAMES_PER_READ);

@@ -1,10 +1,11 @@
 package com.midoali.snes;
 
 /**
- * Turns the on-screen controls into a SNES joypad bitmask.
+ * Turns the on-screen controls (including the 360-degree free-floating virtual
+ * analog joystick) into a SNES joypad bitmask.
  *
  * The SNES pad has four face buttons in a diamond (X on top, Y left, A right,
- * B bottom) plus L and R shoulders, a D-pad and START / SELECT.
+ * B bottom) plus L and R shoulders, a directional stick and START / SELECT.
  *
  * Button ids are the libretro RETRO_DEVICE_ID_JOYPAD_* values, so the mask can
  * be handed to the core unchanged.
@@ -21,8 +22,13 @@ final class VirtualPad {
     static final int FACE_A = 0, FACE_B = 1, FACE_X = 2, FACE_Y = 3;
     static final int SHOULDER_L = 0, SHOULDER_R = 1;
 
+    /* Deadzone as a fraction of stick radius. */
+    static final float STICK_DEADZONE = 0.22f;
+
     private final boolean[] held = new boolean[BTN_COUNT];
     private int mask;
+    private float stickNormX;
+    private float stickNormY;
 
     VirtualPad() {
     }
@@ -56,11 +62,69 @@ final class VirtualPad {
         held[BTN_DOWN] = down;
         held[BTN_LEFT] = left;
         held[BTN_RIGHT] = right;
+        if (!up && !down && !left && !right) {
+            stickNormX = 0f;
+            stickNormY = 0f;
+        }
         if (changed) rebuild();
     }
 
+    /**
+     * Updates the virtual analog stick from a touch displacement (dx, dy)
+     * relative to the stick base and returns the updated {baseX, baseY, knobX, knobY}.
+     * When {@code freeFollow} is true and the finger drags past {@code maxRadius},
+     * the floating base smoothly follows behind the thumb.
+     */
+    synchronized float[] updateFreeStick(float baseX, float baseY,
+                                         float touchX, float touchY,
+                                         float maxRadius, boolean freeFollow) {
+        if (maxRadius <= 1f) maxRadius = 1f;
+        float dx = touchX - baseX;
+        float dy = touchY - baseY;
+        float dist = (float) Math.hypot(dx, dy);
+        float knobX = touchX;
+        float knobY = touchY;
+
+        if (dist > maxRadius) {
+            float ux = dx / dist;
+            float uy = dy / dist;
+            if (freeFollow) {
+                baseX = touchX - ux * maxRadius;
+                baseY = touchY - uy * maxRadius;
+                knobX = touchX;
+                knobY = touchY;
+            } else {
+                knobX = baseX + ux * maxRadius;
+                knobY = baseY + uy * maxRadius;
+            }
+            dx = knobX - baseX;
+            dy = knobY - baseY;
+            dist = maxRadius;
+        }
+
+        stickNormX = Math.max(-1f, Math.min(1f, dx / maxRadius));
+        stickNormY = Math.max(-1f, Math.min(1f, dy / maxRadius));
+
+        boolean up = false, down = false, left = false, right = false;
+        if (dist / maxRadius >= STICK_DEADZONE) {
+            double deg = Math.toDegrees(Math.atan2(dy, dx));
+            right = deg > -67.5 && deg < 67.5;
+            left = deg > 112.5 || deg < -112.5;
+            down = deg >= 22.5 && deg <= 157.5;
+            up = deg <= -22.5 && deg >= -157.5;
+        }
+        setDpad(up, down, left, right);
+        return new float[] {baseX, baseY, knobX, knobY};
+    }
+
+    synchronized float stickNormX() { return stickNormX; }
+
+    synchronized float stickNormY() { return stickNormY; }
+
     synchronized void releaseAll() {
         for (int i = 0; i < BTN_COUNT; i++) held[i] = false;
+        stickNormX = 0f;
+        stickNormY = 0f;
         rebuild();
     }
 
