@@ -52,7 +52,7 @@ def run_session(screen, core_path, rom_path, state_dir, max_frames=None, test_ma
     for i in range(pygame.joystick.get_count()):
         try:j=pygame.joystick.Joystick(i);j.init();joysticks.append(j)
         except pygame.error:pass
-    count=0;notice='';until=0;clock=pygame.time.Clock();sound=None;menu=False
+    count=0;notice='';until=0;clock=pygame.time.Clock();sound=None;menu=False;overlay_tested=False;overlay_changed=False
     with LibretroHost(core_path,rom_path) as core:
         try:
             pygame.mixer.quit();pygame.mixer.init(frequency=int(core.sample_rate) if 8000<=core.sample_rate<=192000 else 44100,size=-16,channels=2,buffer=512);sound=pygame.mixer.Channel(0)
@@ -81,7 +81,7 @@ def run_session(screen, core_path, rom_path, state_dir, max_frames=None, test_ma
                             until=time.monotonic()+3
                 if e.type==pygame.KEYDOWN:
                     if e.key==pygame.K_g:menu=not menu;continue
-                    if menu and e.key==pygame.K_d:display_mode='STRETCH' if display_mode=='FIT' else 'FIT';continue
+                    if menu and e.key==pygame.K_d:display_mode='STRETCH' if display_mode=='FIT' else 'FIT';overlay_changed=True;continue
                     if e.key==pygame.K_ESCAPE:
                         if menu:menu=False;continue
                         return 'menu'
@@ -93,6 +93,11 @@ def run_session(screen, core_path, rom_path, state_dir, max_frames=None, test_ma
                         until=time.monotonic()+3
             core.buttons=input_bits(joysticks) if not menu else set()
             if not menu:core.run_frame();count+=1
+            if test_manual and count==3 and not overlay_tested:
+                overlay_tested=True
+                pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN,button=1,pos=(screen.get_width()-20,20)))
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_d))
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_g))
             if test_manual and not menu and count==10:core.save_state(state)
             if test_manual and not menu and count==20:core.load_state(state)
             frame=frame_surface(core)
@@ -130,7 +135,7 @@ def run_session(screen, core_path, rom_path, state_dir, max_frames=None, test_ma
                 f=pygame.font.SysFont('dejavusans',22);screen.blit(f.render(notice,True,(255,230,160)),(15,15))
             pygame.display.flip()
             if max_frames is not None and count>=max_frames:
-                if test_manual and not state.exists():raise AssertionError('manual save not produced')
+                if test_manual and (not state.exists() or not overlay_changed):raise AssertionError('manual save or settings interaction failed')
                 return 'test-complete'
             fps=core.fps if 20<=core.fps<=120 else 60
             clock.tick(fps)
