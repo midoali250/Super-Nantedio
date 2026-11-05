@@ -140,9 +140,15 @@ python3 tools/host/test_boot.py
 
 [مشروع الأندرويد](games/the-mask/) — [مشروع سطح المكتب](desktop/the-mask/)
 
-| النظام | الحزمة | ملف بصمة التحديثات | أرشيف الإصدارات |
-| --- | --- | --- | --- |
-| **Android APK** | [The-Mask-SNES-1.0.apk](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-v1.0/The-Mask-SNES-1.0.apk) | [`updates/games/the-mask.json`](updates/games/the-mask.json) | [`RELEASE-ARCHIVE/Android/The-Mask/1.0/`](RELEASE-ARCHIVE/Android/The-Mask/) |
-| **Windows x64 Portable EXE** | [The-Mask-Windows-x64.exe](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-Windows-x64.exe) | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/Windows/The-Mask/1.0.0/`](RELEASE-ARCHIVE/Windows/The-Mask/) |
-| **Linux x86_64 AppImage** | [The-Mask-Linux-x86_64.AppImage](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-Linux-x86_64.AppImage) | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/Linux/The-Mask/1.0.0/`](RELEASE-ARCHIVE/Linux/The-Mask/) |
-| **macOS Apple Silicon (App ZIP)** | [The-Mask-macOS-arm64.zip](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-macOS-arm64.zip) | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/macOS/The-Mask/1.0.0/`](RELEASE-ARCHIVE/macOS/The-Mask/) |
+### المزايا المدمجة (الإصدار 1.0 / 1.0.0)
+- **قائمة أكواد الغش (Cheat Codes Menu)**: 6 أكواد غش مدمجة تعمل مباشرة على ذاكرة WRAM الخاصة باللعبة (`Infinite Health`, `Infinite Mask Power`, `Infinite Lives`, `Invincibility / Ghost`, `Moon Jump`, `Stage Select`).
+- **عصاية تحكم حرة 360° في تطبيق الأندرويد (Free-Floating Analog Joystick)**: عصا افتراضية حرة الحركة بزاوية 360 درجة على النصف الأيسر من الشاشة تدعم الاتجاهات الثمانية والقطرية بسلاسة.
+- **شاشة عريضة بعرض شاشة الموبايل (Full-Width Mobile Widescreen)**: عرض اللعبة افتراضيًا بعرض شاشة الهاتف بالكامل على الأندرويد مع خيار التبديل إلى `4:3` من القائمة.
+- **زر `About` في القائمة**: يعرض نافذة التعريف بالتطبيق والمطور (**Ahmed Kamal Elgandy**).
+
+| النظام | الحزمة | الحجم | SHA-256 | ملف بصمة التحديثات | أرشيف الإصدارات |
+| --- | --- | --- | --- | --- | --- |
+| **Android APK** | [The-Mask-SNES-1.0.apk](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-v1.0/The-Mask-SNES-1.0.apk) | `7,606,150 B` | `a5985fa0410165269d3d263b1499731cd357beb6200979ce3e7fba2d9a368351` | [`updates/games/the-mask.json`](updates/games/the-mask.json) | [`RELEASE-ARCHIVE/Android/The-Mask/1.0/`](RELEASE-ARCHIVE/Android/The-Mask/) |
+| **Windows x64 Portable EXE** | [The-Mask-Windows-x64.exe](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-Windows-x64.exe) | `18,716,790 B` | `0fae178bc05d23a95a7f9322e836fd1f95b3e1f43357ce5f03a9bbca0e7c547c` | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/Windows/The-Mask/1.0.0/`](RELEASE-ARCHIVE/Windows/The-Mask/) |
+| **Linux x86_64 AppImage** | [The-Mask-Linux-x86_64.AppImage](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-Linux-x86_64.AppImage) | `29,067,768 B` | `d5f64e453600008eaae10162b9d2495f9d941ea5a8488205578103ccec4b3170` | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/Linux/The-Mask/1.0.0/`](RELEASE-ARCHIVE/Linux/The-Mask/) |
+| **macOS Apple Silicon (App ZIP)** | [The-Mask-macOS-arm64.zip](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-macOS-arm64.zip) | `18,510,240 B` | `c1e50fc9aa1a12d5664446a37b4c32a71db2d31c9fc658e1eef8b70564283046` | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/macOS/The-Mask/1.0.0/`](RELEASE-ARCHIVE/macOS/The-Mask/) |
