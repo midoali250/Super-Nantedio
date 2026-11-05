@@ -556,6 +556,11 @@ Java_com_midoali_snes_SnesCore_nativeStart(JNIEnv *env, jclass cls,
    snprintf(g_content_path, sizeof(g_content_path), "%s/sunsetriders.bin", dir);
    {
       FILE *f = fopen(g_content_path, "wb");
+      if (!f)
+      {
+         snprintf(g_content_path, sizeof(g_content_path), "sunsetriders.bin");
+         f = fopen(g_content_path, "wb");
+      }
       if (f)
       {
          fwrite(g_rom, 1, g_rom_len, f);

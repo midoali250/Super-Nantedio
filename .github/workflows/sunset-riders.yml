@@ -2,7 +2,9 @@ name: Sunset Riders (رعاة البقر) - Android & Desktop
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'arena/**'
     paths:
       - 'games/sunset-riders/**'
       - 'desktop/sunset-riders/**'
@@ -212,9 +214,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git fetch origin main
-          git checkout -B main origin/main
-
           APK="/tmp/sr-artifacts/sunset-riders-android/Sunset-Riders-1.0.apk"
           WIN="/tmp/sr-artifacts/Sunset-Riders-Windows-x64/Sunset-Riders-Windows-x64.exe"
           LIN="/tmp/sr-artifacts/Sunset-Riders-linux-x86_64/Sunset-Riders-Linux-x86_64.AppImage"
@@ -247,5 +246,5 @@ jobs:
           rm -f brand-audit.json
           if ! git diff --cached --quiet; then
             git commit -m "Archive Sunset Riders (رعاة البقر) v1.0 binaries and update SHA-256 manifests"
-            git push origin HEAD:main
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi

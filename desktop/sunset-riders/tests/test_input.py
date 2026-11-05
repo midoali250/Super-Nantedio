@@ -24,4 +24,4 @@ m_pad = app.input_mask(app.DEFAULTS, Empty(), (False,) * 5, [Pad()], 0)
 assert (m_pad & (1 << 6)) and (m_pad & (1 << 8)) and (m_pad & (1 << 11))
 assert len(app.CHEAT_ITEMS) == 6 and app.CHEAT_ALL == 0x3F
 assert '**Ahmed Kamal Elgandy**' in app.ABOUT_RAW_MARKDOWN
-print('PASS: Sunset Riders (رعاة البقر) controls, cheats, HD video filter, and About metadata')
+print('PASS: Sunset Riders controls, cheats, HD video filter, and About metadata')

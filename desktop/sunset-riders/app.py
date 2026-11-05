@@ -139,7 +139,7 @@ def system_notification(version):
     """Best effort OS notification; the game banner is independent."""
     if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,3}', version):
         return False
-    title = 'رعاة البقر (Sunset Riders) update'
+    title = 'Sunset Riders update'
     message = 'Version ' + version + ' is available. Open game settings to download.'
     env = os.environ.copy()
     if sys.platform.startswith('linux'):
@@ -637,7 +637,7 @@ def self_test():
     monitor.thread.join(3)
     assert seen == ['9.0.0', '9.1.0'], 'New update notification missing'
     core.stop()
-    print('PASS: Sunset Riders (رعاة البقر) HD gameplay, cheats, save/restore, 4K scaling, keyboard/mouse/gamepad, notifications')
+    print('PASS: Sunset Riders HD gameplay, cheats, save/restore, 4K scaling, keyboard/mouse/gamepad, notifications')
     pygame.quit()
 
 

@@ -1,7 +1,6 @@
-# Android builds
+# Android Release — رعاة البقر (Sunset Riders v1.0)
 
-Releases are organized by game and version.
-
-The Mario + Duck Hunt + Track Meet web-core builds in `Mario-Duck-Hunt-Track-Meet/` are debug-signed by their CI workflow. They use the same application ID as NES Emulator but a different signer; they cannot update it in place or be installed alongside it. Debug signing may differ between CI runs, so versions may require uninstalling first, which can erase local saves. Back up saves before uninstalling.
-
-NES Mario + Duck Hunt 1.3 also has a different signing key from 1.2 and cannot update it in place.
+- **Download APK**: [Sunset-Riders-1.0.apk](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-v1.0/Sunset-Riders-1.0.apk)
+- **Release Tag**: [`sunset-riders-v1.0`](https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-v1.0)
+- **Size**: `20,099,635` bytes
+- **SHA-256**: `98ed96426e6eb2c80a24b0ee7d9bdb47cc6a736241699aa3346e236e44ecffe3`

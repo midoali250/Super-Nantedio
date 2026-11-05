@@ -23,7 +23,7 @@ android {
     buildToolsVersion = "35.0.0"
 
     defaultConfig {
-        applicationId = "com.midoali.genesis.sunsetriders"
+        applicationId = "com.midoali.snes.sunsetriders"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

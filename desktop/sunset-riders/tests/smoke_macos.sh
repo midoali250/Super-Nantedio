@@ -4,4 +4,4 @@ export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 "$1/Contents/MacOS/SunsetRiders" --self-test
 "$1/Contents/MacOS/SunsetRiders" --update-test
 "$1/Contents/MacOS/SunsetRiders" --ui-test
-echo 'PASS: macOS app launched and exercised Sunset Riders (رعاة البقر) Genesis core'
+echo 'PASS: macOS app launched and exercised Sunset Riders Genesis core'
