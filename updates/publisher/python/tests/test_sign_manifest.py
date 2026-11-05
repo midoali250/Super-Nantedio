@@ -2,7 +2,7 @@ import base64,json,sys,tempfile,unittest
 from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding,PrivateFormat,PublicFormat,NoEncryption
-sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'client'/'python'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[3]/'client'/'python'))
 from signed_updates import verify_manifest,UpdateError
 from sign_manifest import create_manifest
 class PublisherTests(unittest.TestCase):
