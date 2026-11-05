@@ -235,3 +235,16 @@ jobs:
               --title "رعاة البقر — Sunset Riders Desktop 1.0.0 (Windows / Linux / macOS)" \
               --notes "الإصدار 1.0.0 لسطح المكتب للعبة رعاة البقر (Sunset Riders): Windows Portable EXE و Linux AppImage و macOS arm64 App بجودة 2x HD Scale2x وأكواد الغش."
           fi
+
+          python3 tools/publish_sunset_riders.py
+          python3 tools/validate_updates.py
+
+          git config user.name "BitVaultEngine CI"
+          git config user.email "ci@users.noreply.github.com"
+          git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/
+          python3 tools/naming/audit.py
+          rm -f brand-audit.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Archive Sunset Riders (رعاة البقر) v1.0 binaries and update SHA-256 manifests"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
