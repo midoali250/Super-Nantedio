@@ -3,7 +3,7 @@ from pathlib import Path
 os.environ['SDL_VIDEODRIVER']='dummy';os.environ['SDL_AUDIODRIVER']='dummy'
 import pygame
 import launcher
-from game_session import fit_frame
+from game_session import fit_frame, menu_next
 class DesktopShellTests(unittest.TestCase):
  def setUp(self):pygame.init();self.screen=pygame.display.set_mode((1280,720))
  def tearDown(self):pygame.quit()
@@ -23,6 +23,10 @@ class DesktopShellTests(unittest.TestCase):
   self.assertEqual(launcher.scroll_selection(0,1,97),0)
   self.assertEqual(launcher.scroll_selection(96,-1,97),96)
   self.assertEqual(launcher.scroll_selection(0,-1,0),0)
+ def test_game_menu_wrap(self):
+  self.assertEqual(menu_next(0,-1,9),8)
+  self.assertEqual(menu_next(8,1,9),0)
+  self.assertEqual(menu_next(0,1,0),0)
  def test_uncropped_frame_fit(self):
   self.assertEqual(fit_frame((4,3),(1920,1080)).size,(1440,1080))
   self.assertEqual(fit_frame((4,3),(3840,2160)).size,(2880,2160))
