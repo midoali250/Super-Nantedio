@@ -244,18 +244,18 @@ static inline uint16_t rgb565_mix31(uint16_t a, uint16_t b)
    return rgb565_avg(a, m);
 }
 
-static inline int rgb565_close(uint16_t a, uint16_t b, int thresh)
+static inline int rgb565_diff(uint16_t a, uint16_t b)
 {
    int dr, dg, db;
    if (a == b)
-      return 1;
+      return 0;
    dr = (int)((a >> 11) & 0x1F) - (int)((b >> 11) & 0x1F);
    dg = (int)((a >> 6)  & 0x1F) - (int)((b >> 6)  & 0x1F);
    db = (int)(a & 0x1F)         - (int)(b & 0x1F);
    if (dr < 0) dr = -dr;
    if (dg < 0) dg = -dg;
    if (db < 0) db = -db;
-   return (dr + dg + db) < thresh;
+   return dr + dg + db;
 }
 
 static void video_cb(const void *data, unsigned width, unsigned height, size_t pitch)
@@ -288,8 +288,8 @@ static void video_cb(const void *data, unsigned width, unsigned height, size_t p
       return;
    }
 
-   /* Pass 1: Fast Genesis VDP horizontal dither blending + HD Color LUT.
-    * Short-circuits on (L == R && L != C), so >90% of pixels do 0 math. */
+   /* Pass 1: True 50/50 Genesis VDP horizontal dither blending + HD Color LUT.
+    * Converts A-B-A-B checkerboard gradients into smooth 16-bit gradients. */
    for (y = 0; y < h; y++)
    {
       const uint16_t *src_row = (const uint16_t *)((const uint8_t *)data + y * pitch);
@@ -300,8 +300,8 @@ static void video_cb(const void *data, unsigned width, unsigned height, size_t p
       for (x = 1; x < w - 1; x++)
       {
          uint16_t next = g_color_lut[src_row[x + 1]];
-         if (prev == next && prev != curr && rgb565_close(prev, curr, 20))
-            dst_row[x] = rgb565_mix31(curr, prev);
+         if (prev == next && prev != curr && rgb565_diff(prev, curr) < 36)
+            dst_row[x] = rgb565_avg(curr, prev);
          else
             dst_row[x] = curr;
          prev = curr;
@@ -344,8 +344,8 @@ static void video_cb(const void *data, unsigned width, unsigned height, size_t p
       return;
    }
 
-   /* Pass 2 (VIDEO_FILTER_HD_CRISP): Fast 2x HQ Scale2x (EPX) with subpixel
-    * diagonal anti-aliasing. Interior pixels take the 32-bit fast path. */
+   /* Pass 2 (VIDEO_FILTER_HD_CRISP): 9-tap HQ2x / xBR-style edge-directed 2x
+    * upscaler with 2:1 slope extension and symmetric anti-aliasing. */
    for (y = 0; y < h; y++)
    {
       int ym1 = (y > 0) ? (y - 1) : 0;
@@ -365,25 +365,64 @@ static void video_cb(const void *data, unsigned width, unsigned height, size_t p
          uint16_t B = rowP[xp1];
          uint16_t C = rowP[xm1];
          uint16_t D = rowD[x];
+         uint16_t UL, UR, DL, DR;
+         uint16_t e0, e1, e2, e3;
 
-         if (C != B && A != D)
-         {
-            uint16_t e0 = (C == A || rgb565_close(C, A, 7)) ? rgb565_mix31(A, P) : P;
-            uint16_t e1 = (A == B || rgb565_close(A, B, 7)) ? rgb565_mix31(B, P) : P;
-            uint16_t e2 = (D == C || rgb565_close(D, C, 7)) ? rgb565_mix31(C, P) : P;
-            uint16_t e3 = (B == D || rgb565_close(B, D, 7)) ? rgb565_mix31(D, P) : P;
-            out0[x * 2]     = e0;
-            out0[x * 2 + 1] = e1;
-            out1[x * 2]     = e2;
-            out1[x * 2 + 1] = e3;
-         }
-         else
+         if (P == A && P == B && P == C && P == D)
          {
             out0[x * 2]     = P;
             out0[x * 2 + 1] = P;
             out1[x * 2]     = P;
             out1[x * 2 + 1] = P;
+            continue;
          }
+
+         UL = rowA[xm1];
+         UR = rowA[xp1];
+         DL = rowD[xm1];
+         DR = rowD[xp1];
+         e0 = P; e1 = P; e2 = P; e3 = P;
+
+         if (C != B && A != D)
+         {
+            int ca = (C == A || rgb565_diff(C, A) < 8);
+            int ab = (A == B || rgb565_diff(A, B) < 8);
+            int dc = (D == C || rgb565_diff(D, C) < 8);
+            int bd = (B == D || rgb565_diff(B, D) < 8);
+
+            if (ca && !ab && !dc)
+            {
+               uint16_t m = rgb565_avg(C, A);
+               e0 = (P == B || P == D) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
+               if (A == UR && P != UR) e1 = rgb565_mix31(P, m);
+               if (C == DL && P != DL) e2 = rgb565_mix31(P, m);
+            }
+            if (ab && !ca && !bd)
+            {
+               uint16_t m = rgb565_avg(A, B);
+               e1 = (P == C || P == D) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
+               if (A == UL && P != UL) e0 = rgb565_mix31(P, m);
+               if (B == DR && P != DR) e3 = rgb565_mix31(P, m);
+            }
+            if (dc && !ca && !bd)
+            {
+               uint16_t m = rgb565_avg(D, C);
+               e2 = (P == B || P == A) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
+               if (C == UL && P != UL) e0 = rgb565_mix31(P, m);
+               if (D == DR && P != DR) e3 = rgb565_mix31(P, m);
+            }
+            if (bd && !ab && !dc)
+            {
+               uint16_t m = rgb565_avg(B, D);
+               e3 = (P == C || P == A) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
+               if (B == UR && P != UR) e1 = rgb565_mix31(P, m);
+               if (D == DL && P != DL) e2 = rgb565_mix31(P, m);
+            }
+         }
+         out0[x * 2]     = e0;
+         out0[x * 2 + 1] = e1;
+         out1[x * 2]     = e2;
+         out1[x * 2 + 1] = e3;
       }
    }
    g_have_frame = 1;

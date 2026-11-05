@@ -247,5 +247,6 @@ jobs:
           rm -f brand-audit.json
           if ! git diff --cached --quiet; then
             git commit -m "Archive The Mask (SNES) v1.0 binaries and update SHA-256 manifests"
+            git pull --rebase origin main || true
             git push origin HEAD:main
           fi

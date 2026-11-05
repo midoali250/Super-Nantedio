@@ -21,8 +21,10 @@
 
 #include "libretro.h"
 
-#define FB_MAX_W 512
-#define FB_MAX_H 512
+#define SRC_MAX_W 512
+#define SRC_MAX_H 256
+#define FB_MAX_W  1024
+#define FB_MAX_H  512
 #define AUDIO_RING_FRAMES 16384
 
 /* Built-in cheat bitmask for The Mask (USA) [SNES] */
@@ -35,7 +37,10 @@
 
 static uint8_t  *g_rom;
 static size_t    g_rom_len;
+static uint16_t  g_dedith[SRC_MAX_W * SRC_MAX_H];
 static uint16_t  g_fb[FB_MAX_W * FB_MAX_H];
+static uint16_t  g_color_lut[65536];
+static int       g_lut_ready;
 static int       g_fb_w, g_fb_h, g_fb_pitch_px;
 static int       g_have_frame;
 
@@ -165,21 +170,160 @@ static bool env_cb(unsigned cmd, void *data)
    }
 }
 
+static inline uint16_t rgb565_avg(uint16_t a, uint16_t b)
+{
+   return (uint16_t)((a & b) + (((a ^ b) & 0xF7DEu) >> 1));
+}
+
+static inline uint16_t rgb565_mix31(uint16_t a, uint16_t b)
+{
+   return rgb565_avg(a, rgb565_avg(a, b));
+}
+
+static inline int rgb565_diff(uint16_t a, uint16_t b)
+{
+   int dr, dg, db;
+   if (a == b)
+      return 0;
+   dr = (int)((a >> 11) & 0x1F) - (int)((b >> 11) & 0x1F);
+   dg = (int)((a >> 6)  & 0x1F) - (int)((b >> 6)  & 0x1F);
+   db = (int)(a & 0x1F)         - (int)(b & 0x1F);
+   if (dr < 0) dr = -dr;
+   if (dg < 0) dg = -dg;
+   if (db < 0) db = -db;
+   return dr + dg + db;
+}
+
+static void init_hd_color_lut(void)
+{
+   int v;
+   if (g_lut_ready)
+      return;
+   for (v = 0; v < 65536; v++)
+   {
+      int r5 = (v >> 11) & 0x1F;
+      int g6 = (v >> 5)  & 0x3F;
+      int b5 = v & 0x1F;
+      int r = (r5 << 3) | (r5 >> 2);
+      int g = (g6 << 2) | (g6 >> 4);
+      int b = (b5 << 3) | (b5 >> 2);
+      int luma = (r * 77 + g * 150 + b * 29) >> 8;
+      r = luma + (((r - luma) * 276) >> 8);
+      g = luma + (((g - luma) * 276) >> 8);
+      b = luma + (((b - luma) * 276) >> 8);
+      if (r < 0) r = 0; else if (r > 255) r = 255;
+      if (g < 0) g = 0; else if (g > 255) g = 255;
+      if (b < 0) b = 0; else if (b > 255) b = 255;
+      g_color_lut[v] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+   }
+   g_lut_ready = 1;
+}
+
 static void video_cb(const void *data, unsigned width, unsigned height, size_t pitch)
 {
-   int y;
+   int w = (int)width;
+   int h = (int)height;
+   int x, y;
    if (!data)
    {
       g_have_frame = 1;
       return;
    }
-   if ((int)width > FB_MAX_W || (int)height > FB_MAX_H)
+   if (w <= 0 || h <= 0 || w > SRC_MAX_W || h > SRC_MAX_H)
       return;
-   g_fb_w = (int)width;
-   g_fb_h = (int)height;
-   g_fb_pitch_px = (int)(pitch / 2);
-   for (y = 0; y < (int)height; y++)
-      memcpy(g_fb + y * width, (const uint8_t *)data + y * pitch, width * 2);
+   init_hd_color_lut();
+
+   for (y = 0; y < h; y++)
+   {
+      const uint16_t *src_row = (const uint16_t *)((const uint8_t *)data + y * pitch);
+      uint16_t *dst_row = g_dedith + y * w;
+      for (x = 0; x < w; x++)
+         dst_row[x] = g_color_lut[src_row[x]];
+   }
+
+   g_fb_w = w * 2;
+   g_fb_h = h * 2;
+   g_fb_pitch_px = g_fb_w;
+
+   for (y = 0; y < h; y++)
+   {
+      int ym1 = (y > 0) ? (y - 1) : 0;
+      int yp1 = (y + 1 < h) ? (y + 1) : (h - 1);
+      const uint16_t *rowA = g_dedith + ym1 * w;
+      const uint16_t *rowP = g_dedith + y * w;
+      const uint16_t *rowD = g_dedith + yp1 * w;
+      uint16_t *out0 = g_fb + (y * 2) * g_fb_w;
+      uint16_t *out1 = g_fb + (y * 2 + 1) * g_fb_w;
+
+      for (x = 0; x < w; x++)
+      {
+         int xm1 = (x > 0) ? (x - 1) : 0;
+         int xp1 = (x + 1 < w) ? (x + 1) : (w - 1);
+         uint16_t P = rowP[x];
+         uint16_t A = rowA[x];
+         uint16_t B = rowP[xp1];
+         uint16_t C = rowP[xm1];
+         uint16_t D = rowD[x];
+         uint16_t UL, UR, DL, DR;
+         uint16_t e0, e1, e2, e3;
+
+         if (P == A && P == B && P == C && P == D)
+         {
+            out0[x * 2]     = P;
+            out0[x * 2 + 1] = P;
+            out1[x * 2]     = P;
+            out1[x * 2 + 1] = P;
+            continue;
+         }
+
+         UL = rowA[xm1];
+         UR = rowA[xp1];
+         DL = rowD[xm1];
+         DR = rowD[xp1];
+         e0 = P; e1 = P; e2 = P; e3 = P;
+
+         if (C != B && A != D)
+         {
+            int ca = (C == A || rgb565_diff(C, A) < 8);
+            int ab = (A == B || rgb565_diff(A, B) < 8);
+            int dc = (D == C || rgb565_diff(D, C) < 8);
+            int bd = (B == D || rgb565_diff(B, D) < 8);
+
+            if (ca && !ab && !dc)
+            {
+               uint16_t m = rgb565_avg(C, A);
+               e0 = (P == B || P == D) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
+               if (A == UR && P != UR) e1 = rgb565_mix31(P, m);
+               if (C == DL && P != DL) e2 = rgb565_mix31(P, m);
+            }
+            if (ab && !ca && !bd)
+            {
+               uint16_t m = rgb565_avg(A, B);
+               e1 = (P == C || P == D) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
+               if (A == UL && P != UL) e0 = rgb565_mix31(P, m);
+               if (B == DR && P != DR) e3 = rgb565_mix31(P, m);
+            }
+            if (dc && !ca && !bd)
+            {
+               uint16_t m = rgb565_avg(D, C);
+               e2 = (P == B || P == A) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
+               if (C == UL && P != UL) e0 = rgb565_mix31(P, m);
+               if (D == DR && P != DR) e3 = rgb565_mix31(P, m);
+            }
+            if (bd && !ab && !dc)
+            {
+               uint16_t m = rgb565_avg(B, D);
+               e3 = (P == C || P == A) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
+               if (B == UR && P != UR) e1 = rgb565_mix31(P, m);
+               if (D == DL && P != DL) e2 = rgb565_mix31(P, m);
+            }
+         }
+         out0[x * 2]     = e0;
+         out0[x * 2 + 1] = e1;
+         out1[x * 2]     = e2;
+         out1[x * 2 + 1] = e3;
+      }
+   }
    g_have_frame = 1;
 }
 

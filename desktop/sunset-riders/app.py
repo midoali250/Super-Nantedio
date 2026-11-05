@@ -3,6 +3,17 @@
 import ctypes as C
 import hashlib, json, math, os, re, subprocess, sys, tempfile, textwrap, threading, time, urllib.request
 from pathlib import Path
+
+if sys.platform == 'win32':
+    os.environ.setdefault('SDL_WINDOWS_DPI_AWARENESS', 'permonitorv2')
+    try:
+        C.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            C.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 import pygame
 
 VERSION = '1.0.0'
@@ -559,17 +570,24 @@ def self_test():
         restore(core, path.read_bytes())
     assert bytes(wram[:0x10000]) == snap2, 'Saved file restore failed'
 
+    frame = pygame.Surface((core.w, core.h), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
+    frame.get_buffer().write(core.framebuffer())
+    assert pygame.transform.scale(frame, (2880, 2160)).get_size() == (2880, 2160)
+    smooth = pygame.Surface((1280, 720), 0, 32, (0x00ff0000, 0x0000ff00, 0x000000ff, 0))
+    frame32 = frame.convert(smooth)
+    assert frame32.get_bitsize() == 32 and smooth.get_bitsize() == 32, '32-bit surface depth mismatch'
+    assert frame32.get_masks() == smooth.get_masks(), '32-bit surface mask mismatch'
+    pygame.transform.smoothscale(frame32, (1280, 720), smooth)
+    # Verify final scaled image fills full width (right quarter not black) and has true RGB color (not greyscale TV static)
+    right_colors = [smooth.get_at((x, y)) for x in range(980, 1260, 10) for y in range(100, 620, 20)]
+    assert any((c.r + c.g + c.b) > 60 for c in right_colors), 'Right side of scaled screen is blank/cut off'
+    assert any(max(c.r, c.g, c.b) - min(c.r, c.g, c.b) > 80 for c in right_colors), 'Scaled screen lacks RGB color (greyscale static)'
+
     # Verify Reset Game functionality
     core.reset()
     raw_reset = core.framebuffer()
     assert any(b != 0 for b in raw_reset), 'Reset game produced blank frame'
     assert bytes(wram[:0x10000]) != snap2, 'Reset game did not reset WRAM state'
-
-    frame = pygame.Surface((core.w, core.h), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
-    frame.get_buffer().write(core.framebuffer())
-    assert pygame.transform.scale(frame, (2880, 2160)).get_size() == (2880, 2160)
-    smooth = pygame.Surface((1280, 720), 0, 32, (0x00ff0000, 0x0000ff00, 0x000000ff, 0))
-    pygame.transform.smoothscale(frame.convert((0x00ff0000, 0x0000ff00, 0x000000ff, 0)), (1280, 720), smooth)
 
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / 'thread-save.state'
@@ -809,6 +827,11 @@ def main():
                 idx = FILTER_MODES.index(cfg.get('filter', 'hd_crisp'))
                 cfg['filter'] = FILTER_MODES[(idx + 1) % len(FILTER_MODES)]
                 core.set_video_filter(cfg['filter'])
+                core.frame(0)
+                raw_now = core.framebuffer()
+                if frame.get_size() != (core.w, core.h):
+                    frame = pygame.Surface((core.w, core.h), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
+                frame.get_buffer().write(raw_now)
                 persist()
             elif selected == 2:
                 fullscreen = not fullscreen
@@ -1033,7 +1056,8 @@ def main():
             scaled_key = key
         if use_smooth:
             try:
-                pygame.transform.smoothscale(frame.convert((0x00ff0000, 0x0000ff00, 0x000000ff, 0)), (dw, dh), scaled)
+                frame32 = frame.convert(scaled)
+                pygame.transform.smoothscale(frame32, (dw, dh), scaled)
             except pygame.error:
                 pygame.transform.scale(frame, (dw, dh), scaled)
         else:

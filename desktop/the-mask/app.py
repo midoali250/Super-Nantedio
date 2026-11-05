@@ -3,6 +3,17 @@
 import ctypes as C
 import hashlib, json, math, os, re, subprocess, sys, tempfile, textwrap, threading, time, urllib.request
 from pathlib import Path
+
+if sys.platform == 'win32':
+    os.environ.setdefault('SDL_WINDOWS_DPI_AWARENESS', 'permonitorv2')
+    try:
+        C.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            C.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 import pygame
 
 VERSION = '1.0.0'
@@ -370,7 +381,7 @@ def load_config():
     if cfg.get('display') not in ('fit', 'fill'):
         cfg['display'] = 'fill'
     if cfg.get('filter') not in ('sharp', 'smooth'):
-        cfg['filter'] = 'sharp'
+        cfg['filter'] = 'smooth'
     cfg['cheats'] = int(cfg.get('cheats', 0)) & CHEAT_ALL if isinstance(cfg.get('cheats', 0), int) else 0
     return cfg
 
@@ -494,7 +505,7 @@ def self_test():
     apply_window_icon()
     assert 'Ahmed Kamal Elgandy' in ABOUT_RAW_MARKDOWN and 'intellectual property rights' in ABOUT_PLAIN_TEXT
     core = Core()
-    assert (core.w, core.h) == (256, 224), f'Unexpected geometry: {core.w}x{core.h}'
+    assert (core.w, core.h) == (512, 448), f'Unexpected geometry: {core.w}x{core.h}'
 
     def run(n, mask=0):
         for _ in range(n):
@@ -541,10 +552,12 @@ def self_test():
     frame = pygame.Surface((core.w, core.h), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
     frame.get_buffer().write(core.framebuffer())
     assert pygame.transform.scale(frame, (2880, 2160)).get_size() == (2880, 2160)
-    scaled = pygame.Surface((320, 224), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
-    pygame.transform.scale(frame, (320, 224), scaled)
-    smooth = pygame.Surface((320, 224)).convert()
-    pygame.transform.smoothscale(frame.convert(), (320, 224), smooth)
+    scaled = pygame.Surface((1280, 720), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
+    pygame.transform.scale(frame, (1280, 720), scaled)
+    smooth = pygame.Surface((1280, 720), 0, 32, (0x00ff0000, 0x0000ff00, 0x000000ff, 0))
+    frame32 = frame.convert(smooth)
+    assert frame32.get_bitsize() == 32 and smooth.get_bitsize() == 32, '32-bit surface depth mismatch'
+    pygame.transform.smoothscale(frame32, (1280, 720), smooth)
 
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / 'thread-save.state'
@@ -999,10 +1012,13 @@ def main():
         dh = max(1, dh)
         key = (dw, dh, cfg['filter'])
         if key != scaled_key:
-            scaled = pygame.Surface((dw, dh), 0, 16, (0xf800, 0x07e0, 0x001f, 0)) if cfg['filter'] == 'sharp' else pygame.Surface((dw, dh)).convert()
+            scaled = pygame.Surface((dw, dh), 0, 16, (0xf800, 0x07e0, 0x001f, 0)) if cfg['filter'] == 'sharp' else pygame.Surface((dw, dh), 0, 32, (0x00ff0000, 0x0000ff00, 0x000000ff, 0))
             scaled_key = key
         if cfg['filter'] == 'smooth':
-            pygame.transform.smoothscale(frame.convert(), (dw, dh), scaled)
+            try:
+                pygame.transform.smoothscale(frame.convert(scaled), (dw, dh), scaled)
+            except pygame.error:
+                pygame.transform.scale(frame, (dw, dh), scaled)
         else:
             pygame.transform.scale(frame, (dw, dh), scaled)
         screen.blit(scaled, ((w - dw) // 2, (h - dh) // 2))

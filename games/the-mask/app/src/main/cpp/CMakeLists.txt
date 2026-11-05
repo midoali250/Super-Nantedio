@@ -83,5 +83,5 @@ target_include_directories(snescore PRIVATE
   ${CORE} ${CORE}/src ${CORE}/libretro ${COMM}/include)
 
 target_compile_definitions(snescore PRIVATE __LIBRETRO__ DINLINE=inline)
-target_compile_options(snescore PRIVATE -O2 -DPATH_MAX=1024 -Wall -Wno-unused)
+target_compile_options(snescore PRIVATE -O3 -funroll-loops -DPATH_MAX=1024 -Wall -Wno-unused)
 target_link_libraries(snescore m log)

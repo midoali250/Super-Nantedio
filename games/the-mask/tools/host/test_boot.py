@@ -51,7 +51,7 @@ def main():
     app.lib.host_get_cheats.restype = C.c_int
 
     print("geometry")
-    check("frame is 256x224 (SNES NTSC)", (app.w, app.h) == (256, 224), f"{app.w}x{app.h}")
+    check("frame is 512x448 (2x True HD SNES NTSC)", (app.w, app.h) == (512, 448), f"{app.w}x{app.h}")
 
     print("video & boot")
     signatures = []

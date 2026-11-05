@@ -252,5 +252,6 @@ jobs:
           rm -f brand-audit.json
           if ! git diff --cached --quiet; then
             git commit -m "Archive Sunset Riders (رعاة البقر) v1.0 binaries and update SHA-256 manifests"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
