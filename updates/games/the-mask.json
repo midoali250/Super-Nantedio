@@ -7,10 +7,10 @@
   "version_name": "1.0",
   "min_android_sdk": 26,
   "apk_url": "https://github.com/midoali250/bitvault-engine/releases/download/the-mask-v1.0/The-Mask-SNES-1.0.apk",
-  "apk_sha256": "a5985fa0410165269d3d263b1499731cd357beb6200979ce3e7fba2d9a368351",
+  "apk_sha256": "e5de9611d9075a64f976ecd2a24475c2429409969beb0069bd6f5dc6d8e33aa0",
   "apk_size_bytes": 7606150,
   "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/the-mask-v1.0",
-  "published_at": "2026-11-05T10:10:57Z",
+  "published_at": "2026-11-05T21:57:51Z",
   "release_notes_ar": "إصدار The Mask (SNES) مع شاشة عريضة بعرض شاشة الموبايل، وعصاية تحكم حرة 360°، وقائمة أكواد الغش (Cheats)، وزر About.",
   "required": false
 }
