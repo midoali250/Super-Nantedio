@@ -1,0 +1,37 @@
+name: Inspect PixelFlux multicart on shared engine
+on:
+  push:
+    branches: [experiment/pixelflux-rom-audit]
+    paths: ['experiments/pixelflux/**', '.github/workflows/pixelflux-rom-audit.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build pinned NES core
+        run: |
+          git init -q core
+          git -C core remote add origin https://github.com/libretro/libretro-fceumm.git
+          git -C core fetch --depth=1 origin e0f3086a8104f8fbbe49a2615b10401504a9533f
+          git -C core checkout --detach FETCH_HEAD
+          make -C core -j2 platform=unix
+      - name: Launch the exact Drive ROM and capture its menu and startup
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          python -m pip install pygame==2.6.1
+          python experiments/pixelflux/audit_rom.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixelflux-rom-audit
+          path: pixelflux-audit-output/*
+          if-no-files-found: error
+          retention-days: 7
