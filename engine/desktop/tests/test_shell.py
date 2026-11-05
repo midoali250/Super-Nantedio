@@ -1,0 +1,24 @@
+import os,tempfile,unittest
+from pathlib import Path
+os.environ['SDL_VIDEODRIVER']='dummy';os.environ['SDL_AUDIODRIVER']='dummy'
+import pygame
+import launcher
+from game_session import fit_frame
+class DesktopShellTests(unittest.TestCase):
+ def setUp(self):pygame.init();self.screen=pygame.display.set_mode((1280,720))
+ def tearDown(self):pygame.quit()
+ def test_single_list_and_settings_render(self):
+  self.assertEqual(launcher.CATEGORIES,['ALL','FAVORITES'])
+  with tempfile.TemporaryDirectory() as temp:
+   root=Path(temp);(root/'assets').mkdir();(root/'thumbnails').mkdir();(root/'NOTICE.md').write_text('Attribution')
+   icon=pygame.Surface((30,30));icon.fill('blue');pygame.image.save(icon,root/'assets/app-icon.png')
+   thumb=pygame.Surface((20,20));thumb.fill('red');pygame.image.save(thumb,root/'thumbnails/test.png')
+   old=launcher.ROOT;launcher.ROOT=root;launcher.THUMB_CACHE.clear()
+   try:
+    launcher.render(self.screen,[{'id':'test','title':'Test Title','system':'NES'}],'ALL','',0,set(),'',False,True,'FIT')
+    self.assertIsNotNone(launcher.thumbnail('test'))
+   finally:launcher.ROOT=old;launcher.THUMB_CACHE.clear()
+ def test_uncropped_frame_fit(self):
+  self.assertEqual(fit_frame((4,3),(1920,1080)).size,(1440,1080))
+  self.assertEqual(fit_frame((4,3),(3840,2160)).size,(2880,2160))
+if __name__=='__main__':unittest.main()
