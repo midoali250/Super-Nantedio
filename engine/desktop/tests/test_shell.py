@@ -23,6 +23,15 @@ class DesktopShellTests(unittest.TestCase):
   self.assertFalse(launcher.about_button_hit(990,415))
   self.assertIn('Ahmed Kamal Elgandy',launcher.ABOUT_TEXT)
   self.assertIn('original production companies.',launcher.ABOUT_TEXT)
+ def test_update_key_validation(self):
+  import base64,json
+  with tempfile.TemporaryDirectory() as temp:
+   root=Path(temp);(root/'updates').mkdir();file=root/'updates/public-key.json'
+   file.write_text(json.dumps({'platform':'linux','algorithm':'Ed25519','public_key_base64':base64.b64encode(bytes(32)).decode()}))
+   self.assertEqual(len(launcher.verify_packaged_update_key(root,'linux')),32)
+   with self.assertRaises(ValueError):launcher.verify_packaged_update_key(root,'windows')
+   file.write_text(json.dumps({'platform':'linux','algorithm':'Ed25519','public_key_base64':'bad'}))
+   with self.assertRaises(ValueError):launcher.verify_packaged_update_key(root,'linux')
  def test_scroll_boundaries(self):
   self.assertEqual(launcher.scroll_selection(0,-1,97),3)
   self.assertEqual(launcher.scroll_selection(0,1,97),0)
