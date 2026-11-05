@@ -143,7 +143,7 @@ def render(screen, games, category, query, chosen, favorites, status, about=Fals
         label('Click anywhere, or press I or ESC to return',205,575,(113,206,224),small)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--smoke',action='store_true');p.add_argument('--verify-update-key',action='store_true',help=argparse.SUPPRESS);p.add_argument('--screenshot');p.add_argument('--rom-dir',default=str(ROOT/'roms'));p.add_argument('--cores-dir',default=str(ROOT/'cores'));p.add_argument('--ci-game-id',help=argparse.SUPPRESS);args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--smoke',action='store_true');p.add_argument('--ci-controls-test',action='store_true',help=argparse.SUPPRESS);p.add_argument('--verify-update-key',action='store_true',help=argparse.SUPPRESS);p.add_argument('--screenshot');p.add_argument('--rom-dir',default=str(ROOT/'roms'));p.add_argument('--cores-dir',default=str(ROOT/'cores'));p.add_argument('--ci-game-id',help=argparse.SUPPRESS);args=p.parse_args()
     if args.verify_update_key:
         if not args.smoke:raise ValueError('Key verification test requires smoke mode')
         platform={'win32':'windows','darwin':'macos','linux':'linux'}.get(sys.platform)
@@ -152,6 +152,23 @@ def main():
         load_version(ROOT)
     pygame.init();pygame.joystick.init();screen=pygame.display.set_mode((1280,720),0 if args.smoke else pygame.FULLSCREEN);pygame.display.set_caption('AKG Retro Games — preview')
     pygame.display.set_icon(pygame.image.load(str(ROOT/'assets/app-icon.png')))
+    if args.ci_controls_test:
+        if not args.smoke:raise ValueError('Control test requires smoke mode')
+        import tempfile,controls
+        with tempfile.TemporaryDirectory(prefix='akg-controls-ci-') as tmp:
+            original=controls.data_dir;controls.data_dir=lambda:Path(tmp)/'private-data'
+            try:
+                pygame.event.clear()
+                pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN,button=1,pos=(500,200)))
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_t))
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN,key=pygame.K_ESCAPE))
+                controls.control_screen(screen)
+                if controls.read_controls()['keyboard'].get('4')!=pygame.K_t:raise AssertionError('Packaged keyboard assignment failed')
+                saves=controls.data_dir()/'manual-saves';saves.mkdir();(saves/'test.state').write_text('test')
+                controls.reset_application()
+                if controls.data_dir().exists():raise AssertionError('Packaged application data reset failed')
+            finally:controls.data_dir=original
+        pygame.quit();return
     preferences=read_preferences();saved_preferences=preferences.copy()
     all_games=load_catalog(ROOT/'drive-index.json');favorites=set(preferences['favorites']);cat=0;query='';chosen=0;search=False;about=False;settings=False;reset_confirm=False;display_mode=preferences['display_mode']; joysticks=[]; status='Experimental build — game support is being tested';running=True;clock=pygame.time.Clock()
     if args.ci_game_id:
