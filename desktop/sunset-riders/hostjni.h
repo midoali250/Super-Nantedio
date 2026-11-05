@@ -2,11 +2,10 @@
 #define HOSTJNI_H
 #include <stdint.h>
 int  host_start(const unsigned char *rom, int len);
+void host_reset(void);
 void host_stop(void);
 void host_frame(void);
 void host_input(int mask);
-void host_set_cheats(int mask);
-int  host_get_cheats(void);
 void host_set_video_filter(int mode);
 int  host_get_video_filter(void);
 int  host_width(void);

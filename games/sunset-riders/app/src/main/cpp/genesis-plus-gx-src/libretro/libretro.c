@@ -980,16 +980,16 @@ static void config_default(void)
    config.fm_preamp      = 100;
    config.cdda_volume    = 100;
    config.pcm_volume     = 100;
-   config.hq_fm          = 1; /* high-quality FM resampling (slower) */
-   config.hq_psg         = 1; /* high-quality PSG resampling (slower) */
-   config.filter         = 1; /* no filter */
+   config.hq_fm          = 0; /* fast linear FM resampling for zero mobile lag */
+   config.hq_psg         = 0; /* fast PSG resampling for zero mobile lag */
+   config.filter         = 0; /* no low-pass muffling - crystal clear audio */
    config.lp_range       = 0x9999; /* 0.6 in 0.16 fixed point */
    config.low_freq       = 880;
    config.high_freq      = 5000;
    config.lg             = 100;
    config.mg             = 100;
    config.hg             = 100;
-   config.ym2612         = YM2612_DISCRETE; 
+   config.ym2612         = YM2612_ENHANCED;
    config.ym2413         = 2; /* AUTO */
    config.mono           = 0; /* STEREO output */
 #ifdef USE_PER_SOUND_CHANNELS_CONFIG

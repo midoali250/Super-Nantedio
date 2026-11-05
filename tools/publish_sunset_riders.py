@@ -43,7 +43,7 @@ def main():
         "apk_size_bytes": apk_size,
         "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-v1.0",
         "published_at": now_utc,
-        "release_notes_ar": "إصدار لعبة رعاة البقر (Sunset Riders) بجودة صورة فائقة 2x HD Scale2x، وشاشة عريضة بعرض شاشة الموبايل، وعصاية تحكم حرة 360°، وقائمة أكواد الغش (Cheats)، وزر About داخل الضبط.",
+        "release_notes_ar": "إصدار لعبة رعاة البقر (Sunset Riders) بجودة صورة فائقة True HD 2x Scale2x + GPU Filter، وصوت ستيريو نقي 60 إطار/ثانية، وشاشة عريضة بعرض الموبايل، وعصاية تحكم حرة 360°، وزر إعادة تشغيل اللعبة (Reset Game)، وزر About داخل الضبط.",
         "required": False,
     }
     (ROOT / "updates/games/sunset-riders.json").write_text(

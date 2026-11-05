@@ -5,35 +5,23 @@ import android.graphics.Bitmap;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
+import android.os.Build;
 import android.util.Log;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.ShortBuffer;
 
 /**
- * Owns the emulation thread. Converts the native 2x HQ Scale2x RGB565 frame
- * buffer into 32-bit ARGB_8888 using a full 8-bit bit-replication LUT for
- * zero color banding and maximum visual clarity.
+ * Owns the emulation thread. Copies the native 2x HQ Scale2x RGB565 frame
+ * buffer directly into a hardware-uploaded RGB_565 Bitmap via zero-loop
+ * copyPixelsFromBuffer and synchronizes 44.1 kHz stereo audio with pre-roll
+ * cushioning for 60 FPS lag-free gameplay and crystal-clear sound.
  */
 final class Emulator implements Runnable {
     private static final String TAG = "SnesEmu";
-    private static final int AUDIO_FRAMES_PER_READ = 1024;
+    private static final int AUDIO_FRAMES_PER_READ = 2048;
     private static final int MAX_FB_W = 800;
     private static final int MAX_FB_H = 600;
-    private static final int[] RGB565_TO_ARGB = new int[65536];
-
-    static {
-        for (int v = 0; v < 65536; v++) {
-            int r5 = (v >>> 11) & 0x1F;
-            int g6 = (v >>> 5) & 0x3F;
-            int b5 = v & 0x1F;
-            int r = (r5 << 3) | (r5 >>> 2);
-            int g = (g6 << 2) | (g6 >>> 4);
-            int b = (b5 << 3) | (b5 >>> 2);
-            RGB565_TO_ARGB[v] = 0xFF000000 | (r << 16) | (g << 8) | b;
-        }
-    }
 
     private final Context context;
     private final byte[] rom;
@@ -42,19 +30,19 @@ final class Emulator implements Runnable {
 
     private volatile boolean running;
     private volatile boolean paused;
-    private volatile int cheatMask;
+    private volatile boolean resetRequested;
     private volatile int videoFilter = SnesCore.VIDEO_FILTER_HD_CRISP;
     private final Object pauseLock = new Object();
     private Thread thread;
     private AudioTrack track;
+    private boolean audioPlaying;
+    private int prerollFrames;
 
     private Bitmap bitmap;
-    private int[] argbPixels;
     private ByteBuffer frameBuffer;
-    private ShortBuffer shortFrameBuffer;
     private final short[] audioBuffer = new short[AUDIO_FRAMES_PER_READ * 2];
 
-    private int frameWidth = 512, frameHeight = 448;
+    private int frameWidth = 640, frameHeight = 448;
 
     Emulator(Context context, byte[] rom, GameView view, VirtualPad pad) {
         this.context = context.getApplicationContext();
@@ -67,15 +55,11 @@ final class Emulator implements Runnable {
 
     int frameHeight() { return frameHeight; }
 
-    void setCheats(int mask) {
-        cheatMask = mask;
-        try {
-            SnesCore.nativeSetCheats(mask);
-        } catch (Throwable ignored) { }
-    }
-
-    int getCheats() {
-        return cheatMask;
+    void resetGame() {
+        resetRequested = true;
+        synchronized (pauseLock) {
+            pauseLock.notifyAll();
+        }
     }
 
     void setVideoFilter(int mode) {
@@ -90,12 +74,6 @@ final class Emulator implements Runnable {
         return videoFilter;
     }
 
-    void applyCheatCode(int index, boolean enabled, String code) {
-        try {
-            SnesCore.nativeApplyCheatCode(index, enabled, code);
-        } catch (Throwable ignored) { }
-    }
-
     void start() {
         if (running) return;
         running = true;
@@ -106,6 +84,9 @@ final class Emulator implements Runnable {
 
     void stop() {
         running = false;
+        synchronized (pauseLock) {
+            pauseLock.notifyAll();
+        }
         Thread t = thread;
         if (t != null) {
             try {
@@ -125,8 +106,12 @@ final class Emulator implements Runnable {
         AudioTrack t = track;
         if (t != null) {
             try {
-                if (value) t.pause();
-                else t.play();
+                if (value) {
+                    t.pause();
+                    audioPlaying = false;
+                } else {
+                    prerollFrames = 0;
+                }
             } catch (IllegalStateException ignored) { }
         }
     }
@@ -139,13 +124,24 @@ final class Emulator implements Runnable {
                 Log.e(TAG, "core rejected the ROM");
                 return;
             }
-            SnesCore.nativeSetCheats(cheatMask);
-            frameBuffer = ByteBuffer.allocateDirect(MAX_FB_W * MAX_FB_H * 2).order(ByteOrder.nativeOrder());
-            shortFrameBuffer = frameBuffer.asShortBuffer();
             ensureBitmap(SnesCore.nativeFrameWidth(), SnesCore.nativeFrameHeight());
             createAudio();
 
             while (running) {
+                if (resetRequested) {
+                    resetRequested = false;
+                    SnesCore.nativeReset();
+                    AudioTrack t = track;
+                    if (t != null) {
+                        try {
+                            t.pause();
+                            t.flush();
+                            audioPlaying = false;
+                            prerollFrames = 0;
+                        } catch (IllegalStateException ignored) { }
+                    }
+                }
+
                 if (paused) {
                     synchronized (pauseLock) {
                         try {
@@ -159,27 +155,35 @@ final class Emulator implements Runnable {
                 }
 
                 SnesCore.nativeSetInput(pad.mask());
-                SnesCore.nativeSetCheats(cheatMask);
-                SnesCore.nativeSetVideoFilter(videoFilter);
                 SnesCore.nativeRunFrame();
 
                 int frames = SnesCore.nativeReadAudio(audioBuffer, AUDIO_FRAMES_PER_READ);
-                if (frames > 0 && track != null) {
+                AudioTrack t = track;
+                if (frames > 0 && t != null) {
                     try {
-                        track.write(audioBuffer, 0, frames * 2);
+                        if (Build.VERSION.SDK_INT >= 23) {
+                            t.write(audioBuffer, 0, frames * 2, AudioTrack.WRITE_BLOCKING);
+                        } else {
+                            t.write(audioBuffer, 0, frames * 2);
+                        }
+                        if (!audioPlaying) {
+                            prerollFrames += frames;
+                            if (prerollFrames >= 1472) {
+                                t.play();
+                                audioPlaying = true;
+                            }
+                        }
                     } catch (IllegalStateException ignored) { }
                 }
 
                 int w = SnesCore.nativeFrameWidth();
                 int h = SnesCore.nativeFrameHeight();
                 ensureBitmap(w, h);
-                if (SnesCore.nativeCopyVideo(frameBuffer) == 1 && bitmap != null) {
-                    int total = frameWidth * frameHeight;
-                    shortFrameBuffer.position(0);
-                    for (int i = 0; i < total; i++) {
-                        argbPixels[i] = RGB565_TO_ARGB[shortFrameBuffer.get(i) & 0xFFFF];
-                    }
-                    bitmap.setPixels(argbPixels, 0, frameWidth, 0, 0, frameWidth, frameHeight);
+                if (frameBuffer != null && SnesCore.nativeCopyVideo(frameBuffer) == 1 && bitmap != null) {
+                    frameBuffer.position(0);
+                    try {
+                        bitmap.copyPixelsFromBuffer(frameBuffer);
+                    } catch (RuntimeException ignored) { }
                     view.present(bitmap);
                 }
             }
@@ -195,14 +199,14 @@ final class Emulator implements Runnable {
 
     private void ensureBitmap(int w, int h) {
         if (w <= 0 || h <= 0 || w > MAX_FB_W || h > MAX_FB_H) {
-            w = 512;
+            w = 640;
             h = 448;
         }
         if (bitmap == null || w != frameWidth || h != frameHeight) {
             frameWidth = w;
             frameHeight = h;
-            bitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888);
-            argbPixels = new int[frameWidth * frameHeight];
+            bitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.RGB_565);
+            frameBuffer = ByteBuffer.allocateDirect(frameWidth * frameHeight * 2).order(ByteOrder.nativeOrder());
         }
     }
 
@@ -226,7 +230,8 @@ final class Emulator implements Runnable {
                     .setBufferSizeInBytes(Math.max(minBuffer * 2, 16384))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build();
-            track.play();
+            audioPlaying = false;
+            prerollFrames = 0;
         } catch (Throwable t) {
             Log.e(TAG, "audio track unavailable", t);
             track = null;
@@ -236,6 +241,7 @@ final class Emulator implements Runnable {
     private void releaseAudio() {
         AudioTrack t = track;
         track = null;
+        audioPlaying = false;
         if (t != null) {
             try {
                 t.pause();

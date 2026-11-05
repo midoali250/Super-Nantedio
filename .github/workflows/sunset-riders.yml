@@ -225,7 +225,7 @@ jobs:
           else
             gh release create sunset-riders-v1.0 "$APK" \
               --title "رعاة البقر — Sunset Riders 1.0 (Android)" \
-              --notes "الإصدار 1.0 للعبة رعاة البقر (Sunset Riders) على أندرويد بجودة صورة فائقة 2x HD Scale2x، وشاشة عريضة بعرض الموبايل، وعصاية تحكم حرة 360°، وأكواد الغش (Cheats)، وزر About داخل الضبط."
+              --notes "الإصدار 1.0 للعبة رعاة البقر (Sunset Riders) على أندرويد بجودة صورة فائقة True HD 2x Scale2x + GPU، وصوت ستيريو نقي 60 إطار/ثانية، وشاشة عريضة بعرض الموبايل، وعصاية تحكم حرة 360°، وزر Reset Game، وزر About داخل الضبط."
           fi
 
           if gh release view sunset-riders-desktop-v1.0.0 >/dev/null 2>&1; then
@@ -233,7 +233,7 @@ jobs:
           else
             gh release create sunset-riders-desktop-v1.0.0 "$WIN" "$LIN" "$MAC" \
               --title "رعاة البقر — Sunset Riders Desktop 1.0.0 (Windows / Linux / macOS)" \
-              --notes "الإصدار 1.0.0 لسطح المكتب للعبة رعاة البقر (Sunset Riders): Windows Portable EXE و Linux AppImage و macOS arm64 App بجودة 2x HD Scale2x وأكواد الغش."
+              --notes "الإصدار 1.0.0 لسطح المكتب للعبة رعاة البقر (Sunset Riders): Windows Portable EXE و Linux AppImage و macOS arm64 App بجودة True HD 2x Scale2x وزر Reset Game."
           fi
 
           python3 tools/publish_sunset_riders.py
@@ -241,7 +241,13 @@ jobs:
 
           git config user.name "BitVaultEngine CI"
           git config user.email "ci@users.noreply.github.com"
-          git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            git checkout d54a58c -- RELEASE-ARCHIVE/Windows/1.4.0 RELEASE-ARCHIVE/Linux/1.4.0 RELEASE-ARCHIVE/macOS/1.4.0 RELEASE-ARCHIVE/Windows/The-Mask RELEASE-ARCHIVE/Linux/The-Mask RELEASE-ARCHIVE/macOS/The-Mask || true
+            git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/
+          else
+            git checkout HEAD -- RELEASE-ARCHIVE/Android/Sunset-Riders/1.0/Sunset-Riders-1.0.apk RELEASE-ARCHIVE/Windows/Sunset-Riders/1.0.0/Sunset-Riders-Windows-x64.exe RELEASE-ARCHIVE/Linux/Sunset-Riders/1.0.0/Sunset-Riders-Linux-x86_64.AppImage RELEASE-ARCHIVE/macOS/Sunset-Riders/1.0.0/Sunset-Riders-macOS-arm64.zip || true
+            git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/Android/Sunset-Riders/1.0/SHA256SUMS.txt RELEASE-ARCHIVE/Windows/Sunset-Riders/1.0.0/SHA256SUMS.txt RELEASE-ARCHIVE/Linux/Sunset-Riders/1.0.0/SHA256SUMS.txt RELEASE-ARCHIVE/macOS/Sunset-Riders/1.0.0/SHA256SUMS.txt
+          fi
           python3 tools/naming/audit.py
           rm -f brand-audit.json
           if ! git diff --cached --quiet; then
