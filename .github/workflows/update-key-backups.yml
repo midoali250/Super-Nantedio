@@ -1,0 +1,40 @@
+name: Verify update key backups
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            secret_name: AKG_UPDATE_ANDROID_SEED_BACKUP
+          - platform: windows
+            secret_name: AKG_UPDATE_WINDOWS_SEED_BACKUP
+          - platform: linux
+            secret_name: AKG_UPDATE_LINUX_SEED_BACKUP
+          - platform: macos
+            secret_name: AKG_UPDATE_MACOS_SEED_BACKUP
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'PyNaCl==1.5.0'
+      - name: Verify encrypted backup against public key
+        env:
+          SIGNING_SEED: ${{ secrets[matrix.secret_name] }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          python - <<'PY'
+          import os,base64,json,urllib.request
+          from nacl.signing import SigningKey
+          system=os.environ['PLATFORM']
+          with urllib.request.urlopen('https://raw.githubusercontent.com/midoali250/akg-retro-games-'+system+'/main/updates/public-key.json',timeout=30) as r: public=json.load(r)
+          key=SigningKey(base64.b64decode(os.environ['SIGNING_SEED'],validate=True))
+          assert base64.b64encode(bytes(key.verify_key)).decode('ascii')==public['public_key_base64']
+          message=b'AKG verified backup';key.verify_key.verify(message,key.sign(message).signature)
+          print('PASS signing-key backup matches public verification key for',system)
+          PY
