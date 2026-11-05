@@ -61,10 +61,11 @@ static int16_t g_audio_out[65536];
 int host_start(const unsigned char *rom, int len)
 {
    ByteArrayObj arr;
+   const char *tmp = getenv("SUNSET_RIDERS_TEMP");
    arr.data = rom;
    arr.len = len;
    return Java_com_midoali_snes_SnesCore_nativeStart(&g_env, NULL, (jbyteArray)&arr,
-                                                   (jstring)"/tmp") ? 1 : 0;
+                                                   (jstring)(tmp && tmp[0] ? tmp : ".")) ? 1 : 0;
 }
 
 void host_stop(void)
