@@ -1,6 +1,9 @@
 name: Verify update key backups
 on:
   workflow_dispatch:
+  push:
+    branches: ['engine/clean-foundation']
+    paths: ['.github/workflows/update-key-backups.yml']
 permissions:
   contents: read
 jobs:
