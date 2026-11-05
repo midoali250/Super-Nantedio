@@ -76,5 +76,5 @@ target_compile_definitions(snescore PRIVATE
   "INLINE=static inline"
 )
 
-target_compile_options(snescore PRIVATE -O2 -DPATH_MAX=1024 -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -w)
+target_compile_options(snescore PRIVATE -O3 -funroll-loops -DPATH_MAX=1024 -Wno-return-type -Wno-implicit-function-declaration -Wno-int-conversion -w)
 target_link_libraries(snescore m log)

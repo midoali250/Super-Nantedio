@@ -16,7 +16,6 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.CheckBox;
-import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
@@ -40,24 +39,6 @@ public final class MainActivity extends Activity {
 
     public static final String ABOUT_PLAIN_TEXT =
             "This application has been developed by Ahmed Kamal Elgandy to serve as a digital archive and platform for running and optimizing classic retro and Atari-style games on mobile devices. The project aims to revive memories and preserve the software heritage of classic games with a smooth, lightweight experience, while fully respecting the intellectual property rights of the original production companies.";
-
-    private static final int[] CHEAT_FLAGS = {
-            SnesCore.CHEAT_INF_LIVES,
-            SnesCore.CHEAT_INVINCIBLE,
-            SnesCore.CHEAT_MAX_FIREPOWER,
-            SnesCore.CHEAT_INF_CREDITS,
-            SnesCore.CHEAT_ONE_HIT_BOSS,
-            SnesCore.CHEAT_INF_LIVES_P2,
-    };
-
-    private static final String[] CHEAT_LABELS = {
-            "أرواح لا نهائية - 9 أرواح (Infinite Lives P1)",
-            "عدم التأثر بالرصاص والأعداء (Invincibility / Untouchable)",
-            "أقصى قوة سلاح: مسدسين + طلقات سريعة (2X Guns + Rapid Fire)",
-            "محاولات لا نهائية - 9 محاولات (Infinite Credits)",
-            "قتل الزعماء والبراميل بطلقة واحدة (1-Hit Kill Bosses)",
-            "أرواح لا نهائية للاعب الثاني (Infinite Lives P2)",
-    };
 
     private Emulator emulator;
     private GameView gameView;
@@ -96,11 +77,11 @@ public final class MainActivity extends Activity {
         settings.setOnClickListener(v -> showSettings());
         topMenuBar.addView(settings);
 
-        Button cheatsQuick = new Button(this);
-        cheatsQuick.setText("🎮 الغش");
-        cheatsQuick.setAllCaps(false);
-        cheatsQuick.setOnClickListener(v -> showCheatsDialog());
-        topMenuBar.addView(cheatsQuick);
+        Button resetQuick = new Button(this);
+        resetQuick.setText("🔄 ريست");
+        resetQuick.setAllCaps(false);
+        resetQuick.setOnClickListener(v -> performReset());
+        topMenuBar.addView(resetQuick);
 
         Button aboutQuick = new Button(this);
         aboutQuick.setText("About");
@@ -146,6 +127,14 @@ public final class MainActivity extends Activity {
         }, "snes-rom-loader").start();
     }
 
+    private void performReset() {
+        controls.releaseAll();
+        if (emulator != null) {
+            emulator.resetGame();
+            Toast.makeText(this, "تم إعادة تشغيل اللعبة (Reset Game)", Toast.LENGTH_SHORT).show();
+        }
+    }
+
     private void applySettings() {
         controls.setControlScale(prefs.getInt("size", 100) / 100f);
         controls.setAlpha(prefs.getInt("opacity", 75) / 100f);
@@ -154,7 +143,6 @@ public final class MainActivity extends Activity {
         int vf = prefs.getInt("video_filter", SnesCore.VIDEO_FILTER_HD_CRISP);
         gameView.setSmoothFilter(vf != SnesCore.VIDEO_FILTER_RAW_PIXEL);
         if (emulator != null) {
-            emulator.setCheats(prefs.getInt("cheats", 0));
             emulator.setVideoFilter(vf);
         }
     }
@@ -169,13 +157,13 @@ public final class MainActivity extends Activity {
         box.setPadding(padding, padding, padding, padding);
 
         TextView vfTitle = new TextView(this);
-        vfTitle.setText("جودة الصورة (HD Video Quality):");
+        vfTitle.setText("جودة الصورة (True HD Video Quality):");
         vfTitle.setTypeface(Typeface.DEFAULT_BOLD);
         box.addView(vfTitle);
 
         RadioGroup vfGroup = new RadioGroup(this);
         String[] vfLabels = {
-                "فائق الوضوح HD Crisp (2x Scale2x + تنعيم الألوان)",
+                "فائق الوضوح True HD Crisp (2x Scale2x + GPU Filter)",
                 "ناعم فائق السلاسة Ultra Smooth (2x Bilinear)",
                 "بيكسل أصلي حاد Raw Pixel (1x)",
         };
@@ -212,11 +200,16 @@ public final class MainActivity extends Activity {
         });
         box.addView(freeStick);
 
-        Button cheatsBtn = new Button(this);
-        cheatsBtn.setText("🎮 أكواد الغش (Cheats)");
-        cheatsBtn.setAllCaps(false);
-        cheatsBtn.setOnClickListener(v -> showCheatsDialog());
-        box.addView(cheatsBtn);
+        final AlertDialog[] holderDialog = new AlertDialog[1];
+
+        Button resetBtn = new Button(this);
+        resetBtn.setText("🔄 إعادة تشغيل اللعبة (Reset Game)");
+        resetBtn.setAllCaps(false);
+        resetBtn.setOnClickListener(v -> {
+            performReset();
+            if (holderDialog[0] != null) holderDialog[0].dismiss();
+        });
+        box.addView(resetBtn);
 
         Button checkUpdate = new Button(this);
         checkUpdate.setText("التحديث");
@@ -234,103 +227,14 @@ public final class MainActivity extends Activity {
         addSlider(box, "وضوح الأزرار", "opacity", 25, 100, 75);
 
         TextView hint = new TextView(this);
-        hint.setText("رعاة البقر (Sunset Riders) — جودة صورة HD مضاعفة (Scale2x) + عصاية تحكم حرة 360° + شاشة عريضة + أكواد غش مدمجة.");
+        hint.setText("رعاة البقر (Sunset Riders) — جودة صورة True HD مضاعفة (Scale2x + GPU) + عصاية تحكم حرة 360° + شاشة عريضة + صوت ستيريو نقي 60 إطار/ثانية.");
         box.addView(hint);
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(box);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("الضبط والإعدادات — رعاة البقر")
                 .setView(scroll).setPositiveButton("تم", (d, w) -> {}).create();
-        dialog.setOnDismissListener(d -> {
-            settingsOpen = false;
-            if (emulator != null && hasWindowFocus()) emulator.setPaused(false);
-        });
-        dialog.show();
-    }
-
-    private void showCheatsDialog() {
-        settingsOpen = true;
-        controls.releaseAll();
-        if (emulator != null) emulator.setPaused(true);
-
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        int padding = (int) (18 * getResources().getDisplayMetrics().density);
-        box.setPadding(padding, padding, padding, padding);
-
-        final CheckBox[] boxes = new CheckBox[CHEAT_FLAGS.length];
-        int currentMask = prefs.getInt("cheats", 0);
-
-        for (int i = 0; i < CHEAT_FLAGS.length; i++) {
-            final int flag = CHEAT_FLAGS[i];
-            CheckBox cb = new CheckBox(this);
-            cb.setText(CHEAT_LABELS[i]);
-            cb.setChecked((currentMask & flag) != 0);
-            cb.setOnCheckedChangeListener((v, checked) -> {
-                int m = prefs.getInt("cheats", 0);
-                if (checked) m |= flag;
-                else m &= ~flag;
-                prefs.edit().putInt("cheats", m).apply();
-                applySettings();
-            });
-            boxes[i] = cb;
-            box.addView(cb);
-        }
-
-        LinearLayout actions = new LinearLayout(this);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        Button enableAll = new Button(this);
-        enableAll.setText("تفعيل الكل");
-        enableAll.setAllCaps(false);
-        enableAll.setOnClickListener(v -> {
-            prefs.edit().putInt("cheats", SnesCore.CHEAT_ALL).apply();
-            for (CheckBox cb : boxes) cb.setChecked(true);
-            applySettings();
-        });
-        actions.addView(enableAll);
-
-        Button disableAll = new Button(this);
-        disableAll.setText("إيقاف الكل");
-        disableAll.setAllCaps(false);
-        disableAll.setOnClickListener(v -> {
-            prefs.edit().putInt("cheats", 0).apply();
-            for (CheckBox cb : boxes) cb.setChecked(false);
-            if (emulator != null) emulator.applyCheatCode(0, false, null);
-            applySettings();
-        });
-        actions.addView(disableAll);
-        box.addView(actions);
-
-        TextView customLabel = new TextView(this);
-        customLabel.setText("إدخال كود Game Genie (XXXX-XXXX) أو Action Replay (FFXXXX:YYYY):");
-        box.addView(customLabel);
-
-        final EditText customCode = new EditText(this);
-        customCode.setHint("مثال: REFA-C6VL أو FFB098:0009");
-        customCode.setSingleLine(true);
-        customCode.setText(prefs.getString("custom_cheat", ""));
-        box.addView(customCode);
-
-        Button applyCodeBtn = new Button(this);
-        applyCodeBtn.setText("تطبيق الكود المخصص");
-        applyCodeBtn.setAllCaps(false);
-        applyCodeBtn.setOnClickListener(v -> {
-            String code = customCode.getText().toString().trim().toUpperCase();
-            prefs.edit().putString("custom_cheat", code).apply();
-            if (emulator != null && !code.isEmpty()) {
-                emulator.applyCheatCode(0, true, code);
-                Toast.makeText(this, "تم تفعيل الكود: " + code, Toast.LENGTH_SHORT).show();
-            }
-        });
-        box.addView(applyCodeBtn);
-
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(box);
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("🎮 أكواد الغش — رعاة البقر")
-                .setView(scroll)
-                .setPositiveButton("عودة للعبة", (d, w) -> {})
-                .create();
+        holderDialog[0] = dialog;
         dialog.setOnDismissListener(d -> {
             settingsOpen = false;
             if (emulator != null && hasWindowFocus()) emulator.setPaused(false);

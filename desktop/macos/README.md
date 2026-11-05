@@ -1,0 +1,1 @@
+See ../README.md for controls, 4K scaling, update process, licensing and limitations. The tests directory contains the packaged build smoke test used by GitHub Actions. Builds and tests are performed by .github/workflows/super-mario-world-desktop.yml.

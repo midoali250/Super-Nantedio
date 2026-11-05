@@ -1,0 +1,84 @@
+name: NES Mario + Duck Hunt
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'games/nes-mario-duckhunt/**'
+      - '.github/workflows/nes-mario-duckhunt.yml'
+  pull_request:
+    paths:
+      - 'games/nes-mario-duckhunt/**'
+      - '.github/workflows/nes-mario-duckhunt.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: games/nes-mario-duckhunt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android components
+        run: |
+          SDKMGR="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMGR" ]; then SDKMGR="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)"; fi
+          yes | "$SDKMGR" --licenses > /dev/null || true
+          "$SDKMGR" --install 'ndk;27.0.12077973' 'cmake;3.22.1' 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Test controls
+        run: |
+          mkdir -p /tmp/nes-vpad-test
+          javac -d /tmp/nes-vpad-test app/src/main/java/com/midoali/nes/{VirtualPad,Zapper,ScreenMap}.java tools/vpad/VpadTest.java
+          java -cp /tmp/nes-vpad-test com.midoali.nes.VpadTest
+      - name: Host core gameplay and protection tests
+        run: |
+          python3 -m pip install Pillow==11.3.0
+          cmake -S tools/host -B tools/host/build
+          cmake --build tools/host/build -j 2
+          python3 tools/host/test_lives.py
+          python3 tools/host/test_protection.py
+          python3 tools/host/test_enemy_collision.py 0
+          python3 tools/host/test_enemy_collision.py 2
+      - name: Configure signed release
+        id: signing
+        env:
+          KEY_B64: ${{ secrets.WORLD_SIGNING_KEY_B64 }}
+          KEY_PASSWORD: ${{ secrets.WORLD_SIGNING_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.WORLD_SIGNING_ALIAS }}
+        run: |
+          if [ -n "$KEY_B64" ] && [ -n "$KEY_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
+            umask 077
+            printf '%s' "$KEY_B64" | base64 --decode > "$RUNNER_TEMP/game-release.jks"
+            echo "NES_KEYSTORE_PATH=$RUNNER_TEMP/game-release.jks" >> "$GITHUB_ENV"
+            echo "NES_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "NES_KEYSTORE_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "NES_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets on this repository; the release APK stays unsigned."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build debug and signed release APK
+        run: ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nes-mario-duckhunt-debug
+          path: games/nes-mario-duckhunt/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: steps.signing.outputs.signed == 'true'
+        with:
+          name: nes-mario-duckhunt-release
+          path: games/nes-mario-duckhunt/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: steps.signing.outputs.signed != 'true'
+        with:
+          name: nes-mario-duckhunt-release-unsigned
+          path: games/nes-mario-duckhunt/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error

@@ -6,17 +6,18 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.os.Build;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
 /**
- * High-definition surface view for Sunset Riders (رعاة البقر).
- * Uses hardware bilinear filtering on top of the native 2x Scale2x + De-Dither
- * ARGB_8888 frame buffer ("Sharp Bilinear + Scale2x") for crystal-clear image
- * quality across full-width mobile widescreen displays.
+ * Hardware-accelerated HD surface view for Sunset Riders (رعاة البقر).
+ * Uses GPU-accelerated SurfaceHolder.lockHardwareCanvas() with hardware
+ * bilinear texture filtering on top of the native 2x HQ Scale2x + De-Dither
+ * frame buffer for 60 FPS True HD visuals across widescreen mobile displays.
  */
 final class GameView extends SurfaceView implements SurfaceHolder.Callback {
-    private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG);
+    private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
     private final Paint clear = new Paint();
     private final Rect dst = new Rect();
     private volatile int viewWidth, viewHeight;
@@ -30,7 +31,6 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
     void setSmoothFilter(boolean value) {
         smoothFilter = value;
         paint.setFilterBitmap(value);
-        paint.setAntiAlias(value);
         paint.setDither(true);
     }
 
@@ -41,7 +41,6 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
         getHolder().addCallback(this);
         setFocusable(false);
         paint.setFilterBitmap(true);
-        paint.setAntiAlias(true);
         paint.setDither(true);
         clear.setColor(Color.BLACK);
     }
@@ -61,13 +60,22 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) { }
 
-    /** Called on the emulator thread. */
+    /** Called on the emulator thread. Uses GPU hardware canvas when available. */
     void present(Bitmap bitmap) {
         SurfaceHolder holder = getHolder();
         if (holder == null || bitmap == null) return;
         Canvas canvas = null;
         try {
-            canvas = holder.lockCanvas();
+            if (Build.VERSION.SDK_INT >= 23) {
+                try {
+                    canvas = holder.lockHardwareCanvas();
+                } catch (Throwable ignored) {
+                    canvas = null;
+                }
+            }
+            if (canvas == null) {
+                canvas = holder.lockCanvas();
+            }
             if (canvas == null) return;
             int w = canvas.getWidth();
             int h = canvas.getHeight();
@@ -75,15 +83,17 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
             viewHeight = h;
             int[] r = ScreenMap.displayRect(w, h, stretch);
             dst.set(r[0], r[1], r[0] + r[2], r[1] + r[3]);
-            canvas.drawRect(0, 0, w, h, clear);
+            if (!stretch) {
+                canvas.drawRect(0, 0, w, h, clear);
+            }
             canvas.drawBitmap(bitmap, null, dst, paint);
-        } catch (IllegalArgumentException ignored) {
+        } catch (IllegalArgumentException | IllegalStateException ignored) {
             /* surface went away mid-frame */
         } finally {
             if (canvas != null) {
                 try {
                     holder.unlockCanvasAndPost(canvas);
-                } catch (IllegalArgumentException ignored) { }
+                } catch (IllegalArgumentException | IllegalStateException ignored) { }
             }
         }
     }

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "game_id": "super-mario-world",
+  "game_name": "Super Mario Bros. (World)",
+  "package_name": "com.midoali.supermarioworld",
+  "version_code": 5,
+  "version_name": "1.4",
+  "min_android_sdk": 26,
+  "apk_url": "https://github.com/midoali250/bitvault-engine/releases/download/super-mario-world-v1.4/Super-Mario-Bros-World-1.4.apk",
+  "apk_sha256": "7dcc1ab7a95dfeadc8dfe47b547fb62218e586cd8c7f8e9e882aff929dd7a363",
+  "apk_size_bytes": 6681826,
+  "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/super-mario-world-v1.4",
+  "published_at": "2026-11-04T11:22:25Z",
+  "release_notes_ar": "إصدار جديد بعد تغيير اسم المشروع، مع الحفاظ على اسم اللعبة فقط.",
+  "required": false
+}

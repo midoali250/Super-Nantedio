@@ -1,0 +1,57 @@
+plugins {
+    id 'com.android.application'
+}
+
+def signingNames = ['NES_KEYSTORE_PATH', 'NES_KEYSTORE_PASSWORD', 'NES_KEY_ALIAS', 'NES_KEY_PASSWORD']
+def signingValues = signingNames.collectEntries { [(it): (System.getenv(it) ?: '')] }
+def signingConfigured = signingValues.values().every { !it.isEmpty() }
+
+android {
+    namespace 'com.bitvaultengine.nes'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.bitvaultengine.nes"
+        minSdk 21
+        targetSdk 34
+        versionCode 2
+        versionName "1.1"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        if (signingConfigured) {
+            release {
+                storeFile file(signingValues['NES_KEYSTORE_PATH'])
+                storePassword signingValues['NES_KEYSTORE_PASSWORD']
+                keyAlias signingValues['NES_KEY_ALIAS']
+                keyPassword signingValues['NES_KEY_PASSWORD']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (signingConfigured) signingConfig signingConfigs.release
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    aaptOptions {
+        noCompress "nes"
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+}

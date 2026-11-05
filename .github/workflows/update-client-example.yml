@@ -1,0 +1,24 @@
+name: Build reusable Android update client example
+on:
+  push:
+    paths:
+      - 'updates/client/android/**'
+      - '.github/workflows/update-client-example.yml'
+  pull_request:
+    paths:
+      - 'updates/client/android/**'
+      - '.github/workflows/update-client-example.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build example using shared update client
+        working-directory: updates/client/android/sample
+        run: |
+          "$GITHUB_WORKSPACE/games/nes-mario-duckhunt/gradlew" :app:assembleDebug --no-daemon

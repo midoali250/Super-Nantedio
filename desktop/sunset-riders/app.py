@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""رعاة البقر (Sunset Riders) desktop frontend, Genesis Plus GX core + 2x HQ Scale2x HD Video."""
+"""Sunset Riders (Cowboys) desktop frontend, Genesis Plus GX core + True HD 2x Scale2x Video."""
 import ctypes as C
 import hashlib, json, math, os, re, subprocess, sys, tempfile, textwrap, threading, time, urllib.request
 from pathlib import Path
@@ -18,19 +18,9 @@ ABOUT_RAW_MARKDOWN = (
 )
 ABOUT_PLAIN_TEXT = ABOUT_RAW_MARKDOWN.replace('**', '')
 
-CHEAT_ITEMS = [
-    ('Infinite Lives P1 (9 Lives)', 1 << 0),
-    ('Invincibility (Untouchable)', 1 << 1),
-    ('Max Firepower: 2X Guns + Rapid Fire', 1 << 2),
-    ('Infinite Credits (9 Continues)', 1 << 3),
-    ('1-Hit Kill Bosses & Barrels', 1 << 4),
-    ('Infinite Lives P2 (Co-Op)', 1 << 5),
-]
-CHEAT_ALL = 0x3F
-
 FILTER_MODES = ['hd_crisp', 'smooth', 'sharp']
 FILTER_LABELS = {
-    'hd_crisp': 'HD Crisp (2x Scale2x + De-Dither)',
+    'hd_crisp': 'True HD Crisp (2x Scale2x + De-Dither + GPU Filter)',
     'smooth': 'Ultra Smooth (2x Bilinear)',
     'sharp': 'Raw Pixel (1x Sharp)',
 }
@@ -52,12 +42,10 @@ class Core:
         self.lib = C.CDLL(str(ROOT / library))
         self.lib.host_start.argtypes = [C.c_char_p, C.c_int]
         self.lib.host_start.restype = C.c_int
+        self.lib.host_reset.argtypes = []
         self.lib.host_stop.argtypes = []
         self.lib.host_frame.argtypes = []
         self.lib.host_input.argtypes = [C.c_int]
-        self.lib.host_set_cheats.argtypes = [C.c_int]
-        self.lib.host_get_cheats.argtypes = []
-        self.lib.host_get_cheats.restype = C.c_int
         self.lib.host_set_video_filter.argtypes = [C.c_int]
         self.lib.host_get_video_filter.argtypes = []
         self.lib.host_get_video_filter.restype = C.c_int
@@ -85,11 +73,11 @@ class Core:
         self.w = self.lib.host_width()
         self.h = self.lib.host_height()
 
-    def set_cheats(self, mask):
-        self.lib.host_set_cheats(int(mask) & CHEAT_ALL)
-
-    def get_cheats(self):
-        return int(self.lib.host_get_cheats())
+    def reset(self):
+        self.lib.host_input(0)
+        self.lib.host_reset()
+        self.w = self.lib.host_width()
+        self.h = self.lib.host_height()
 
     def set_video_filter(self, name):
         mode = FILTER_NATIVE.get(name, 0)
@@ -309,6 +297,14 @@ def home_dir():
         root = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
     p = root / 'bitvault-engine' / 'SunsetRiders'
     p.mkdir(parents=True, exist_ok=True)
+    # Remove any legacy v1 files that may have saved a corrupted cheat state
+    for legacy in ('autosave.state', 'settings-v1.json'):
+        lp = p / legacy
+        if lp.exists():
+            try:
+                lp.unlink()
+            except OSError:
+                pass
     return p
 
 
@@ -376,11 +372,11 @@ class SaveWorker:
 
 
 def save_config(config):
-    write_atomic(home_dir() / 'settings-v1.json', json.dumps(config, indent=2).encode())
+    write_atomic(home_dir() / 'settings-v2.json', json.dumps(config, indent=2).encode())
 
 
 def load_config():
-    cfg = read_json(home_dir() / 'settings-v1.json')
+    cfg = read_json(home_dir() / 'settings-v2.json')
     valid = {}
     incoming = cfg.get('controls', {})
     if not isinstance(incoming, dict):
@@ -396,7 +392,6 @@ def load_config():
         cfg['display'] = 'fill'
     if cfg.get('filter') not in FILTER_MODES:
         cfg['filter'] = 'hd_crisp'
-    cfg['cheats'] = int(cfg.get('cheats', 0)) & CHEAT_ALL if isinstance(cfg.get('cheats', 0), int) else 0
     return cfg
 
 
@@ -430,14 +425,24 @@ def restore(core, data):
 
 
 def save_game(core):
-    write_atomic(home_dir() / 'autosave.state', snapshot(core))
+    write_atomic(home_dir() / 'autosave-v2.state', snapshot(core))
 
 
 def load_game(core):
-    path = home_dir() / 'autosave.state'
+    path = home_dir() / 'autosave-v2.state'
     if not path.exists():
         return False
     restore(core, path.read_bytes())
+    core.frame(0)
+    raw = core.framebuffer()
+    # Guard against restoring a blank/locked screen state
+    if len(set(raw[::64])) <= 1:
+        core.reset()
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return False
     return True
 
 
@@ -484,7 +489,7 @@ def describe(entry, group):
     try:
         values = entry[['key', 'pad', 'mouse'][group]]
         if not values:
-            return '—'
+            return '-'
         if group == 0:
             return ', '.join(pygame.key.name(k).upper() for k in values)
         if group == 2:
@@ -515,11 +520,13 @@ def self_test():
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
     pygame.init()
-    pygame.display.set_mode((512, 448))
+    pygame.display.set_mode((640, 448))
     apply_window_icon()
     assert 'Ahmed Kamal Elgandy' in ABOUT_RAW_MARKDOWN and 'intellectual property rights' in ABOUT_PLAIN_TEXT
     core = Core()
     assert core.w >= 512 and core.h >= 384, f'Expected 2x HD geometry, got: {core.w}x{core.h}'
+    raw0 = core.framebuffer()
+    assert any(b != 0 for b in raw0), 'Expected non-blank warm-up boot frame'
 
     def run(n, mask=0):
         for _ in range(n):
@@ -527,11 +534,11 @@ def self_test():
             core.samples()
 
     # Boot into Stage 1 of Sunset Riders
-    for i in range(1, 901):
-        m = ((1 << 3) | (1 << 0)) if (i in range(250, 260) or i in range(400, 410) or i in range(520, 530) or i in range(620, 630)) else 0
+    for i in range(1, 820):
+        m = ((1 << 3) | (1 << 0)) if (i in range(150, 160) or i in range(300, 310) or i in range(420, 430) or i in range(520, 530)) else 0
         core.frame(m)
         core.samples()
-    assert core.w >= 512 and core.h >= 448, f'Expected 2x HD gameplay geometry, got: {core.w}x{core.h}'
+    assert core.w >= 512 and core.h == 448, f'Expected 2x True HD gameplay geometry, got: {core.w}x{core.h}'
 
     core.lib.retro_get_memory_data.argtypes = [C.c_uint]
     core.lib.retro_get_memory_data.restype = C.POINTER(C.c_uint8)
@@ -544,32 +551,25 @@ def self_test():
     snap2 = bytes(wram[:0x10000])
     assert snap1 != snap2, 'Player did not shoot on B'
 
-    # Verify built-in Cheats engine on Desktop
-    core.set_cheats(CHEAT_ALL)
-    assert core.get_cheats() == CHEAT_ALL, 'Cheats mask not set'
-    run(10, (1 << 0) | (1 << 7))
-    assert wram[0xB098] == 9 and wram[0xB09A] == 9, 'Infinite Lives cheat failed'
-    assert wram[0xB0A2] == 9, 'Infinite Credits cheat failed'
-    assert wram[0xCA4C] == 2, 'Invincibility cheat failed'
-    assert wram[0xCA43] == 3, 'Max Firepower Dual Guns cheat failed'
-    core.set_cheats(0)
-    run(1, 0)
-    assert wram[0xCA43] == 0, 'Cheats did not clear'
-    snap2 = bytes(wram[:0x10000])
-
     state = snapshot(core)
     run(30, 1 << 7)
     with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / 'autosave.state'
+        path = Path(folder) / 'autosave-v2.state'
         write_atomic(path, state)
         restore(core, path.read_bytes())
     assert bytes(wram[:0x10000]) == snap2, 'Saved file restore failed'
 
+    # Verify Reset Game functionality
+    core.reset()
+    raw_reset = core.framebuffer()
+    assert any(b != 0 for b in raw_reset), 'Reset game produced blank frame'
+    assert bytes(wram[:0x10000]) != snap2, 'Reset game did not reset WRAM state'
+
     frame = pygame.Surface((core.w, core.h), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
     frame.get_buffer().write(core.framebuffer())
     assert pygame.transform.scale(frame, (2880, 2160)).get_size() == (2880, 2160)
-    smooth = pygame.Surface((1280, 720)).convert()
-    pygame.transform.smoothscale(frame.convert(), (1280, 720), smooth)
+    smooth = pygame.Surface((1280, 720), 0, 32, (0x00ff0000, 0x0000ff00, 0x000000ff, 0))
+    pygame.transform.smoothscale(frame.convert((0x00ff0000, 0x0000ff00, 0x000000ff, 0)), (1280, 720), smooth)
 
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / 'thread-save.state'
@@ -637,7 +637,7 @@ def self_test():
     monitor.thread.join(3)
     assert seen == ['9.0.0', '9.1.0'], 'New update notification missing'
     core.stop()
-    print('PASS: Sunset Riders HD gameplay, cheats, save/restore, 4K scaling, keyboard/mouse/gamepad, notifications')
+    print('PASS: Sunset Riders (Cowboys) True HD gameplay, reset game, save/restore, 4K scaling, keyboard/mouse/gamepad, notifications')
     pygame.quit()
 
 
@@ -671,10 +671,9 @@ def main():
     pygame.joystick.init()
     apply_window_icon()
     screen = pygame.display.set_mode((1024, 768) if ui_test else (0, 0), 0 if ui_test else pygame.FULLSCREEN)
-    pygame.display.set_caption('رعاة البقر — Sunset Riders')
+    pygame.display.set_caption('Sunset Riders')
     core = Core()
     cfg = load_config()
-    core.set_cheats(cfg.get('cheats', 0))
     core.set_video_filter(cfg.get('filter', 'hd_crisp'))
     frame = pygame.Surface((core.w, core.h), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
     controls = cfg['controls']
@@ -683,14 +682,10 @@ def main():
     monitor = UpdateMonitor(status=notice)
     if not ui_test:
         monitor.check()
-    message = ''
-    try:
-        message = 'Previous game restored' if load_game(core) else 'New game'
-    except (OSError, ValueError, RuntimeError):
-        message = 'Save could not be loaded'
+    message = 'Ready — Press Enter (Start) to play, F5 to Reset, or F1/Esc for Menu'
     clock = pygame.time.Clock()
     channel = pygame.mixer.Channel(0) if pygame.mixer.get_init() else None
-    save_worker = SaveWorker(home_dir() / 'autosave.state')
+    save_worker = SaveWorker(home_dir() / 'autosave-v2.state')
     pending_audio = bytearray()
     scaled = None
     scaled_key = None
@@ -711,11 +706,11 @@ def main():
     last_save = time.monotonic()
     buttons = []
     main_rows = [
-        'Resume game', 'Controls', 'Cheats', 'Settings (Video & display)',
+        'Resume game', 'Reset game', 'Controls', 'Settings (Video & display)',
         'Save now', 'Load saved game', 'Check for updates',
         'Download update', 'About', 'Exit game'
     ]
-    video_rows = ['Screen:', 'Image Quality:', 'Toggle fullscreen', 'About', 'Back']
+    video_rows = ['Screen:', 'Image Quality:', 'Toggle fullscreen', 'Reset game', 'About', 'Back']
 
     def persist():
         try:
@@ -732,19 +727,37 @@ def main():
         except (OSError, ValueError, RuntimeError):
             message = 'Could not save game'
 
+    def reset_now():
+        nonlocal page, message, last_save
+        core.reset()
+        pending_audio.clear()
+        if channel:
+            try:
+                channel.stop()
+            except pygame.error:
+                pass
+        state_file = home_dir() / 'autosave-v2.state'
+        if state_file.exists():
+            try:
+                state_file.unlink()
+            except OSError:
+                pass
+        last_save = time.monotonic()
+        message = 'Game reset to title screen'
+        page = None
+
     def activate():
         nonlocal page, selected, group, waiting, running, screen, fullscreen, message
         if page == 'main':
             choice = main_rows[selected]
             if choice == 'Resume game':
                 page = None
+            elif choice == 'Reset game':
+                reset_now()
             elif choice == 'Controls':
                 page = 'controls'
                 selected = 0
                 group = 0
-            elif choice == 'Cheats':
-                page = 'cheats'
-                selected = 0
             elif choice == 'Settings (Video & display)':
                 page = 'video'
                 selected = 0
@@ -752,7 +765,11 @@ def main():
                 save_now()
             elif choice == 'Load saved game':
                 try:
-                    message = 'Saved game loaded' if load_game(core) else 'No saved game yet'
+                    if load_game(core):
+                        message = 'Saved game loaded'
+                        page = None
+                    else:
+                        message = 'No valid saved game found'
                 except (OSError, ValueError, RuntimeError):
                     message = 'Could not load save'
             elif choice == 'Check for updates':
@@ -783,26 +800,6 @@ def main():
                 message = 'Controls reset'
             else:
                 page = 'main'
-                selected = 1
-        elif page == 'cheats':
-            if selected < len(CHEAT_ITEMS):
-                _, bit = CHEAT_ITEMS[selected]
-                cfg['cheats'] = cfg.get('cheats', 0) ^ bit
-                core.set_cheats(cfg['cheats'])
-                persist()
-                message = 'Cheat updated'
-            elif selected == len(CHEAT_ITEMS):
-                cfg['cheats'] = CHEAT_ALL
-                core.set_cheats(CHEAT_ALL)
-                persist()
-                message = 'All cheats enabled'
-            elif selected == len(CHEAT_ITEMS) + 1:
-                cfg['cheats'] = 0
-                core.set_cheats(0)
-                persist()
-                message = 'All cheats disabled'
-            else:
-                page = 'main'
                 selected = 2
         elif page == 'video':
             if selected == 0:
@@ -818,6 +815,8 @@ def main():
                 screen = pygame.display.set_mode((0, 0) if fullscreen else (1024, 768),
                                                  pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
             elif selected == 3:
+                reset_now()
+            elif selected == 4:
                 page = 'about'
                 selected = 0
             else:
@@ -849,9 +848,7 @@ def main():
                 pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(screen.get_width() // 2, 20)))
             if ui_frame == 7:
                 assert page == 'main' and selected == 7, 'Update banner did not open download menu'
-                selected = 0
-                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN))
-            if ui_frame == 8:
+                selected = 2  # Controls
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
             if ui_frame == 10:
                 assert page == 'controls'
@@ -864,25 +861,22 @@ def main():
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
             if ui_frame == 16:
                 assert page == 'main'
-                selected = 2  # Cheats
+                selected = 1  # Reset game
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
             if ui_frame == 18:
-                assert page == 'cheats'
-                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
-            if ui_frame == 20:
-                assert (cfg['cheats'] & 1) == 1 and (core.get_cheats() & 1) == 1
+                assert page is None and message == 'Game reset to title screen', 'Reset game did not reset and resume'
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
-            if ui_frame == 22:
+            if ui_frame == 20:
                 assert page == 'main'
                 selected = 8  # About
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
-            if ui_frame == 24:
+            if ui_frame == 22:
                 assert page == 'about'
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
-            if ui_frame == 26:
+            if ui_frame == 24:
                 assert page == 'main'
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
-            if ui_frame == 28:
+            if ui_frame == 26:
                 assert page is None
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
 
@@ -921,6 +915,9 @@ def main():
                 screen = pygame.display.set_mode((0, 0) if fullscreen else (1024, 768),
                                                  pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
                 continue
+            if e.type == pygame.KEYDOWN and e.key == pygame.K_F5:
+                reset_now()
+                continue
             if (e.type == pygame.KEYDOWN and e.key in (pygame.K_F1, pygame.K_ESCAPE)) or (e.type == pygame.JOYBUTTONDOWN and e.button == 9):
                 back()
                 continue
@@ -947,7 +944,6 @@ def main():
             n = {
                 'main': len(main_rows),
                 'controls': len(ACTIONS) + 2,
-                'cheats': len(CHEAT_ITEMS) + 3,
                 'video': len(video_rows),
                 'about': 1,
             }[page]
@@ -1033,10 +1029,13 @@ def main():
         use_smooth = cfg['filter'] in ('hd_crisp', 'smooth')
         key = (dw, dh, use_smooth)
         if key != scaled_key:
-            scaled = pygame.Surface((dw, dh)).convert() if use_smooth else pygame.Surface((dw, dh), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
+            scaled = pygame.Surface((dw, dh), 0, 32, (0x00ff0000, 0x0000ff00, 0x000000ff, 0)) if use_smooth else pygame.Surface((dw, dh), 0, 16, (0xf800, 0x07e0, 0x001f, 0))
             scaled_key = key
         if use_smooth:
-            pygame.transform.smoothscale(frame.convert(), (dw, dh), scaled)
+            try:
+                pygame.transform.smoothscale(frame.convert((0x00ff0000, 0x0000ff00, 0x000000ff, 0)), (dw, dh), scaled)
+            except pygame.error:
+                pygame.transform.scale(frame, (dw, dh), scaled)
         else:
             pygame.transform.scale(frame, (dw, dh), scaled)
         screen.blit(scaled, ((w - dw) // 2, (h - dh) // 2))
@@ -1071,12 +1070,11 @@ def main():
             titles = {
                 'main': 'SUNSET RIDERS (COWBOYS) — PAUSED',
                 'controls': 'CONTROLS — SUNSET RIDERS',
-                'cheats': 'CHEAT CODES — SUNSET RIDERS',
-                'video': 'SETTINGS & HD IMAGE QUALITY',
+                'video': 'SETTINGS & TRUE HD IMAGE QUALITY',
                 'about': 'ABOUT',
             }
             text(title, titles[page], x, top)
-            text(small, 'F1 / Esc: back    •    Arrows + Enter / click    •    F11: fullscreen', x, top + 35 * k, (143, 165, 190))
+            text(small, 'F1 / Esc: back    •    F5: Reset Game    •    F11: Fullscreen', x, top + 35 * k, (143, 165, 190))
             start = panel.y + 80 * k
             buttons = []
             if page == 'controls':
@@ -1105,21 +1103,6 @@ def main():
                         pygame.draw.rect(screen, (35, 53, 77), rect, border_radius=6)
                     text(small, label, x, y + 8 * k)
                 footer = ('Press ' + GROUPS[waiting[1]] + ' input now (Esc cancels)' if waiting else 'Choose a column with Left/Right, then Enter or click.')
-            elif page == 'cheats':
-                cheat_rows = [
-                    f"[{'ON ' if (cfg.get('cheats', 0) & bit) else 'OFF'}]  {label}"
-                    for label, bit in CHEAT_ITEMS
-                ] + ['Enable all cheats', 'Disable all cheats', 'Back']
-                rowh = min(46 * k, (ph - 155 * k) / len(cheat_rows))
-                for i, label in enumerate(cheat_rows):
-                    y = start + i * rowh
-                    rect = pygame.Rect(panel.x + 14 * k, y, pw - 28 * k, rowh - 4 * k)
-                    buttons.append((rect, i, None))
-                    if i == selected:
-                        pygame.draw.rect(screen, (35, 69, 92), rect, border_radius=max(3, int(7 * k)))
-                    col = (103, 240, 155) if label.startswith('[ON ') else (230, 237, 248)
-                    text(font, label, x, y + 8 * k, col)
-                footer = 'Toggle any cheat with Enter or mouse click. Changes apply immediately.'
             elif page == 'about':
                 text(font, 'Developed by Ahmed Kamal Elgandy', x, start + 10 * k, (250, 214, 75))
                 y_line = start + 55 * k
@@ -1143,7 +1126,7 @@ def main():
                     if page == 'video' and i == 0:
                         label += '  ' + ('Fill screen (widescreen, no crop)' if cfg['display'] == 'fill' else 'Original 4:3 (no crop)')
                     if page == 'video' and i == 1:
-                        label += '  ' + FILTER_LABELS.get(cfg.get('filter', 'hd_crisp'), 'HD Crisp')
+                        label += '  ' + FILTER_LABELS.get(cfg.get('filter', 'hd_crisp'), 'True HD Crisp')
                     text(font, label, x, y + 8 * k)
                 footer = notice['text'] if page == 'main' else message
             text(small, footer[:110], x, panel.bottom - 32 * k, (99, 216, 232))
@@ -1159,7 +1142,7 @@ def main():
             screen.blit(banner_small.render('Click here or use the gear to download', True, (175, 230, 237)), (banner.x + 14, banner.y + 34))
 
         pygame.display.flip()
-        if ui_test and ui_frame == 19 and os.environ.get('SUNSET_RIDERS_UI_SCREENSHOT'):
+        if ui_test and ui_frame == 15 and os.environ.get('SUNSET_RIDERS_UI_SCREENSHOT'):
             pygame.image.save(screen, os.environ['SUNSET_RIDERS_UI_SCREENSHOT'])
         if page:
             clock.tick(30)
@@ -1167,7 +1150,7 @@ def main():
     completed = save_worker.close()
     core.stop()
     if ui_test:
-        assert completed and (home_dir() / 'autosave.state').is_file(), 'Exit did not save game'
+        assert completed and (home_dir() / 'autosave-v2.state').is_file(), 'Exit did not save game'
     pygame.quit()
 
 
