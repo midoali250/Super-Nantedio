@@ -5,22 +5,22 @@
       "version": "1.0.0",
       "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/the-mask-desktop-v1.0.0",
       "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-Windows-x64.exe",
-      "size": 1,
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      "size": 18713283,
+      "sha256": "ce2fac748aec541a08723052553ff5ae8cd4017757a791839382ff6c1313b969"
     },
     "linux": {
       "version": "1.0.0",
       "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/the-mask-desktop-v1.0.0",
       "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-Linux-x86_64.AppImage",
-      "size": 1,
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      "size": 29067768,
+      "sha256": "1937be77fade605368598489dba28a0917c5699daa8d023f2563fe65fcf8a25a"
     },
     "macos": {
       "version": "1.0.0",
       "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/the-mask-desktop-v1.0.0",
       "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-macOS-arm64.zip",
-      "size": 1,
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      "size": 18506177,
+      "sha256": "e66e7e1815f69541886ed0536e14629ba80eddf35c33c3a792e7482f2a4d0d3d"
     }
   }
 }
