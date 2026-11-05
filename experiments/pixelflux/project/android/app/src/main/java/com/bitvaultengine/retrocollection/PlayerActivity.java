@@ -50,7 +50,7 @@ public final class PlayerActivity extends Activity {
         byte[] bytes;try(InputStream in=getAssets().open("roms/"+sourceId+ext)){bytes=readAll(in,10_000_000);}if(!sha.equals(sha256(bytes)))throw new SecurityException("Game identity mismatch");
         File tmp=new File(getCacheDir(),sha+ext+".tmp");try(FileOutputStream out=new FileOutputStream(tmp)){out.write(bytes);}if(!tmp.renameTo(file))throw new IllegalStateException("Unable to prepare game");return file;}
     private void settings(){if(game==null)return;game.paused=true;
-        String[] options={"Resume","Move controls","Reset control positions","Save stage / position","Load stage / position","Full screen: "+(game.stretch?"stretch":"fit"),"Exit to game list","Cheats","Button mapping","Button size"};
+        String[] options={"Resume","Move controls","Reset control positions","Save stage / position","Load stage / position","Full screen: "+(game.stretch?"stretch":"fit"),"Exit to PixelFlux","Cheats","Button mapping","Button size"};
         new AlertDialog.Builder(this).setTitle("Game settings").setItems(options,(d,which)->{
             if(which==1){game.edit=true;Toast.makeText(this,"Drag the joystick and buttons; tap DONE to save",Toast.LENGTH_LONG).show();}
             else if(which==2){game.resetPositions();game.savePositions();}
@@ -88,13 +88,13 @@ public final class PlayerActivity extends Activity {
           .setNegativeButton("Cancel",(d,w)->done.run()).setOnCancelListener(d->done.run()).show();
     }
     public static void libraryControls(Activity activity,String firstGame){
-        String[] items={"Move joystick and four buttons","Button mapping: classic games","Button mapping: 16-bit games","Button size","Reset control positions","Reset entire app"};
+        String[] items={"Move joystick and four buttons","Button mapping: classic games","Button size","Reset control positions","Reset entire app"};
         new AlertDialog.Builder(activity).setTitle("Controls settings").setItems(items,(d,which)->{
           if(which==0){if(firstGame==null){Toast.makeText(activity,"No games available",Toast.LENGTH_SHORT).show();return;}android.content.Intent intent=new android.content.Intent(activity,PlayerActivity.class);intent.putExtra("game_id",firstGame);intent.putExtra("akg_edit_controls",true);activity.startActivity(intent);}
-          else if(which==1||which==2)showMapping(activity,which==1?"NES":"SNES",()->libraryControls(activity,firstGame));
-          else if(which==3)showSize(activity,()->libraryControls(activity,firstGame));
-          else if(which==4){SharedPreferences.Editor e=activity.getSharedPreferences("controls",MODE_PRIVATE).edit();for(int i=0;i<5;i++){e.remove("x"+i);e.remove("y"+i);}e.apply();Toast.makeText(activity,"Control positions reset",Toast.LENGTH_SHORT).show();}
-          else if(which==5){new AlertDialog.Builder(activity).setTitle("Reset entire app?").setMessage("This permanently deletes ALL local game saves, control mappings, settings and cached files. Bundled games remain. This cannot be undone.").setNegativeButton("Cancel",(dialog,w)->libraryControls(activity,firstGame)).setPositiveButton("Delete all app data",(dialog,w)->{android.app.ActivityManager manager=(android.app.ActivityManager)activity.getSystemService(ACTIVITY_SERVICE);if(manager==null||!manager.clearApplicationUserData())Toast.makeText(activity,"Unable to reset app data",Toast.LENGTH_LONG).show();}).show();}
+          else if(which==1)showMapping(activity,"NES",()->libraryControls(activity,firstGame));
+          else if(which==2)showSize(activity,()->libraryControls(activity,firstGame));
+          else if(which==3){SharedPreferences.Editor e=activity.getSharedPreferences("controls",MODE_PRIVATE).edit();for(int i=0;i<5;i++){e.remove("x"+i);e.remove("y"+i);}e.apply();Toast.makeText(activity,"Control positions reset",Toast.LENGTH_SHORT).show();}
+          else if(which==4){new AlertDialog.Builder(activity).setTitle("Reset entire app?").setMessage("This permanently deletes ALL local game saves, control mappings, settings and cached files. Bundled games remain. This cannot be undone.").setNegativeButton("Cancel",(dialog,w)->libraryControls(activity,firstGame)).setPositiveButton("Delete all app data",(dialog,w)->{android.app.ActivityManager manager=(android.app.ActivityManager)activity.getSystemService(ACTIVITY_SERVICE);if(manager==null||!manager.clearApplicationUserData())Toast.makeText(activity,"Unable to reset app data",Toast.LENGTH_LONG).show();}).show();}
         }).setNegativeButton("Close",null).show();
     }
     private void chooseCheats(){

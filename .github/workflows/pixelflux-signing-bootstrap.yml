@@ -1,0 +1,45 @@
+name: Bootstrap PixelFlux APK signing identity
+on:
+  workflow_dispatch:
+    inputs:
+      repo_key:
+        description: PixelFlux repository public secret encryption key
+        required: true
+      repo_key_id:
+        description: PixelFlux public key ID
+        required: true
+      backup_key:
+        description: Shared engine public secret encryption key
+        required: true
+      backup_key_id:
+        description: Shared engine public key ID
+        required: true
+permissions:
+  contents: read
+jobs:
+  create:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pynacl==1.5.0
+      - name: Generate keystore on GitHub and seal both copies
+        env:
+          MODE: create
+          REPO_KEY: ${{ inputs.repo_key }}
+          REPO_KEY_ID: ${{ inputs.repo_key_id }}
+          BACKUP_KEY: ${{ inputs.backup_key }}
+          BACKUP_KEY_ID: ${{ inputs.backup_key_id }}
+        run: python experiments/pixelflux/project/scripts/bootstrap_apk_signing.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixelflux-sealed-android-signing
+          path: encrypted-apk-signing.json
+          if-no-files-found: error
+          retention-days: 3
