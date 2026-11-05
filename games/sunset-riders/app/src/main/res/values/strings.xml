@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">رعاة البقر</string>
+    <string name="update_manifest_url">https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/games/sunset-riders.json</string>
+</resources>
