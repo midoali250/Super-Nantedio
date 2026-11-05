@@ -32,6 +32,22 @@ class Tests(unittest.TestCase):
   raw=bytearray(self.env(self.m));raw[-3]^=1
   with patch('urllib.request.build_opener',return_value=Opener(bytes(raw))):
    with self.assertRaises(UpdateError):u.check('windows',self.root,2)
+ def test_three_independent_platform_repositories(self):
+  for platform,extension in [('windows','.exe'),('linux','.AppImage'),('macos','.zip')]:
+   key={'algorithm':'Ed25519','platform':platform,'public_key_base64':base64.b64encode(self.pub).decode()}
+   (self.root/'updates/public-key.json').write_text(json.dumps(key))
+   manifest=dict(self.m,platform=platform,url='https://github.com/midoali250/akg-retro-games-'+platform+'/releases/download/v3/game'+extension)
+   class Recording(Opener):
+    requested=''
+    def open(self,request,*args,**kwargs):
+     self.requested=request.full_url;return super().open(request,*args,**kwargs)
+   response=Recording(self.env(manifest))
+   with patch('urllib.request.build_opener',return_value=response):self.assertEqual(u.check(platform,self.root)['platform'],platform)
+   self.assertIn('/akg-retro-games-'+platform+'/releases/latest/download/',response.requested)
+ def test_no_published_manifest_is_no_update(self):
+  class Missing:
+   def open(self,*args,**kwargs):raise urllib.error.HTTPError('https://github.com',404,'Not Found',{},None)
+  with patch('urllib.request.build_opener',return_value=Missing()):self.assertIsNone(u.check('windows',self.root))
  def test_user_requested_verified_download(self):
   with patch('urllib.request.build_opener',return_value=Opener(self.data)):
    dest=u.download('windows',self.m,self.root/'downloads');self.assertEqual(dest.read_bytes(),self.data)
