@@ -6,6 +6,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.os.Build;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
@@ -16,7 +17,7 @@ import android.view.SurfaceView;
  * switch to 4:3 pillarboxed mode.
  */
 final class GameView extends SurfaceView implements SurfaceHolder.Callback {
-    private final Paint paint = new Paint();
+    private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
     private final Paint clear = new Paint();
     private final Rect dst = new Rect();
     private volatile int viewWidth, viewHeight;
@@ -30,8 +31,9 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
         super(context);
         getHolder().addCallback(this);
         setFocusable(false);
-        paint.setFilterBitmap(false);
-        paint.setAntiAlias(false);
+        paint.setFilterBitmap(true);
+        paint.setAntiAlias(true);
+        paint.setDither(false);
         clear.setColor(Color.BLACK);
     }
 
@@ -56,7 +58,16 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
         if (holder == null || bitmap == null) return;
         Canvas canvas = null;
         try {
-            canvas = holder.lockCanvas();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                try {
+                    canvas = holder.lockHardwareCanvas();
+                } catch (Throwable ignored) {
+                    canvas = null;
+                }
+            }
+            if (canvas == null) {
+                canvas = holder.lockCanvas();
+            }
             if (canvas == null) return;
             int w = canvas.getWidth();
             int h = canvas.getHeight();
@@ -64,7 +75,9 @@ final class GameView extends SurfaceView implements SurfaceHolder.Callback {
             viewHeight = h;
             int[] r = ScreenMap.displayRect(w, h, stretch);
             dst.set(r[0], r[1], r[0] + r[2], r[1] + r[3]);
-            canvas.drawRect(0, 0, w, h, clear);
+            if (!stretch) {
+                canvas.drawRect(0, 0, w, h, clear);
+            }
             canvas.drawBitmap(bitmap, null, dst, paint);
         } catch (IllegalArgumentException ignored) {
             /* surface went away mid-frame */

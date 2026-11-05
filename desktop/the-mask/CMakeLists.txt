@@ -86,5 +86,5 @@ target_include_directories(snesapp_host PRIVATE
   ${CORE} ${CORE}/src ${CORE}/libretro ${COMM}/include ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_definitions(snesapp_host PRIVATE __LIBRETRO__ DINLINE=inline)
-target_compile_options(snesapp_host PRIVATE -O2 -DPATH_MAX=1024 -w)
+target_compile_options(snesapp_host PRIVATE -O3 -funroll-loops -DPATH_MAX=1024 -w)
 target_link_libraries(snesapp_host m)
