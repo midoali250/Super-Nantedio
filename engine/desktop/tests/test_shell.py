@@ -18,6 +18,11 @@ class DesktopShellTests(unittest.TestCase):
     launcher.render(self.screen,[{'id':'test','title':'Test Title','system':'NES'}],'ALL','',0,set(),'',False,True,'FIT')
     self.assertIsNotNone(launcher.thumbnail('test'))
    finally:launcher.ROOT=old;launcher.THUMB_CACHE.clear()
+ def test_about_button_and_text(self):
+  self.assertTrue(launcher.about_button_hit(1100,415))
+  self.assertFalse(launcher.about_button_hit(990,415))
+  self.assertIn('Ahmed Kamal Elgandy',launcher.ABOUT_TEXT)
+  self.assertIn('original production companies.',launcher.ABOUT_TEXT)
  def test_scroll_boundaries(self):
   self.assertEqual(launcher.scroll_selection(0,-1,97),3)
   self.assertEqual(launcher.scroll_selection(0,1,97),0)
