@@ -81,7 +81,7 @@ public final class PlayerActivity extends Activity {
                     if(request==1){request=0;byte[] saved=NativeBridge.save();if(saved==null)throw new IllegalStateException("Save unavailable");File file=new File(getFilesDir(),sha+".state"),tmp=new File(getFilesDir(),sha+".state.tmp");try(FileOutputStream out=new FileOutputStream(tmp)){out.write(saved);out.getFD().sync();}if(!tmp.renameTo(file))throw new IllegalStateException("Save failed");runOnUiThread(()->Toast.makeText(PlayerActivity.this,"State saved",Toast.LENGTH_SHORT).show());}
                     if(request==2){request=0;byte[] saved;try(FileInputStream in=new FileInputStream(new File(getFilesDir(),sha+".state"))){saved=readAll(in,100_000_000);}if(!NativeBridge.restore(saved))throw new IllegalStateException("Load failed");runOnUiThread(()->Toast.makeText(PlayerActivity.this,"State loaded",Toast.LENGTH_SHORT).show());}
                     }catch(Exception stateError){request=0;runOnUiThread(()->Toast.makeText(PlayerActivity.this,"Save/load failed: "+stateError.getMessage(),Toast.LENGTH_LONG).show());}
-                    if(smoke&&frames>=120){byte[] s=NativeBridge.save();if(!sawVideo||!sawAudio||s==null||!NativeBridge.restore(s))throw new IllegalStateException("Smoke failed");Log.i("AKG_ANDROID_SMOKE","PASS "+system+" video audio state input");alive=false;runOnUiThread(()->finish());}
+                    if(smoke&&frames>=600){byte[] s=NativeBridge.save();if(!sawVideo||!sawAudio||s==null||!NativeBridge.restore(s))throw new IllegalStateException("Smoke failed");Log.i("AKG_ANDROID_SMOKE","PASS "+system+" video audio state input");alive=false;runOnUiThread(()->finish());}
                 }
                 Canvas canvas=null;try{canvas=getHolder().lockCanvas();if(canvas!=null)drawFrame(canvas,bitmap);}finally{if(canvas!=null)getHolder().unlockCanvasAndPost(canvas);}
                 long wait=delay-(android.os.SystemClock.uptimeMillis()-started);if(wait>0)android.os.SystemClock.sleep(wait);
@@ -99,6 +99,6 @@ public final class PlayerActivity extends Activity {
             int mask=0;for(int i=0;i<e.getPointerCount();i++){if((a==MotionEvent.ACTION_UP||a==MotionEvent.ACTION_POINTER_UP)&&i==index)continue;float tx=e.getX(i)/w,ty=e.getY(i)/h;float dx=(tx-px[0])*w,dy=(ty-py[0])*h,rad=Math.min(w,h)*.17f;if(e.getPointerId(i)==stickPointer){if(dx<-rad*.22)mask|=1<<6;if(dx>rad*.22)mask|=1<<7;if(dy<-rad*.22)mask|=1<<4;if(dy>rad*.22)mask|=1<<5;}
                 for(int k=1;k<5;k++){dx=(tx-px[k])*w;dy=(ty-py[k])*h;float r=Math.min(w,h)*.075f;if(dx*dx+dy*dy<r*r)mask|=1<<ids[k];}
                 if(ty>.86f&&tx>.32f&&tx<.48f)mask|=1<<2;if(ty>.86f&&tx>.50f&&tx<.66f)mask|=1<<3;}
-            if((a==MotionEvent.ACTION_UP||a==MotionEvent.ACTION_POINTER_UP)&&e.getPointerId(index)==stickPointer)stickPointer=-1;if(a==MotionEvent.ACTION_CANCEL){mask=0;stickPointer=-1;}buttons=mask;return true;}
+            if((a==MotionEvent.ACTION_UP||a==MotionEvent.ACTION_POINTER_UP)&&e.getPointerId(index)==stickPointer)stickPointer=-1;if(a==MotionEvent.ACTION_CANCEL){mask=0;stickPointer=-1;}buttons=mask;if(smoke&&mask!=0)Log.i("AKG_ANDROID_TOUCH","mask="+mask);return true;}
     }
 }
