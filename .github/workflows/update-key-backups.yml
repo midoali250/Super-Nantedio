@@ -41,3 +41,25 @@ jobs:
           message=b'AKG verified backup';key.verify_key.verify(message,key.sign(message).signature)
           print('PASS signing-key backup matches public verification key for',system)
           PY
+  android_apk_backup:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: midoali250/akg-retro-games-android
+          ref: f7821c5cc74d54937776ecfc950a833775260995
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install PyNaCl==1.5.0
+      - name: Verify Android APK signing backup certificate
+        env:
+          SIGNING_JSON: ${{ secrets.AKG_ANDROID_RELEASE_SIGNING_BACKUP }}
+          MODE: verify
+        run: |
+          export EXPECTED_FINGERPRINT="$(python -c 'import json,urllib.request;print(json.load(urllib.request.urlopen("https://raw.githubusercontent.com/midoali250/akg-retro-games-android/main/updates/android-apk-signing-certificate.json"))["certificate_sha256"])')"
+          python scripts/bootstrap_apk_signing.py
