@@ -1,0 +1,169 @@
+name: Build and test PixelFlux on BitVault Engine
+on:
+  push:
+    branches: [experiment/pixelflux-rom-audit]
+    paths: ['experiments/pixelflux/project/**', '.github/workflows/pixelflux-build.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      PROJECT: experiments/pixelflux/project
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - name: Install Android native build tools
+        run: sdkmanager 'ndk;27.2.12479018' 'cmake;3.22.1' 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Prepare exact cartridge and icon
+        run: |
+          python -m pip install pillow==11.1.0
+          python "$PROJECT/scripts/prepare_rom.py"
+          python "$PROJECT/scripts/make_icons.py"
+      - name: Build core from BitVault registry
+        run: |
+          ln -s "$GITHUB_WORKSPACE" "$PROJECT/android/engine-source"
+          cd "$PROJECT/android"
+          python ../scripts/build_android_cores.py
+      - name: Package PixelFlux Android debug APK
+        run: |
+          cd "$PROJECT/android"
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon
+      - name: Check APK contains no updater and exactly the intended game
+        run: |
+          APK=$(find "$PROJECT/android/app/build/outputs/apk/debug" -name '*.apk' -type f -print -quit)
+          unzip -l "$APK" | grep 'assets/roms/111kGbhhbliijXvVSg0gkwB2XYOwHdaPL.nes'
+          ! unzip -l "$APK" | grep -E 'assets/updates/|UpdateClient|UpdateSecurity'
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Exercise Android multicart and controls
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: cd experiments/pixelflux/project && bash scripts/android_smoke.sh
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+          - os: windows-latest
+            platform: windows
+          - os: macos-15
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      PROJECT: experiments/pixelflux/project
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: msys2/setup-msys2@v2
+        if: matrix.platform == 'windows'
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            git
+            mingw-w64-x86_64-gcc
+      - name: Build Windows NES core
+        if: matrix.platform == 'windows'
+        shell: msys2 {0}
+        run: cd "$PROJECT" && bash scripts/build_desktop_core.sh win
+      - name: Build Unix NES core
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          cd "$PROJECT"
+          if [ '${{ matrix.platform }}' = 'linux' ];then bash scripts/build_desktop_core.sh unix;else bash scripts/build_desktop_core.sh osx;fi
+      - name: Install dependencies and prepare exact game
+        shell: bash
+        run: |
+          python -m pip install pygame==2.6.1 pyinstaller==6.11.1 pillow==11.1.0 setuptools==70.3.0
+          python "$PROJECT/scripts/prepare_rom.py"
+          python "$PROJECT/scripts/make_icons.py"
+      - name: Package Windows application
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          cd "$PROJECT"
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name PixelFlux --icon desktop/assets/icon.ico --add-data 'desktop/assets;assets' --add-data 'roms;roms' --add-data 'package-cores;cores' --add-data 'third-party-notices;third-party-notices' desktop/launcher.py
+      - name: Package Linux application
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          cd "$PROJECT"
+          python -m PyInstaller --noconfirm --clean --onedir --contents-directory . --name PixelFlux --add-data 'desktop/assets:assets' --add-data 'roms:roms' --add-data 'package-cores:cores' --add-data 'third-party-notices:third-party-notices' desktop/launcher.py
+      - name: Package macOS application
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          cd "$PROJECT"
+          python -m PyInstaller --noconfirm --clean --windowed --name PixelFlux --icon desktop/assets/icon.icns --add-data 'desktop/assets:assets' --add-data 'roms:roms' --add-data 'package-cores:cores' --add-data 'third-party-notices:third-party-notices' desktop/launcher.py
+      - name: Test packaged Windows application
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $app=Join-Path $env:PROJECT 'dist/PixelFlux.exe'
+          foreach ($argsLine in @('--smoke','--smoke --ci-game','--smoke --ci-controls')) {
+            $proc=Start-Process -Wait -PassThru -FilePath $app -ArgumentList $argsLine
+            if ($proc.ExitCode -ne 0) { exit $proc.ExitCode }
+          }
+      - name: Test packaged Linux and macOS application
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          cd "$PROJECT"
+          if [ '${{ matrix.platform }}' = 'linux' ];then APP=dist/PixelFlux/PixelFlux;else APP=dist/PixelFlux.app/Contents/MacOS/PixelFlux;fi
+          "$APP" --smoke --screenshot pixelflux-home.png
+          "$APP" --smoke --ci-game
+          "$APP" --smoke --ci-controls
+      - uses: actions/upload-artifact@v4
+        if: matrix.platform == 'linux'
+        with:
+          name: pixelflux-light-interface
+          path: experiments/pixelflux/project/pixelflux-home.png
+          if-no-files-found: error
+          retention-days: 7
+      - name: Package portable Linux AppImage
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          cd "$PROJECT"
+          mkdir -p AppDir/usr/bin
+          cp -a dist/PixelFlux/. AppDir/usr/bin/
+          cp desktop/assets/icon.png AppDir/pixelflux.png
+          printf '[Desktop Entry]\nType=Application\nName=PixelFlux\nExec=PixelFlux\nIcon=pixelflux\nCategories=Game;Emulator;\nTerminal=false\n' > AppDir/pixelflux.desktop
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/PixelFlux" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          echo '62aebc77c2149e96b593b94da9bbd1881e0984a56399ff6d7a03b7ddd7c9ce68  appimagetool' | sha256sum -c -
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir PixelFlux-Linux-x86_64.AppImage
+      - name: Package macOS ZIP
+        if: matrix.platform == 'macos'
+        run: cd "$PROJECT" && ditto -c -k --sequesterRsrc --keepParent dist/PixelFlux.app PixelFlux-macOS-Apple-Silicon.zip
