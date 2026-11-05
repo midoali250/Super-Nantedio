@@ -1,4 +1,4 @@
-import os,tempfile,unittest
+import os,sys,tempfile,unittest,json
 from pathlib import Path
 from unittest.mock import patch
 os.environ['SDL_VIDEODRIVER']='dummy';os.environ['SDL_AUDIODRIVER']='dummy'
@@ -40,6 +40,17 @@ class ControlsTests(unittest.TestCase):
   c=controls.sanitize_controls({'keyboard':{'8':pygame.K_ESCAPE,'0':pygame.K_b},'gamepads':{'test-guid':{'8':{'type':'button','index':6},'0':{'type':'button','index':-1}}}})
   self.assertNotIn('8',c['keyboard']);self.assertEqual(c['keyboard']['0'],pygame.K_b);self.assertNotIn('0',c['gamepads']['test-guid'])
   self.assertTrue(controls.binding_active(Pad(),c['gamepads']['test-guid']['8']))
+ def test_reset_confirmation_cancel_and_confirm_through_main_settings(self):
+  import launcher
+  with tempfile.TemporaryDirectory() as d:
+   base=Path(d);root=base/'resources';(root/'assets').mkdir(parents=True);(root/'drive-index.json').write_text(json.dumps({'files':[],'excluded_ids':[]}));icon=pygame.Surface((8,8));pygame.image.save(icon,root/'assets/app-icon.png')
+   data=base/'.retro-collection';(data/'manual-saves').mkdir(parents=True);saved=data/'manual-saves'/'test.state';saved.write_text('keep until confirmed')
+   def run(keys):
+    events=[pygame.event.Event(pygame.KEYDOWN,key=k,unicode='') for k in keys]
+    with patch.object(launcher,'ROOT',root),patch('pathlib.Path.home',return_value=base),patch.object(sys,'argv',['launcher.py','--smoke']),patch('pygame.event.get',return_value=events),patch.object(launcher,'scan_gamepads',return_value=[]):
+     launcher.BACKGROUND_CACHE.clear();launcher.main()
+   run([pygame.K_g,pygame.K_r,pygame.K_n]);self.assertTrue(saved.exists())
+   run([pygame.K_g,pygame.K_r,pygame.K_y]);self.assertFalse(data.exists())
  def test_factory_reset_only_deletes_app_directory_and_all_saves(self):
   with tempfile.TemporaryDirectory() as d:
    base=Path(d);root=base/'.retro-collection';(root/'manual-saves').mkdir(parents=True);(root/'manual-saves'/'test.state').write_text('save');(root/'controls.json').write_text('mapping');(root/'preferences.json').write_text('favorite');outside=base/'keep.txt';outside.write_text('untouched')
