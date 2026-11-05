@@ -13,15 +13,18 @@ print('ROM SIZE',len(raw),'SHA256',result['sha256'],'MAPPER',mapper,flush=True)
 pygame.init();pygame.display.set_mode((640,480))
 with LibretroHost('core/fceumm_libretro.so',rom) as host:
  result['core']=host.system_name;result['fps']=host.fps;result['audio_rate']=host.sample_rate
- for frame in range(1800):
-  host.buttons={3} if 1200<=frame<1204 else set()
+ for frame in range(2700):
+  host.buttons=set()
+  if 1200<=frame<1204 or 1800<=frame<1804:host.buttons.add(3)
+  if 2300<=frame<2450:host.buttons.add(7)
+  if 2400<=frame<2408:host.buttons.add(8)
   host.run_frame();host.drain_audio()
-  if frame in (59,299,899,1199,1499,1799):
+  if frame in (59,299,899,1199,1499,1799,2099,2299,2399,2499,2699):
    image=frame_surface(host)
    if image:
     dest=out/('frame-%04d.png'%(frame+1));pygame.image.save(image,dest);result['screens'].append(str(dest));print('SCREEN',dest,host.width,host.height,flush=True)
  result['frames']=host.frames;result['audio_samples']=host.audio_samples
  if not result['screens'] or host.audio_samples==0:raise RuntimeError('Core did not produce video and audio')
  (out/'audit.json').write_text(json.dumps(result,indent=2)+'\n')
- print('PASS ROM launched with video, audio and scripted Start after menu; see screenshots',flush=True)
+ print('PASS ROM launched with video, audio and scripted Start twice and gameplay controls; see screenshots',flush=True)
 pygame.quit()
