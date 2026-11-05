@@ -130,7 +130,7 @@ def main():
    text('PixelFlux',55,155,(35,62,72),big);text('ONE CARTRIDGE',56,204,(91,137,131),small);text('A WORLD OF GAMES',56,224,(91,137,131),small)
    for y,label in [(260,'SETTINGS  [G]'),(332,'ABOUT  [I]'),(404,'EXIT')]:
     pygame.draw.rect(screen,(255,255,255),R(55,y,215,55),border_radius=10);pygame.draw.rect(screen,(184,220,208),R(55,y,215,55),width=2,border_radius=10);text(label,69,y+16)
-   text('ARROWS + ENTER',56,510,(91,137,131),small);text('F5 SAVE / F8 LOAD',56,535,(91,137,131),small)
+   text('R SHIFT: SELECT',56,492,(91,137,131),small);text('ENTER: START',56,514,(91,137,131),small);text('ARROWS: MOVE',56,536,(91,137,131),small);text('F5 SAVE / F8 LOAD',56,558,(91,137,131),small)
    if time.monotonic()<until:text(status,330,675,(107,137,127),small)
    if page=='settings':
     pygame.draw.rect(screen,(231,246,242),R(250,150,780,420),border_radius=18);text('SETTINGS',285,170,(41,116,112),big)

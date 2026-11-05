@@ -33,6 +33,8 @@ adb('shell','uiautomator','dump','/sdcard/pixel-final-ui.xml');xml=adb('exec-out
 if re.search(r'text="[^"]*\bPlay\b',xml,re.I):raise RuntimeError('Unexpected Play button on home screen')
 tap(find('Reset'));find('Reset entire app?');tap(find('Cancel'));tap(find('About'));find('About PixelFlux');tap(find('Close'))
 time.sleep(2);first=Image.open(BytesIO(adb('exec-out','screencap','-p'))).convert('RGB')
+green=sum(1 for r,g,b in first.crop((300,0,1280,640)).getdata() if g>100 and g>r*1.3 and g>b*1.2)
+if green<100:raise RuntimeError('Live green multicart menu not visible inside home screen')
 # The native surface occupies the right 77 percent of the landscape screen.
 adb('shell','input','swipe','860','595','860','595','250');time.sleep(2)
 second=Image.open(BytesIO(adb('exec-out','screencap','-p'))).convert('RGB')
