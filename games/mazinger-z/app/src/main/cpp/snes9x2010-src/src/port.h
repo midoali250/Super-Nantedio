@@ -201,7 +201,7 @@
 #define snprintf _snprintf
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
-#elif defined(__unix__) || defined(__APPLE__) || defined(__HAIKU__)
+#elif defined(__unix__) || defined(__APPLE__) || defined(__HAIKU__) || defined(__MINGW32__)
 /* POSIX puts strcasecmp/strncasecmp in <strings.h>.  <string.h> also
  * declares them, but only for a profile that asks for the BSD or
  * POSIX.1-2008 set, so a build passing -D_XOPEN_SOURCE=600 (the

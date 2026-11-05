@@ -134,3 +134,15 @@ python3 tools/host/test_boot.py
 لو احتجت توزيع تجاري، بدّل النواة بـ bsnes (GPLv3) — جسر JNI بيتكلم مع
 واجهة libretro بس، فما فيوش حاجة تانية هتتغير.
 
+
+
+## The Mask (SNES) للأندرويد وسطح المكتب (Windows / Linux / macOS)
+
+[مشروع الأندرويد](games/the-mask/) — [مشروع سطح المكتب](desktop/the-mask/)
+
+| النظام | الحزمة | ملف بصمة التحديثات | أرشيف الإصدارات |
+| --- | --- | --- | --- |
+| **Android APK** | [The-Mask-SNES-1.0.apk](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-v1.0/The-Mask-SNES-1.0.apk) | [`updates/games/the-mask.json`](updates/games/the-mask.json) | [`RELEASE-ARCHIVE/Android/The-Mask/1.0/`](RELEASE-ARCHIVE/Android/The-Mask/) |
+| **Windows x64 Portable EXE** | [The-Mask-Windows-x64.exe](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-Windows-x64.exe) | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/Windows/The-Mask/1.0.0/`](RELEASE-ARCHIVE/Windows/The-Mask/) |
+| **Linux x86_64 AppImage** | [The-Mask-Linux-x86_64.AppImage](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-Linux-x86_64.AppImage) | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/Linux/The-Mask/1.0.0/`](RELEASE-ARCHIVE/Linux/The-Mask/) |
+| **macOS Apple Silicon (App ZIP)** | [The-Mask-macOS-arm64.zip](https://github.com/midoali250/bitvault-engine/releases/download/the-mask-desktop-v1.0.0/The-Mask-macOS-arm64.zip) | [`updates/desktop/the-mask.json`](updates/desktop/the-mask.json) | [`RELEASE-ARCHIVE/macOS/The-Mask/1.0.0/`](RELEASE-ARCHIVE/macOS/The-Mask/) |

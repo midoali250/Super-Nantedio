@@ -17,6 +17,8 @@
 | ماريو + داك هانت | [`games/nes-mario-duckhunt.json`](games/nes-mario-duckhunt.json) | `com.midoali.nes` |
 | ماريو الأصلية (World) | [`games/super-mario-world.json`](games/super-mario-world.json) | `com.midoali.supermarioworld` |
 | مازينجر Z (SNES) | [`games/mazinger-z.json`](games/mazinger-z.json) | `com.midoali.snes.mazingerz` |
+| القناع — The Mask (SNES) | [`games/the-mask.json`](games/the-mask.json) | `com.midoali.snes.themask` |
+| القناع — The Mask لسطح المكتب (Windows / Linux / macOS) | [`desktop/the-mask.json`](desktop/the-mask.json) | `the-mask-desktop` |
 
 الرابط الثابت الذي سيقرأه عميل اللعبة مستقبلًا:
 `https://raw.githubusercontent.com/midoali250/bitvault-engine/main/updates/games/nes-mario-duckhunt.json`
