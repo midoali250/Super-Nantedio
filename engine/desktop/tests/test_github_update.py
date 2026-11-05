@@ -17,14 +17,14 @@ class Opener:
 class Tests(unittest.TestCase):
  def setUp(self):
   self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name);(self.root/'updates').mkdir();self.k=Ed25519PrivateKey.generate();self.pub=self.k.public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)
-  (self.root/'updates/public-key.json').write_text(json.dumps({'algorithm':'Ed25519','platform':'windows','public_key_base64':base64.b64encode(self.pub).decode()}));self.data=b'signed update'
+  (self.root/'updates/version.json').write_text(json.dumps({'version_code':2}));(self.root/'updates/public-key.json').write_text(json.dumps({'algorithm':'Ed25519','platform':'windows','public_key_base64':base64.b64encode(self.pub).decode()}));self.data=b'signed update'
   self.m={'schema_version':1,'product':'akg-retro-games','platform':'windows','version_code':3,'size_bytes':len(self.data),'sha256':hashlib.sha256(self.data).hexdigest(),'url':'https://github.com/midoali250/akg-retro-games-windows/releases/download/v3/game.exe'}
  def tearDown(self):self.temp.cleanup()
  def env(self,manifest):
   raw=json.dumps(manifest,separators=(',',':')).encode();return json.dumps({'payload':base64.b64encode(raw).decode(),'signature':base64.b64encode(self.k.sign(raw)).decode()}).encode()
  def test_signed_update_and_version(self):
   with patch('urllib.request.build_opener',return_value=Opener(self.env(self.m))):
-   self.assertEqual(u.check('windows',self.root,2)['version_code'],3);self.assertIsNone(u.check('windows',self.root,3))
+   self.assertEqual(u.check('windows',self.root)['version_code'],3);self.assertIsNone(u.check('windows',self.root,3))
  def test_reject_wrong_repository_and_tampering(self):
   m=dict(self.m,url='https://github.com/attacker/game/releases/download/v3/game.exe')
   with patch('urllib.request.build_opener',return_value=Opener(self.env(m))):
