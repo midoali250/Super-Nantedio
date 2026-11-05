@@ -47,8 +47,8 @@ def main():
         "required": False,
     }
     (ROOT / "updates/games/the-mask.json").write_text(
-        json.dumps(android_manifest, ensure_ascii=False, indent=2) + "
-", encoding="utf-8"
+        json.dumps(android_manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
 
     desktop_manifest = {
@@ -78,8 +78,8 @@ def main():
         },
     }
     (ROOT / "updates/desktop/the-mask.json").write_text(
-        json.dumps(desktop_manifest, indent=2) + "
-", encoding="utf-8"
+        json.dumps(desktop_manifest, indent=2) + "\n",
+        encoding="utf-8",
     )
 
     archives = [
@@ -94,8 +94,9 @@ def main():
         shutil.copy2(src, dest_dir / src.name)
         if src.suffix == ".AppImage":
             (dest_dir / src.name).chmod(0o755)
-        (dest_dir / "SHA256SUMS.txt").write_text(f"{sha}  {src.name}  ({sz} bytes)
-", encoding="utf-8")
+        (dest_dir / "SHA256SUMS.txt").write_text(
+            f"{sha}  {src.name}  ({sz} bytes)\n", encoding="utf-8"
+        )
         print(f"Archived {os_name}: {src.name} ({sz} bytes, sha256={sha})")
 
 

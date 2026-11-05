@@ -7,10 +7,10 @@
   "version_name": "1.0",
   "min_android_sdk": 26,
   "apk_url": "https://github.com/midoali250/bitvault-engine/releases/download/the-mask-v1.0/The-Mask-SNES-1.0.apk",
-  "apk_sha256": "8a51d71b3e5a2280150d6d01b2f522e28b144997323ca9028c9ec9def84c4b96",
+  "apk_sha256": "bf9901b2a12fd9f07f62127b58afcdecf32c6f77727a047f1bb9617e4d5b6ec3",
   "apk_size_bytes": 7588910,
   "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/the-mask-v1.0",
-  "published_at": "2026-11-05T08:48:00Z",
+  "published_at": "2026-11-05T09:04:21Z",
   "release_notes_ar": "الإصدار الأول 1.0 للعبة The Mask (SNES) على أندرويد مع أيقونة مخصصة ودعم مركز تحديثات BitVaultEngine.",
   "required": false
 }
