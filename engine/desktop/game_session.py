@@ -65,7 +65,9 @@ def run_session(screen, core_path, rom_path, state_dir, max_frames=None, test_ma
                     try:j=pygame.joystick.Joystick(e.device_index);j.init();joysticks.append(j)
                     except pygame.error:pass
                 if e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
-                    if e.pos[0]>=screen.get_width()-75 and e.pos[1]<75:menu=not menu
+                    gear_size=max(42,int(screen.get_height()*.065))
+                    gear_hit=pygame.Rect(screen.get_width()-gear_size-10,10,gear_size,gear_size)
+                    if gear_hit.collidepoint(e.pos):menu=not menu
                     elif menu:
                         sw,sh=screen.get_size();x,y=e.pos[0]*1280/sw,e.pos[1]*720/sh
                         if 360<=x<=920 and 250<=y<=300:display_mode='STRETCH' if display_mode=='FIT' else 'FIT'
