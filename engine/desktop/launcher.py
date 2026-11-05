@@ -58,12 +58,14 @@ def render(screen, games, category, query, chosen, favorites, status, about=Fals
         n=index-page*6;x=250+(n%3)*240;y=200+(n//3)*194;box=rect(x,y,218,172)
         pygame.draw.rect(screen,(16,29,52),box,border_radius=12)
         if index==chosen:
-            # Soft cyan neon halo plus a crisp high-contrast focus border.
-            glow=pygame.Surface((w,h),pygame.SRCALPHA)
+            # Bounded glow surface avoids allocating a full 4K overlay per card.
+            spread=max(3,int(14*min(sx,sy)))
+            glow=pygame.Surface((box.width+spread*2,box.height+spread*2),pygame.SRCALPHA)
+            basebox=pygame.Rect(spread,spread,box.width,box.height)
             for pad,alpha in [(12,18),(8,28),(4,50)]:
-                spread=max(1,int(pad*min(sx,sy)))
-                pygame.draw.rect(glow,(25,195,255,alpha),box.inflate(spread*2,spread*2),width=max(2,int(3*min(sx,sy))),border_radius=max(5,int(15*min(sx,sy))))
-            screen.blit(glow,(0,0))
+                margin=max(1,int(pad*min(sx,sy)))
+                pygame.draw.rect(glow,(25,195,255,alpha),basebox.inflate(margin*2,margin*2),width=max(2,int(3*min(sx,sy))),border_radius=max(5,int(15*min(sx,sy))))
+            screen.blit(glow,(box.x-spread,box.y-spread))
         pygame.draw.rect(screen,(86,230,255) if index==chosen else (80,108,145),box,width=max(1,int(3*min(sx,sy))),border_radius=max(5,int(12*min(sx,sy))))
         banner=rect(x+8,y+8,202,95);colors=[(35,80,101),(42,60,110),(65,51,106),(35,76,80),(56,57,99),(48,63,92)];pygame.draw.rect(screen,colors[index%len(colors)],banner,border_radius=8)
         img=thumbnail(g['id'])
