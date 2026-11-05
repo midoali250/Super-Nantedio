@@ -1,5 +1,5 @@
 """Experimental software-video/PCM game loop for the desktop prototype."""
-import os,time
+import os,time,math
 from pathlib import Path
 import pygame
 from libretro_host import LibretroHost
@@ -104,7 +104,11 @@ def run_session(screen, core_path, rom_path, state_dir, max_frames=None, test_ma
             # In-game gear is clickable; G opens the same menu.
             size=max(42,int(screen.get_height()*.065));gear=pygame.Rect(screen.get_width()-size-10,10,size,size)
             pygame.draw.rect(screen,(22,44,70),gear,border_radius=8)
-            f=pygame.font.SysFont('dejavusans',max(20,size//2));screen.blit(f.render('G',True,(230,245,255)),(gear.x+size//3,gear.y+size//5))
+            cx,cy=gear.center;radius=max(8,size//4)
+            for k in range(8):
+                a=k*math.pi/4
+                pygame.draw.line(screen,(230,245,255),(round(cx+math.cos(a)*radius*.7),round(cy+math.sin(a)*radius*.7)),(round(cx+math.cos(a)*radius*1.3),round(cy+math.sin(a)*radius*1.3)),max(2,size//12))
+            pygame.draw.circle(screen,(230,245,255),(cx,cy),radius,max(2,size//12))
             if menu:
                 sw,sh=screen.get_size();scale=min(sw/1280,sh/720)
                 shade=pygame.Surface((sw,sh),pygame.SRCALPHA);shade.fill((0,0,0,190));screen.blit(shade,(0,0))
