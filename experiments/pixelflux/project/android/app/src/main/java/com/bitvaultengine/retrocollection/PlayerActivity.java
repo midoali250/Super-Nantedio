@@ -19,6 +19,12 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.widget.Toast;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.File;
@@ -40,8 +46,26 @@ public final class PlayerActivity extends Activity {
         try{byte[] data;try(InputStream in=getAssets().open("cheats/index.json")){data=readAll(in,5_000_000);}JSONArray games=new JSONObject(new String(data,StandardCharsets.UTF_8)).getJSONArray("games");
             for(int i=0;i<games.length();i++){JSONObject r=games.getJSONObject(i);if(sourceId.equals(r.getString("source_id"))){sha=r.getString("rom_sha256");system=r.getString("system");JSONArray cheats=r.optJSONArray("verified_cheats");if(cheats!=null){for(int j=0;j<cheats.length();j++){JSONObject c=cheats.getJSONObject(j);String code=c.optString("code","");if(c.optBoolean("verified",false)&&sha.equals(c.optString("rom_sha256"))&&code.matches("[A-Za-z0-9+:-]{1,128}")){cheatNames.add(c.optString("name","Cheat"));cheatCodes.add(code);}}}break;}}
             if(sha==null||!sha.matches("[a-f0-9]{64}")||!("NES".equals(system)||"SNES".equals(system)))throw new IllegalArgumentException("Unknown game");
-            game=new GameView();game.edit=layoutOnly;setContentView(game);if(layoutOnly)Toast.makeText(this,"Drag the joystick and all four buttons, then tap DONE",Toast.LENGTH_LONG).show();
+            game=new GameView();game.edit=layoutOnly;if(smoke||layoutOnly)setContentView(game);else showEmbeddedHome();if(layoutOnly)Toast.makeText(this,"Drag the joystick and all four buttons, then tap DONE",Toast.LENGTH_LONG).show();
         }catch(Exception e){Log.e("AKG_ANDROID","Catalog error",e);Toast.makeText(this,"Game catalog unavailable",Toast.LENGTH_LONG).show();finish();}
+    }
+    private int dp(int n){return Math.round(n*getResources().getDisplayMetrics().density);}
+    private Button sideButton(String text){Button b=new Button(this);b.setText(text);b.setAllCaps(false);b.setTextSize(14);b.setTextColor(Color.rgb(43,78,80));GradientDrawable d=new GradientDrawable();d.setColor(Color.WHITE);d.setCornerRadius(dp(8));d.setStroke(dp(1),Color.rgb(170,213,200));b.setBackground(d);return b;}
+    private void resetApp(){
+        game.paused=true;
+        new AlertDialog.Builder(this).setTitle("Reset entire app?").setMessage("This permanently deletes ALL local game saves, control mappings, settings and cached files. The bundled cartridge remains. This cannot be undone.")
+          .setNegativeButton("Cancel",(d,w)->game.paused=false).setPositiveButton("Delete all app data",(d,w)->{android.app.ActivityManager a=(android.app.ActivityManager)getSystemService(ACTIVITY_SERVICE);if(a==null||!a.clearApplicationUserData()){game.paused=false;Toast.makeText(this,"Unable to reset app data",Toast.LENGTH_LONG).show();}}).setOnCancelListener(d->game.paused=false).show();
+    }
+    private void showEmbeddedHome(){
+        LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.HORIZONTAL);root.setBackgroundColor(Color.rgb(250,251,247));
+        ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout side=new LinearLayout(this);side.setPadding(dp(8),dp(8),dp(8),dp(8));side.setOrientation(LinearLayout.VERTICAL);side.setBackgroundColor(Color.rgb(235,248,244));scroll.addView(side);root.addView(scroll,new LinearLayout.LayoutParams(0,-1,.23f));
+        TextView title=new TextView(this);title.setText("PixelFlux");title.setTextColor(Color.rgb(35,62,72));title.setTextSize(19);title.setTypeface(null,Typeface.BOLD);side.addView(title);
+        TextView tagline=new TextView(this);tagline.setText("ONE CARTRIDGE\nA WORLD OF GAMES");tagline.setTextColor(Color.rgb(91,137,131));tagline.setTextSize(9);side.addView(tagline);
+        Button settings=sideButton("Settings");settings.setOnClickListener(v->settings());side.addView(settings,new LinearLayout.LayoutParams(-1,dp(44)));
+        Button about=sideButton("About");about.setOnClickListener(v->{game.paused=true;new AlertDialog.Builder(this).setTitle("About PixelFlux").setMessage(MainActivity.ABOUT).setPositiveButton("Close",(d,w)->game.paused=false).setOnCancelListener(d->game.paused=false).show();});side.addView(about,new LinearLayout.LayoutParams(-1,dp(44)));
+        Button reset=sideButton("Reset");reset.setOnClickListener(v->resetApp());side.addView(reset,new LinearLayout.LayoutParams(-1,dp(44)));
+        Button exit=sideButton("Exit");exit.setOnClickListener(v->finish());side.addView(exit,new LinearLayout.LayoutParams(-1,dp(44)));
+        root.addView(game,new LinearLayout.LayoutParams(0,-1,.77f));setContentView(root);
     }
     static byte[] readAll(InputStream in,int max)throws Exception{java.io.ByteArrayOutputStream out=new java.io.ByteArrayOutputStream();byte[] buf=new byte[16384];int n,total=0;while((n=in.read(buf))!=-1){total+=n;if(total>max)throw new IllegalArgumentException("File too large");out.write(buf,0,n);}return out.toByteArray();}
     private static String sha256(byte[] bytes)throws Exception{byte[] hash=MessageDigest.getInstance("SHA-256").digest(bytes);StringBuilder b=new StringBuilder();for(byte v:hash)b.append(String.format(Locale.ROOT,"%02x",v&255));return b.toString();}
@@ -50,7 +74,7 @@ public final class PlayerActivity extends Activity {
         byte[] bytes;try(InputStream in=getAssets().open("roms/"+sourceId+ext)){bytes=readAll(in,10_000_000);}if(!sha.equals(sha256(bytes)))throw new SecurityException("Game identity mismatch");
         File tmp=new File(getCacheDir(),sha+ext+".tmp");try(FileOutputStream out=new FileOutputStream(tmp)){out.write(bytes);}if(!tmp.renameTo(file))throw new IllegalStateException("Unable to prepare game");return file;}
     private void settings(){if(game==null)return;game.paused=true;
-        String[] options={"Resume","Move controls","Reset control positions","Save stage / position","Load stage / position","Full screen: "+(game.stretch?"stretch":"fit"),"Exit to PixelFlux","Cheats","Button mapping","Button size"};
+        String[] options={"Resume","Move controls","Reset control positions","Save stage / position","Load stage / position","Full screen: "+(game.stretch?"stretch":"fit"),"Exit application","Cheats","Button mapping","Button size"};
         new AlertDialog.Builder(this).setTitle("Game settings").setItems(options,(d,which)->{
             if(which==1){game.edit=true;Toast.makeText(this,"Drag the joystick and buttons; tap DONE to save",Toast.LENGTH_LONG).show();}
             else if(which==2){game.resetPositions();game.savePositions();}
