@@ -7,10 +7,10 @@
   "version_name": "1.0",
   "min_android_sdk": 26,
   "apk_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-v1.0/Sunset-Riders-1.0.apk",
-  "apk_sha256": "98ed96426e6eb2c80a24b0ee7d9bdb47cc6a736241699aa3346e236e44ecffe3",
+  "apk_sha256": "e6b3ded3d663192ac4ac973d7abd352f9e95f897073b189dcedaed37f8572834",
   "apk_size_bytes": 20099635,
   "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-v1.0",
-  "published_at": "2026-11-05T12:15:08Z",
+  "published_at": "2026-11-05T21:11:40Z",
   "release_notes_ar": "إصدار لعبة رعاة البقر (Sunset Riders) بجودة صورة فائقة 2x HD Scale2x، وشاشة عريضة بعرض شاشة الموبايل، وعصاية تحكم حرة 360°، وقائمة أكواد الغش (Cheats)، وزر About داخل الضبط.",
   "required": false
 }
