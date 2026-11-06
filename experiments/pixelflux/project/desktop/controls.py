@@ -3,7 +3,7 @@ import json, os, shutil, tempfile
 from pathlib import Path
 import pygame
 
-ACTIONS=[('UP',4),('DOWN',5),('LEFT',6),('RIGHT',7),('A',8),('B',0),('X',9),('Y',1),('L',10),('R',11),('SELECT',2),('START',3)]
+ACTIONS=[('UP',4),('DOWN',5),('LEFT',6),('RIGHT',7),('A / JUMP',8),('B / FIRE',0),('TURBO FIRE',9),('TURBO JUMP',1),('L',10),('R',11),('SELECT',2),('START',3)]
 DEFAULT_KEYS={4:pygame.K_UP,5:pygame.K_DOWN,6:pygame.K_LEFT,7:pygame.K_RIGHT,8:pygame.K_x,0:pygame.K_z,9:pygame.K_s,1:pygame.K_a,10:pygame.K_q,11:pygame.K_w,2:pygame.K_RSHIFT,3:pygame.K_RETURN}
 DEFAULT_BUTTONS={8:0,0:1,9:2,1:3,10:4,11:5,2:6,3:7}
 RESERVED={pygame.K_ESCAPE,pygame.K_g,pygame.K_F5,pygame.K_F8}
@@ -103,6 +103,19 @@ def input_bits(pads,config,pressed=None):
                 if binding_active(pad,spec) if spec else default_pad_active(pad,bit):bits.add(bit)
         except (pygame.error,AttributeError,IndexError,KeyError,TypeError):continue
     return bits
+
+def nes_input_bits(pads,config,frame,pressed=None,turbo_state=None):
+    """Map extra controls to repeated NES B/A presses, immediate on each hold."""
+    raw=input_bits(pads,config,pressed=pressed)
+    result=raw-{1,9}
+    for source,target in ((1,8),(9,0)):
+        if source not in raw:
+            if turbo_state is not None:turbo_state.pop(source,None)
+            continue
+        phase=frame if turbo_state is None else turbo_state.get(source,0)
+        if phase%6<3:result.add(target)
+        if turbo_state is not None:turbo_state[source]=phase+1
+    return result
 
 def captured_binding(event,controller_instance):
     if getattr(event,'instance_id',None)!=controller_instance:return None

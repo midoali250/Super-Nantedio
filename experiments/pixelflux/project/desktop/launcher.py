@@ -2,7 +2,7 @@
 import argparse,hashlib,sys,time,textwrap
 from pathlib import Path
 import pygame
-from controls import control_screen,reset_application,scan_gamepads,read_controls,input_bits
+from controls import control_screen,reset_application,scan_gamepads,read_controls,nes_input_bits
 from preferences import read_preferences,write_preferences
 from game_session import frame_surface,fit_frame
 from libretro_host import LibretroHost
@@ -16,9 +16,44 @@ def verify_rom(path):
  return p
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--smoke',action='store_true');p.add_argument('--ci-game',action='store_true');p.add_argument('--ci-controls',action='store_true');p.add_argument('--ci-layout',action='store_true');p.add_argument('--screenshot');a=p.parse_args()
- if (a.ci_game or a.ci_controls or a.ci_layout) and not a.smoke:raise ValueError('CI checks require smoke mode')
+ p=argparse.ArgumentParser();p.add_argument('--smoke',action='store_true');p.add_argument('--ci-game',action='store_true');p.add_argument('--ci-controls',action='store_true');p.add_argument('--ci-layout',action='store_true');p.add_argument('--ci-turbo',action='store_true');p.add_argument('--screenshot');a=p.parse_args()
+ if (a.ci_game or a.ci_controls or a.ci_layout or a.ci_turbo) and not a.smoke:raise ValueError('CI checks require smoke mode')
  pygame.init();pygame.joystick.init();screen=pygame.display.set_mode((1280,720),0 if a.smoke else pygame.FULLSCREEN);pygame.display.set_caption('PixelFlux');pygame.display.set_icon(pygame.image.load(str(ROOT/'assets/icon.png')))
+ if a.ci_turbo:
+  from collections import defaultdict
+  from controls import empty_controls
+  cfg=empty_controls()
+  def keys(*values):return defaultdict(int,{k:1 for k in values})
+  # X/Z are normal A/B. A/S are independently pulsed A/B, starting immediately.
+  assert nes_input_bits([],cfg,0,keys(pygame.K_x))=={8}
+  assert nes_input_bits([],cfg,3,keys(pygame.K_z))=={0}
+  assert [nes_input_bits([],cfg,f,keys(pygame.K_a)) for f in range(6)]==[{8},{8},{8},set(),set(),set()]
+  assert [nes_input_bits([],cfg,f,keys(pygame.K_s)) for f in range(6)]==[{0},{0},{0},set(),set(),set()]
+  assert nes_input_bits([],cfg,3,keys(pygame.K_x,pygame.K_a))=={8}
+  phase={}
+  assert nes_input_bits([],cfg,5,keys(pygame.K_a),phase)=={8}
+  for f in range(3):nes_input_bits([],cfg,6+f,keys(pygame.K_a),phase)
+  nes_input_bits([],cfg,9,keys(),phase)
+  assert nes_input_bits([],cfg,10,keys(pygame.K_a),phase)=={8}
+  cfg['keyboard']['1']=pygame.K_t
+  assert nes_input_bits([],cfg,0,keys(pygame.K_t))=={8}
+  assert nes_input_bits([],cfg,0,keys(pygame.K_a))==set()
+  class Pad:
+   def __init__(self,button):self.button=button
+   def get_init(self):return True
+   def get_guid(self):return 'test-controller'
+   def get_numbuttons(self):return 4
+   def get_button(self,n):return n==self.button
+   def get_numaxes(self):return 0
+   def get_numhats(self):return 0
+  assert nes_input_bits([Pad(0)],cfg,0,keys())=={8}
+  assert nes_input_bits([Pad(1)],cfg,0,keys())=={0}
+  assert nes_input_bits([Pad(2)],cfg,0,keys())=={0} and nes_input_bits([Pad(2)],cfg,3,keys())==set()
+  assert nes_input_bits([Pad(3)],cfg,0,keys())=={8} and nes_input_bits([Pad(3)],cfg,3,keys())==set()
+  cfg['gamepads']['test-controller']={'9':{'type':'button','index':3},'1':{'type':'button','index':2}}
+  assert nes_input_bits([Pad(2)],cfg,0,keys())=={8}
+  assert nes_input_bits([Pad(3)],cfg,0,keys())=={0}
+  print('PASS normal/turbo keyboard and mapped virtual controller, remapping, simultaneous hold and pulse timing');pygame.quit();return
  if a.ci_controls:
   import tempfile,controls
   with tempfile.TemporaryDirectory() as tmp:
@@ -32,13 +67,26 @@ def main():
  rom=verify_rom(ROOT/'roms'/(GAME_ID+'.nes'));suffix='.dll' if sys.platform=='win32' else '.dylib' if sys.platform=='darwin' else '.so';corepath=ROOT/'cores'/('fceumm_libretro'+suffix)
  if not corepath.is_file():raise FileNotFoundError('NES core is not bundled')
  if a.ci_game:
-  with LibretroHost(corepath,rom) as emu:
+  from collections import defaultdict
+  from controls import empty_controls
+  class ProbeHost(LibretroHost):
+   def __init__(self,*args):self.observed=set();super().__init__(*args)
+   def _input(self,port,device,index,ident):
+    value=super()._input(port,device,index,ident)
+    if value:self.observed.add(ident)
+    return value
+  with ProbeHost(corepath,rom) as emu:
    for frame in range(2700):
     emu.buttons={3} if 1200<=frame<1204 or 1800<=frame<1804 else ({7} if 2300<=frame<2450 else set());emu.run_frame();emu.drain_audio()
    if emu.audio_samples<=0 or frame_surface(emu) is None:raise RuntimeError('Game did not produce audio/video')
-   print('PASS multicart, menu, game startup, direction and audio')
+   for key,expected in [(pygame.K_x,8),(pygame.K_z,0),(pygame.K_a,8),(pygame.K_s,0)]:
+    for f in range(6):
+     emu.buttons=nes_input_bits([],empty_controls(),f,defaultdict(int,{key:1}));emu.observed.clear();emu.run_frame();emu.drain_audio()
+     should=(f<3) if key in (pygame.K_a,pygame.K_s) else True
+     if (expected in emu.observed)!=should:raise AssertionError('NES core did not poll the expected button pulse')
+   print('PASS multicart gameplay, video/audio and all four keyboard mappings polled by NES core')
   pygame.quit();return
- prefs=read_preferences();config=read_controls();pads=scan_gamepads();page='home';confirm=False;fullscreen_game=False;previous_start=False;layout_tested=False;slot=0;status='';until=0;running=True;clock=pygame.time.Clock();icon=pygame.image.load(str(ROOT/'assets/icon.png')).convert_alpha();count=0
+ prefs=read_preferences();config=read_controls();pads=scan_gamepads();page='home';confirm=False;fullscreen_game=False;previous_start=False;layout_tested=False;slot=0;status='';until=0;running=True;clock=pygame.time.Clock();icon=pygame.image.load(str(ROOT/'assets/icon.png')).convert_alpha();count=0;cache_key=None;cached_icon=None;small=body=big=None;turbo_state={}
  with LibretroHost(corepath,rom) as core:
   sound=None
   if not a.smoke:
@@ -122,7 +170,7 @@ def main():
       elif 332<=y<=387:page='about'
       elif 404<=y<=459:running=False
    if page=='home' and not confirm:
-    core.buttons=input_bits(pads,config)
+    core.buttons=nes_input_bits(pads,config,count,turbo_state=turbo_state)
     if a.ci_layout and count==1200:core.buttons.add(3)
     start=3 in core.buttons
     if start and not previous_start and not fullscreen_game:fullscreen_game=True
@@ -146,10 +194,11 @@ def main():
    if frame:
     view=screen.get_rect() if fullscreen_game else R(330,45,904,630);fitted=fit_frame((4,3),view.size) if prefs['display_mode']=='FIT' else pygame.Rect(0,0,*view.size);fitted.move_ip(view.topleft)
     screen.blit((pygame.transform.smoothscale if prefs['scaling']=='SMOOTH' else pygame.transform.scale)(frame,fitted.size),fitted)
-   small=pygame.font.SysFont('dejavusans',max(12,int(15*scale)));body=pygame.font.SysFont('dejavusans',max(14,int(20*scale)));big=pygame.font.SysFont('dejavusans',max(20,int(30*scale)))
+   if cache_key!=(w,h):
+    cache_key=(w,h);small=pygame.font.SysFont('dejavusans',max(12,int(15*scale)));body=pygame.font.SysFont('dejavusans',max(14,int(20*scale)));big=pygame.font.SysFont('dejavusans',max(20,int(30*scale)));cached_icon=pygame.transform.smoothscale(icon,(max(1,int(84*scale)),max(1,int(84*scale))))
    def text(s,x,y,col=(46,67,76),f=body):screen.blit(f.render(str(s),True,col),R(x,y,1,1).topleft)
    if not fullscreen_game:
-    screen.blit(pygame.transform.smoothscale(icon,(max(1,int(84*scale)),max(1,int(84*scale)))),R(55,56,84,84).topleft)
+    screen.blit(cached_icon,R(55,56,84,84).topleft)
     text('PixelFlux',55,155,(35,62,72),big);text('ONE CARTRIDGE',56,204,(91,137,131),small);text('A WORLD OF GAMES',56,224,(91,137,131),small)
     for y,label in [(260,'SETTINGS  [G]'),(332,'ABOUT  [I]'),(404,'EXIT')]:
      pygame.draw.rect(screen,(255,255,255),R(55,y,215,55),border_radius=10);pygame.draw.rect(screen,(184,220,208),R(55,y,215,55),width=2,border_radius=10);text(label,69,y+16)

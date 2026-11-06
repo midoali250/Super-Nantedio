@@ -129,7 +129,7 @@ jobs:
         shell: pwsh
         run: |
           $app=Join-Path $env:PROJECT 'dist/PixelFlux.exe'
-          foreach ($argsLine in @('--smoke','--smoke --ci-game','--smoke --ci-controls','--smoke --ci-layout')) {
+          foreach ($argsLine in @('--smoke','--smoke --ci-game','--smoke --ci-controls','--smoke --ci-layout','--smoke --ci-turbo')) {
             $proc=Start-Process -Wait -PassThru -FilePath $app -ArgumentList $argsLine
             if ($proc.ExitCode -ne 0) { exit $proc.ExitCode }
           }
@@ -143,6 +143,7 @@ jobs:
           "$APP" --smoke --ci-game
           "$APP" --smoke --ci-controls
           "$APP" --smoke --ci-layout
+          "$APP" --smoke --ci-turbo
       - uses: actions/upload-artifact@v4
         if: matrix.platform == 'linux'
         with:

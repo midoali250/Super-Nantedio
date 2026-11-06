@@ -3,7 +3,7 @@ set -euo pipefail
 if [ -f baseline/PixelFlux-Android-signed.apk ]; then
   adb install baseline/PixelFlux-Android-signed.apk
   adb install -r PixelFlux-Android-signed.apk
-  echo 'PASS same-certificate v1.1 to v1.2 install'
+  echo 'PASS same-certificate v1.2 to v1.3 install'
 else
   adb install PixelFlux-Android-signed.apk
 fi
