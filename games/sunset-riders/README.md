@@ -21,3 +21,10 @@ Standalone native Android edition of **رعاة البقر (Sunset Riders)** (`S
   - Defaults to **Free-Floating Stick (360°)** (`dpadFreeMode = true`) on the left side of the screen.
 - **About Dialog (inside Settings & Top Bar)**:
   > This application has been developed by **Ahmed Kamal Elgandy** to serve as a digital archive and platform for running and optimizing classic retro and Atari-style games on mobile devices. The project aims to revive memories and preserve the software heritage of classic games with a smooth, lightweight experience, while fully respecting the intellectual property rights of the original production companies.
+
+## مقارنة جودة الصورة (v1.0 → v1.1)
+
+![Sunset Riders before / after v1.1](docs/shots/before-after-v1.1.png)
+
+- **قبل (v1.0)**: ألوان مطفية/غامقة لأن الـ LUT كان يطرح 8 من كل قناة فوق نطاق DAC (`0..238`)، وصورة معمّية بسبب الخلط الأفقي `50/50` و`HQ2x` ثم تكبير `3.75×` على 1080p.
+- **بعد (v1.1)**: ألوان زاهية مشبعة (توسيع كامل للنطاق + Bright Arcade Gamma `0.68` + Hue-Preserving Vibrance) وصورة حادة تمامًا (Strict 2D Checkerboard De-Dither + `Scale4x` نقي بدقة `1024×896` ثم تكبير `~1.2×` فقط).
