@@ -179,8 +179,10 @@ jobs:
           chmod +x AppDir/AppRun
           printf '[Desktop Entry]\nType=Application\nName=Sunset Riders\nExec=SunsetRiders\nIcon=sunsetriders\nCategories=Game;\n' > AppDir/sunsetriders.desktop
           cp desktop/sunset-riders/icon.png AppDir/sunsetriders.png
-          curl -fL --retry 3 -o /tmp/appimagetool 'https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage'
-          echo '62aebc77c2149e96b593b94da9bbd1881e0984a56399ff6d7a03b7ddd7c9ce68  /tmp/appimagetool' | sha256sum -c -
+          # Pin the tool to a tagged release: the "continuous" asset is rebuilt
+          # regularly, so its checksum changes and the download fails.
+          curl -fL --retry 3 -o /tmp/appimagetool 'https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage'
+          echo 'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  /tmp/appimagetool' | sha256sum -c -
           chmod +x /tmp/appimagetool
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 /tmp/appimagetool AppDir Sunset-Riders-Linux-x86_64.AppImage
           chmod +x Sunset-Riders-Linux-x86_64.AppImage
