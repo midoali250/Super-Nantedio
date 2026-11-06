@@ -199,7 +199,10 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name != 'pull_request'
+    # Releases and update manifests are only published from main: a branch build
+    # would otherwise re-upload a byte-different APK and leave the manifest in
+    # main pointing at a stale SHA-256.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: [android, windows, unix]
     runs-on: ubuntu-latest
     steps:
