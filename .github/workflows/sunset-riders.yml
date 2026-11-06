@@ -2,9 +2,10 @@ name: Sunset Riders (رعاة البقر) - Android & Desktop
 on:
   workflow_dispatch:
   push:
+    # Feature branches are already covered by pull_request below; triggering on
+    # both events built the same commit twice and let the two runs race.
     branches:
       - main
-      - 'arena/**'
     paths:
       - 'games/sunset-riders/**'
       - 'desktop/sunset-riders/**'
