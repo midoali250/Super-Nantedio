@@ -3,11 +3,14 @@
 import datetime as dt
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ART = Path("/tmp/sr-artifacts")
+# Defaults to the CI artifact drop, but can point at freshly downloaded release
+# assets so the manifest always describes the bytes users actually download.
+ART = Path(os.environ.get("SR_ARTIFACTS", "/tmp/sr-artifacts"))
 
 apk = ART / "sunset-riders-android" / "Sunset-Riders-1.1.apk"
 win = ART / "Sunset-Riders-Windows-x64" / "Sunset-Riders-Windows-x64.exe"

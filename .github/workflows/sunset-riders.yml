@@ -205,6 +205,9 @@ jobs:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: [android, windows, unix]
     runs-on: ubuntu-latest
+    concurrency:
+      group: sunset-riders-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -239,18 +242,23 @@ jobs:
               --notes "الإصدار 1.1.0 لسطح المكتب: Windows Portable EXE و Linux AppImage و macOS arm64 App بجودة صورة True HD 4x Scale4x (1024×896) وألوان زاهية مشبعة (Vibrant Arcade Color LUT)، مع زر Reset Game."
           fi
 
-          python3 tools/publish_sunset_riders.py
+          # Re-download the published assets so the manifests and the archive
+          # record the exact bytes that are now served to users (never a local
+          # build artifact that a concurrent upload may have replaced).
+          VERIFY=/tmp/sr-verify
+          mkdir -p "$VERIFY/sunset-riders-android" "$VERIFY/Sunset-Riders-Windows-x64" \
+            "$VERIFY/Sunset-Riders-linux-x86_64" "$VERIFY/Sunset-Riders-macos-arm64"
+          gh release download sunset-riders-v1.1 -p 'Sunset-Riders-1.1.apk' --clobber -D "$VERIFY/sunset-riders-android"
+          gh release download sunset-riders-desktop-v1.1.0 -p 'Sunset-Riders-Windows-x64.exe' -p 'Sunset-Riders-Linux-x86_64.AppImage' -p 'Sunset-Riders-macOS-arm64.zip' --clobber -D "$VERIFY/Sunset-Riders-Windows-x64"
+          mv "$VERIFY/Sunset-Riders-Windows-x64/Sunset-Riders-Linux-x86_64.AppImage" "$VERIFY/Sunset-Riders-linux-x86_64/"
+          mv "$VERIFY/Sunset-Riders-Windows-x64/Sunset-Riders-macOS-arm64.zip" "$VERIFY/Sunset-Riders-macos-arm64/"
+          SR_ARTIFACTS="$VERIFY" python3 tools/publish_sunset_riders.py
           python3 tools/validate_updates.py
 
           git config user.name "BitVaultEngine CI"
           git config user.email "ci@users.noreply.github.com"
-          if [ "${GITHUB_REF_NAME}" = "main" ]; then
-            git checkout d54a58c -- RELEASE-ARCHIVE/Windows/1.4.0 RELEASE-ARCHIVE/Linux/1.4.0 RELEASE-ARCHIVE/macOS/1.4.0 RELEASE-ARCHIVE/Windows/The-Mask RELEASE-ARCHIVE/Linux/The-Mask RELEASE-ARCHIVE/macOS/The-Mask || true
-            git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/
-          else
-            git checkout HEAD -- RELEASE-ARCHIVE/Android/Sunset-Riders/1.1/Sunset-Riders-1.1.apk RELEASE-ARCHIVE/Windows/Sunset-Riders/1.1.0/Sunset-Riders-Windows-x64.exe RELEASE-ARCHIVE/Linux/Sunset-Riders/1.1.0/Sunset-Riders-Linux-x86_64.AppImage RELEASE-ARCHIVE/macOS/Sunset-Riders/1.1.0/Sunset-Riders-macOS-arm64.zip || true
-            git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/Android/Sunset-Riders/1.1/SHA256SUMS.txt RELEASE-ARCHIVE/Windows/Sunset-Riders/1.1.0/SHA256SUMS.txt RELEASE-ARCHIVE/Linux/Sunset-Riders/1.1.0/SHA256SUMS.txt RELEASE-ARCHIVE/macOS/Sunset-Riders/1.1.0/SHA256SUMS.txt
-          fi
+          git checkout d54a58c -- RELEASE-ARCHIVE/Windows/1.4.0 RELEASE-ARCHIVE/Linux/1.4.0 RELEASE-ARCHIVE/macOS/1.4.0 RELEASE-ARCHIVE/Windows/The-Mask RELEASE-ARCHIVE/Linux/The-Mask RELEASE-ARCHIVE/macOS/The-Mask || true
+          git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/
           python3 tools/naming/audit.py
           rm -f brand-audit.json
           if ! git diff --cached --quiet; then
