@@ -5,22 +5,22 @@
       "version": "1.1.0",
       "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.1.0",
       "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-Windows-x64.exe",
-      "size": 17734575,
-      "sha256": "b1321610b662fcec8da2620dc41853b728662c00642f87642422c952b580b6da"
+      "size": 17734382,
+      "sha256": "0fecd123c7602176791ac4fb1c2af5ccc7e27b868d931d2813961024b4056356"
     },
     "linux": {
       "version": "1.1.0",
       "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.1.0",
       "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-Linux-x86_64.AppImage",
       "size": 28305912,
-      "sha256": "b6bc09f73b7a4c627a14d5456b3b8e0226dd90bd916fafc989dba8b67f9454bc"
+      "sha256": "06146b68fd597192b490d554f141e920c302f03720426a1a00761fb2b82b3bc7"
     },
     "macos": {
       "version": "1.1.0",
       "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.1.0",
       "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-macOS-arm64.zip",
-      "size": 17886936,
-      "sha256": "87e2d7275566c514cbf8b8a461b88464efaa22619ab5915f4ace58ea867a39b9"
+      "size": 17884183,
+      "sha256": "db7e64ffa691595c22b5e5ea28c187ea4218209efba486cb2af1c99e69540cb2"
     }
   }
 }
