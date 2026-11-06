@@ -1,1 +1,1 @@
-a82a90dde5de58a7dc27c128448bfa93b2e1cfc8ac437b92ce36429669775b3c  The-Mask-macOS-arm64.zip  (18552759 bytes)
+c1e50fc9aa1a12d5664446a37b4c32a71db2d31c9fc658e1eef8b70564283046  The-Mask-macOS-arm64.zip  (18510240 bytes)
