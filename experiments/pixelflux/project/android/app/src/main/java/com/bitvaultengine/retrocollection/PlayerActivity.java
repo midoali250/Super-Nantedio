@@ -37,7 +37,7 @@ import java.util.Locale;
 
 /** Experimental libretro player: game thread owns native state; touches provide live input. */
 public final class PlayerActivity extends Activity {
-    private GameView game; private String sourceId,sha,system; private boolean smoke,layoutOnly;
+    private GameView game; private View sidebar; private boolean fullscreenGame; private String sourceId,sha,system; private boolean smoke,layoutOnly;
     private final java.util.ArrayList<String> cheatNames=new java.util.ArrayList<>(),cheatCodes=new java.util.ArrayList<>();
     @Override public void onCreate(Bundle state){super.onCreate(state);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY|View.SYSTEM_UI_FLAG_FULLSCREEN|View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN|View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
@@ -49,6 +49,13 @@ public final class PlayerActivity extends Activity {
             game=new GameView();game.edit=layoutOnly;if(smoke||layoutOnly)setContentView(game);else showEmbeddedHome();if(layoutOnly)Toast.makeText(this,"Drag the joystick and all four buttons, then tap DONE",Toast.LENGTH_LONG).show();
         }catch(Exception e){Log.e("AKG_ANDROID","Catalog error",e);Toast.makeText(this,"Game catalog unavailable",Toast.LENGTH_LONG).show();finish();}
     }
+    private void expandGame(){if(sidebar!=null&&!fullscreenGame){fullscreenGame=true;sidebar.setVisibility(View.GONE);Log.i("PIXELFLUX_LAYOUT","GAME_FULLSCREEN");}}
+    private void confirmCartridgeMenu(){
+        new AlertDialog.Builder(this).setTitle("Return to cartridge menu?").setMessage("The current unsaved game progress will be lost. Manual saves remain available.")
+          .setNegativeButton("Cancel",(d,w)->game.paused=false)
+          .setPositiveButton("Return to menu",(d,w)->{game.request=3;fullscreenGame=false;if(sidebar!=null)sidebar.setVisibility(View.VISIBLE);game.paused=false;Log.i("PIXELFLUX_LAYOUT","CARTRIDGE_MENU");})
+          .setOnCancelListener(d->game.paused=false).show();
+    }
     private int dp(int n){return Math.round(n*getResources().getDisplayMetrics().density);}
     private Button sideButton(String text){Button b=new Button(this);b.setText(text);b.setAllCaps(false);b.setTextSize(14);b.setTextColor(Color.rgb(43,78,80));GradientDrawable d=new GradientDrawable();d.setColor(Color.WHITE);d.setCornerRadius(dp(8));d.setStroke(dp(1),Color.rgb(170,213,200));b.setBackground(d);return b;}
     private void resetApp(){
@@ -58,7 +65,7 @@ public final class PlayerActivity extends Activity {
     }
     private void showEmbeddedHome(){
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.HORIZONTAL);root.setBackgroundColor(Color.rgb(250,251,247));
-        ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout side=new LinearLayout(this);side.setPadding(dp(8),dp(8),dp(8),dp(8));side.setOrientation(LinearLayout.VERTICAL);side.setBackgroundColor(Color.rgb(235,248,244));scroll.addView(side);root.addView(scroll,new LinearLayout.LayoutParams(0,-1,.23f));
+        ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout side=new LinearLayout(this);side.setPadding(dp(8),dp(8),dp(8),dp(8));side.setOrientation(LinearLayout.VERTICAL);side.setBackgroundColor(Color.rgb(235,248,244));scroll.addView(side);sidebar=scroll;root.addView(scroll,new LinearLayout.LayoutParams(0,-1,.23f));
         TextView title=new TextView(this);title.setText("PixelFlux");title.setTextColor(Color.rgb(35,62,72));title.setTextSize(19);title.setTypeface(null,Typeface.BOLD);side.addView(title);
         TextView tagline=new TextView(this);tagline.setText("ONE CARTRIDGE\nA WORLD OF GAMES");tagline.setTextColor(Color.rgb(91,137,131));tagline.setTextSize(9);side.addView(tagline);
         Button settings=sideButton("Settings");settings.setOnClickListener(v->settings());side.addView(settings,new LinearLayout.LayoutParams(-1,dp(44)));
@@ -74,14 +81,14 @@ public final class PlayerActivity extends Activity {
         byte[] bytes;try(InputStream in=getAssets().open("roms/"+sourceId+ext)){bytes=readAll(in,10_000_000);}if(!sha.equals(sha256(bytes)))throw new SecurityException("Game identity mismatch");
         File tmp=new File(getCacheDir(),sha+ext+".tmp");try(FileOutputStream out=new FileOutputStream(tmp)){out.write(bytes);}if(!tmp.renameTo(file))throw new IllegalStateException("Unable to prepare game");return file;}
     private void settings(){if(game==null)return;game.paused=true;
-        String[] options={"Resume","Move controls","Reset control positions","Save stage / position","Load stage / position","Full screen: "+(game.stretch?"stretch":"fit"),"Exit application","Cheats","Button mapping","Button size"};
+        String[] options={"Resume","Move controls","Reset control positions","Save stage / position","Load stage / position","Full screen: "+(game.stretch?"stretch":"fit"),"Back to cartridge menu","Cheats","Button mapping","Button size"};
         new AlertDialog.Builder(this).setTitle("Game settings").setItems(options,(d,which)->{
             if(which==1){game.edit=true;Toast.makeText(this,"Drag the joystick and buttons; tap DONE to save",Toast.LENGTH_LONG).show();}
             else if(which==2){game.resetPositions();game.savePositions();}
             else if(which==3){chooseStateSlot(true);return;}
             else if(which==4){chooseStateSlot(false);return;}
             else if(which==5){game.stretch=!game.stretch;game.prefs.edit().putBoolean("stretch",game.stretch).apply();}
-            else if(which==6){finish();return;}
+            else if(which==6){confirmCartridgeMenu();return;}
             else if(which==7){chooseCheats();return;}
             else if(which==8){showMapping(this,system,()->{game.reloadControls();game.paused=false;});return;}
             else if(which==9){showSize(this,()->{game.reloadControls();game.paused=false;});return;}
@@ -166,7 +173,8 @@ public final class PlayerActivity extends Activity {
                     if(cheatProbe!=0){int value=NativeBridge.ramByte(0x0dbe);if((cheatProbe==1&&value==0x63)||(cheatProbe==2&&value!=0x63)){Log.i("AKG_ANDROID_CHEAT",cheatProbe==1?"SMW cheat enforced":"SMW cheat disabled");cheatProbe=0;}}int w=NativeBridge.width(),h=NativeBridge.height();if(w>0&&h>0&&w<=4096&&h<=4096){if(videoBuffer==null||videoBuffer.length!=w*h)videoBuffer=new int[w*h];if(NativeBridge.copyVideo(videoBuffer)){sawVideo=true;if(bitmap==null||bitmap.getWidth()!=w||bitmap.getHeight()!=h){if(bitmap!=null)bitmap.recycle();bitmap=Bitmap.createBitmap(w,h,Bitmap.Config.ARGB_8888);}bitmap.setPixels(videoBuffer,0,w,0,0,w,h);}}short[] pcm=NativeBridge.audio();if(pcm!=null&&pcm.length>0){sawAudio=true;if(audio!=null){int offset=0;while(offset<pcm.length&&alive&&!paused&&!edit){int wrote=audio.write(pcm,offset,pcm.length-offset,AudioTrack.WRITE_BLOCKING);if(wrote<=0){Log.w("AKG_ANDROID_AUDIO","Audio write failed: "+wrote);break;}offset+=wrote;}}}
                     try {
                     if(request==1){request=0;byte[] saved=NativeBridge.save();if(saved==null)throw new IllegalStateException("Save unavailable");File file=stateFile(stateSlot),tmp=new File(getFilesDir(),file.getName()+".tmp");try(FileOutputStream out=new FileOutputStream(tmp)){out.write(saved);out.getFD().sync();}if(!tmp.renameTo(file))throw new IllegalStateException("Save failed");Log.i("AKG_ANDROID_STATE","Saved slot "+stateSlot);runOnUiThread(()->Toast.makeText(PlayerActivity.this,"State saved",Toast.LENGTH_SHORT).show());}
-                    if(request==2){request=0;byte[] saved;try(FileInputStream in=new FileInputStream(stateFile(stateSlot))){saved=readAll(in,100_000_000);}if(!NativeBridge.restore(saved))throw new IllegalStateException("Load failed");Log.i("AKG_ANDROID_STATE","Loaded slot "+stateSlot);runOnUiThread(()->Toast.makeText(PlayerActivity.this,"State loaded",Toast.LENGTH_SHORT).show());}
+                    if(request==3){request=0;NativeBridge.reset();Log.i("PIXELFLUX_LAYOUT","CORE_RESET");}
+                        if(request==2){request=0;byte[] saved;try(FileInputStream in=new FileInputStream(stateFile(stateSlot))){saved=readAll(in,100_000_000);}if(!NativeBridge.restore(saved))throw new IllegalStateException("Load failed");Log.i("AKG_ANDROID_STATE","Loaded slot "+stateSlot);runOnUiThread(()->Toast.makeText(PlayerActivity.this,"State loaded",Toast.LENGTH_SHORT).show());}
                     }catch(Exception stateError){request=0;runOnUiThread(()->Toast.makeText(PlayerActivity.this,"Save/load failed: "+stateError.getMessage(),Toast.LENGTH_LONG).show());}
                     if(smoke&&frames>=1200){byte[] s=NativeBridge.save();if(!sawVideo||!sawAudio||s==null||!NativeBridge.restore(s))throw new IllegalStateException("Smoke failed");Log.i("AKG_ANDROID_SMOKE","PASS "+system+" video audio state input; elapsed_ms="+((System.nanoTime()-activeStart)/1_000_000));alive=false;runOnUiThread(()->finish());}
                 }else if(!audioPaused&&audio!=null){audio.pause();audio.flush();audioPaused=true;}
@@ -192,6 +200,7 @@ public final class PlayerActivity extends Activity {
             int mask=0,faces=0;for(int i=0;i<e.getPointerCount();i++){if((a==MotionEvent.ACTION_UP||a==MotionEvent.ACTION_POINTER_UP)&&i==index)continue;float tx=e.getX(i)/w,ty=e.getY(i)/h;float dx=(tx-stickOriginX)*w,dy=(ty-stickOriginY)*h,rad=Math.min(w,h)*.17f;if(e.getPointerId(i)==stickPointer){stickCurrentX=tx;stickCurrentY=ty;if(dx<-rad*.22)mask|=1<<6;if(dx>rad*.22)mask|=1<<7;if(dy<-rad*.22)mask|=1<<4;if(dy>rad*.22)mask|=1<<5;}
                 for(int k=1;k<5;k++){dx=(tx-px[k])*w;dy=(ty-py[k])*h;float r=Math.min(w,h)*Math.max(.075f,buttonSize);if(dx*dx+dy*dy<r*r)faces|=1<<(k-1);}
                 if(ty>.86f&&tx>.32f&&tx<.48f)mask|=1<<2;if(ty>.86f&&tx>.50f&&tx<.66f)mask|=1<<3;}
+            if((a==MotionEvent.ACTION_UP||a==MotionEvent.ACTION_POINTER_UP)&&!smoke&&!edit&&!fullscreenGame&&y>.86f&&x>.50f&&x<.66f)postDelayed(()->expandGame(),120);
             if((a==MotionEvent.ACTION_UP||a==MotionEvent.ACTION_POINTER_UP)&&e.getPointerId(index)==stickPointer)stickPointer=-1;if(a==MotionEvent.ACTION_CANCEL){mask=0;faces=0;stickPointer=-1;}heldFaces=faces;buttons=mask;if(smoke&&(mask!=0||faces!=0))Log.i("AKG_ANDROID_TOUCH","mask="+(mask|faceMask(0))+" faces="+faces);return true;}
     }
 }

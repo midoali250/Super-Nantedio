@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-adb install PixelFlux-Android-signed.apk
+if [ -f baseline/PixelFlux-Android-signed.apk ]; then
+  adb install baseline/PixelFlux-Android-signed.apk
+  adb install -r PixelFlux-Android-signed.apk
+  echo 'PASS same-certificate v1.1 to v1.2 install'
+else
+  adb install PixelFlux-Android-signed.apk
+fi
 adb shell wm size 640x1280
 adb logcat -c
 adb shell am start -n com.pixelflux.app/com.bitvaultengine.retrocollection.MainActivity
@@ -39,7 +45,12 @@ if green<100:raise RuntimeError('Live green multicart menu not visible inside ho
 adb('shell','input','swipe','860','595','860','595','250');time.sleep(2)
 second=Image.open(BytesIO(adb('exec-out','screencap','-p'))).convert('RGB')
 if not ImageChops.difference(first,second).getbbox():raise RuntimeError('No visible change after Start')
-tap(find('Settings'));tap(find('Save stage / position'));tap(find('Slot 1'));waitlog('Saved slot 1')
-tap(find('Settings'));tap(find('Load stage / position'));tap(find('Slot 1'));waitlog('Loaded slot 1')
-print('PASS signed Android: auto-open embedded menu, no Play button, About, reset cancel, Start, manual save and restore')
+waitlog('GAME_FULLSCREEN')
+adb('shell','uiautomator','dump','/sdcard/pixel-full-ui.xml');fullxml=adb('exec-out','cat','/sdcard/pixel-full-ui.xml').decode()
+if 'text="PixelFlux"' in fullxml:raise RuntimeError('Sidebar remained visible after selecting game')
+# Fullscreen game settings is drawn in the top center of the native surface.
+adb('shell','input','tap','640','45');tap(find('Save stage / position'));tap(find('Slot 1'));waitlog('Saved slot 1')
+adb('shell','input','tap','640','45');tap(find('Load stage / position'));tap(find('Slot 1'));waitlog('Loaded slot 1')
+adb('shell','input','tap','640','45');tap(find('Back to cartridge menu'));find('Return to cartridge menu?');tap(find('Return to menu'));waitlog('CORE_RESET');find('PixelFlux')
+print('PASS signed Android: embedded menu, full-screen game on Start, return to menu, About, reset cancel, save and restore')
 PY

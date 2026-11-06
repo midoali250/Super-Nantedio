@@ -34,3 +34,23 @@ for _ in range(15):
  time.sleep(1)
 else:raise RuntimeError('Embedded home screen failed')
 PY
+adb shell input swipe 860 595 860 595 250
+for i in $(seq 1 20); do if adb logcat -d -s PIXELFLUX_LAYOUT:I | grep -q GAME_FULLSCREEN;then break;fi;sleep 1;done
+adb logcat -d -s PIXELFLUX_LAYOUT:I | grep -q GAME_FULLSCREEN
+adb shell input tap 640 45
+python3 - <<'PY'
+import subprocess,time,re,xml.etree.ElementTree as ET
+def adb(*a):return subprocess.check_output(['adb',*a],timeout=30)
+def tap_text(text):
+ for i in range(15):
+  try:
+   adb('shell','uiautomator','dump','/sdcard/pixel-back.xml');root=ET.fromstring(adb('exec-out','cat','/sdcard/pixel-back.xml'))
+   n=next(n for n in root.iter('node') if n.get('text','').casefold()==text.casefold())
+   m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',n.get('bounds',''));x1,y1,x2,y2=map(int,m.groups());adb('shell','input','tap',str((x1+x2)//2),str((y1+y2)//2));return
+  except Exception:time.sleep(1)
+ raise RuntimeError('Menu item unavailable: '+text)
+tap_text('Back to cartridge menu');tap_text('Return to menu')
+PY
+for i in $(seq 1 20); do if adb logcat -d -s PIXELFLUX_LAYOUT:I | grep -q CORE_RESET;then break;fi;sleep 1;done
+adb logcat -d -s PIXELFLUX_LAYOUT:I | grep -q CORE_RESET
+echo 'PASS Android expands on Start and returns to cartridge menu'
