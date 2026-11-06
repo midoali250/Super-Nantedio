@@ -1,15 +1,15 @@
 # رعاة البقر — Sunset Riders (Android)
 
-Standalone native Android edition of **رعاة البقر (Sunset Riders)** (`Sunset Riders (U) [!].bin`), powered by the **Genesis Plus GX** libretro C core with **True HD 2x Scale2x + Genesis De-Dither + HD Color LUT + GPU Hardware Filtering**, **60 FPS Crystal-Clear Stereo Audio**, **360° Free-Floating Virtual Joystick**, **Full-Width Mobile Widescreen**, **Reset Game (`🔄 ريست`)**, and **About** dialog inside the Settings menu.
+Standalone native Android edition of **رعاة البقر (Sunset Riders)** (`Sunset Riders (U) [!].bin`), powered by the **Genesis Plus GX** libretro C core with **True HD 4x Scale4x + Vibrant Arcade Color LUT + Strict 2D Checkerboard De-Dither + GPU Hardware Filtering**, **60 FPS Crystal-Clear Stereo Audio**, **360° Free-Floating Virtual Joystick**, **Full-Width Mobile Widescreen**, **Reset Game (`🔄 ريست`)**, and **About** dialog inside the Settings menu.
 
 ## Highlights
 
 - **App Title**: `رعاة البقر` (`com.midoali.snes.sunsetriders`)
 - **True HD Image Quality (جودة الصورة)**:
-  - **True HD Crisp (2x Scale2x + Genesis Horizontal De-Dither + HD Color LUT)** enabled by default (`512x448` / `640x448` zero-copy `RGB_565` output rendered via `SurfaceHolder.lockHardwareCanvas()` GPU pipeline).
+  - **True HD Crisp (2-stage 4x Scale4x + Strict 2D Checkerboard De-Dither + Vibrant Arcade Color LUT)** enabled by default (`1024x896` / `1280x896` zero-copy `RGB_565` output rendered via `SurfaceHolder.lockHardwareCanvas()` GPU pipeline).
   - Switchable in **Settings → Image Quality**:
-    1. **True HD Crisp (2x Scale2x + De-Dither + GPU Filter)** — *Default*
-    2. **Ultra Smooth (2x Bilinear + De-Dither)**
+    1. **True HD Crisp (4x Scale4x + Vibrant Colors + GPU Filter)** — *Default*
+    2. **Ultra Smooth (4x Bilinear + Vibrant Colors)**
     3. **Raw Pixel (1x Sharp)**
 - **Ultra-Lightweight 60 FPS Performance & Clear Audio**:
   - `YM2612_ENHANCED` FM synthesis with low-overhead native mixing (`hq_fm = 0`, `hq_psg = 0`, `-O3 -funroll-loops`) and 1472-frame audio pre-roll cushioning for zero crackling or lag.

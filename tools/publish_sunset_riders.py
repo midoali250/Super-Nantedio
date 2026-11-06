@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ART = Path("/tmp/sr-artifacts")
 
-apk = ART / "sunset-riders-android" / "Sunset-Riders-1.0.apk"
+apk = ART / "sunset-riders-android" / "Sunset-Riders-1.1.apk"
 win = ART / "Sunset-Riders-Windows-x64" / "Sunset-Riders-Windows-x64.exe"
 lin = ART / "Sunset-Riders-linux-x86_64" / "Sunset-Riders-Linux-x86_64.AppImage"
 mac = ART / "Sunset-Riders-macos-arm64" / "Sunset-Riders-macOS-arm64.zip"
@@ -35,15 +35,15 @@ def main():
         "game_id": "sunset-riders",
         "game_name": "رعاة البقر (Sunset Riders)",
         "package_name": "com.midoali.snes.sunsetriders",
-        "version_code": 1,
-        "version_name": "1.0",
+        "version_code": 2,
+        "version_name": "1.1",
         "min_android_sdk": 26,
-        "apk_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-v1.0/Sunset-Riders-1.0.apk",
+        "apk_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-v1.1/Sunset-Riders-1.1.apk",
         "apk_sha256": apk_sha,
         "apk_size_bytes": apk_size,
-        "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-v1.0",
+        "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-v1.1",
         "published_at": now_utc,
-        "release_notes_ar": "إصدار لعبة رعاة البقر (Sunset Riders) بجودة صورة فائقة True HD 2x Scale2x + GPU Filter، وصوت ستيريو نقي 60 إطار/ثانية، وشاشة عريضة بعرض الموبايل، وعصاية تحكم حرة 360°، وزر إعادة تشغيل اللعبة (Reset Game)، وزر About داخل الضبط.",
+        "release_notes_ar": "الإصدار 1.1: صورة بألوان زاهية مشبعة وساطعة (Vibrant Arcade Color LUT + Bright Gamma) مع تكبير 4x Scale4x فائق الوضوح (1024×896) بدون أي تمويه، وإزالة تشويش السماء والتدرجات بدقة، وصوت ستيريو نقي 60 إطار/ثانية، وشاشة عريضة بعرض الموبايل، وعصاية تحكم حرة 360°، وزر إعادة تشغيل اللعبة (Reset Game)، وزر About داخل الضبط.",
         "required": False,
     }
     (ROOT / "updates/games/sunset-riders.json").write_text(
@@ -55,23 +55,23 @@ def main():
         "game": "sunset-riders-desktop",
         "platforms": {
             "windows": {
-                "version": "1.0.0",
-                "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.0.0",
-                "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.0.0/Sunset-Riders-Windows-x64.exe",
+                "version": "1.1.0",
+                "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.1.0",
+                "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-Windows-x64.exe",
                 "size": win_size,
                 "sha256": win_sha,
             },
             "linux": {
-                "version": "1.0.0",
-                "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.0.0",
-                "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.0.0/Sunset-Riders-Linux-x86_64.AppImage",
+                "version": "1.1.0",
+                "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.1.0",
+                "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-Linux-x86_64.AppImage",
                 "size": lin_size,
                 "sha256": lin_sha,
             },
             "macos": {
-                "version": "1.0.0",
-                "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.0.0",
-                "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.0.0/Sunset-Riders-macOS-arm64.zip",
+                "version": "1.1.0",
+                "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-desktop-v1.1.0",
+                "download_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-macOS-arm64.zip",
                 "size": mac_size,
                 "sha256": mac_sha,
             },
@@ -83,10 +83,10 @@ def main():
     )
 
     archives = [
-        ("Android", "1.0", apk, apk_sha, apk_size),
-        ("Windows", "1.0.0", win, win_sha, win_size),
-        ("Linux", "1.0.0", lin, lin_sha, lin_size),
-        ("macOS", "1.0.0", mac, mac_sha, mac_size),
+        ("Android", "1.1", apk, apk_sha, apk_size),
+        ("Windows", "1.1.0", win, win_sha, win_size),
+        ("Linux", "1.1.0", lin, lin_sha, lin_size),
+        ("macOS", "1.1.0", mac, mac_sha, mac_size),
     ]
     for os_name, ver, src, sha, sz in archives:
         dest_dir = ROOT / "RELEASE-ARCHIVE" / os_name / "Sunset-Riders" / ver

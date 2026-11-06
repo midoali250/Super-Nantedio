@@ -13,8 +13,8 @@ import android.view.SurfaceView;
 /**
  * Hardware-accelerated HD surface view for Sunset Riders (رعاة البقر).
  * Uses GPU-accelerated SurfaceHolder.lockHardwareCanvas() with hardware
- * bilinear texture filtering on top of the native 2x HQ Scale2x + De-Dither
- * frame buffer for 60 FPS True HD visuals across widescreen mobile displays.
+ * bilinear texture filtering on top of the native 4x True HD Scale4x
+ * frame buffer for 60 FPS razor-sharp vibrant visuals across widescreen mobile displays.
  */
 final class GameView extends SurfaceView implements SurfaceHolder.Callback {
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);

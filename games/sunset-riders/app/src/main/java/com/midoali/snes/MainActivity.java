@@ -157,14 +157,14 @@ public final class MainActivity extends Activity {
         box.setPadding(padding, padding, padding, padding);
 
         TextView vfTitle = new TextView(this);
-        vfTitle.setText("جودة الصورة (True HD Video Quality):");
+        vfTitle.setText("جودة الصورة (True HD Vibrant Video Quality):");
         vfTitle.setTypeface(Typeface.DEFAULT_BOLD);
         box.addView(vfTitle);
 
         RadioGroup vfGroup = new RadioGroup(this);
         String[] vfLabels = {
-                "فائق الوضوح True HD Crisp (2x Scale2x + GPU Filter)",
-                "ناعم فائق السلاسة Ultra Smooth (2x Bilinear)",
+                "فائق الوضوح True HD Crisp (4x Scale4x + ألوان زاهية)",
+                "ناعم فائق السلاسة Ultra Smooth (4x Bilinear)",
                 "بيكسل أصلي حاد Raw Pixel (1x)",
         };
         int currentVf = prefs.getInt("video_filter", SnesCore.VIDEO_FILTER_HD_CRISP);
@@ -227,7 +227,7 @@ public final class MainActivity extends Activity {
         addSlider(box, "وضوح الأزرار", "opacity", 25, 100, 75);
 
         TextView hint = new TextView(this);
-        hint.setText("رعاة البقر (Sunset Riders) — جودة صورة True HD مضاعفة (Scale2x + GPU) + عصاية تحكم حرة 360° + شاشة عريضة + صوت ستيريو نقي 60 إطار/ثانية.");
+        hint.setText("رعاة البقر (Sunset Riders) — صورة True HD ربعية الدقة (Scale4x 4x) بألوان زاهية شديدة الوضوح + عصاية تحكم حرة 360° + شاشة عريضة + صوت ستيريو نقي 60 إطار/ثانية.");
         box.addView(hint);
 
         ScrollView scroll = new ScrollView(this);

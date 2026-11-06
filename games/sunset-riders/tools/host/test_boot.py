@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Host-side boot, gameplay, True HD 2x Scale2x image quality, and Reset Game
+Host-side boot, gameplay, True HD 4x Scale4x image quality, and Reset Game
 verification for Sunset Riders (USA) [Sega Genesis] — رعاة البقر.
 
 Builds and loads the exact C code (snes_jni.c + Genesis Plus GX) that ships in
@@ -8,8 +8,8 @@ the APK and Desktop binaries, feeds the bundled sunsetriders.bin ROM, runs
 frames through the Konami intro, title screen, character select, and Stage 1
 gameplay, and verifies:
   1. ROM loads and boots cleanly with immediate non-blank Konami logo frame.
-  2. Default True HD Crisp (2x Scale2x + De-Dither + HD Color LUT) outputs
-     512x448 / 640x448 frames, while Raw Pixel mode outputs 256x224 / 320x224.
+  2. Default True HD Crisp (4x Scale4x + Vibrant Arcade Color LUT) outputs
+     1024x896 / 1280x896 frames, while Raw Pixel mode outputs 256x224 / 320x224.
   3. Stereo 16-bit PCM audio is produced (~44100 Hz) with zero static.
   4. Hardware reset (host_reset / nativeReset) cleanly restarts the game back
      to the Konami logo / title screen with non-blank frames.
@@ -84,7 +84,7 @@ def main():
     assert lib.host_start(rom, len(rom)) == 1, "nativeStart failed"
 
     os.makedirs(SHOTS, exist_ok=True)
-    buf = ctypes.create_string_buffer(800 * 600 * 2)
+    buf = ctypes.create_string_buffer(1600 * 1200 * 2)
 
     def grab():
         n = lib.host_video(buf, len(buf))
@@ -98,7 +98,7 @@ def main():
         for _ in range(frames):
             lib.host_frame()
 
-    # Verify default video filter is HD Crisp (0) -> 2x upscaled resolution (512x448 or 640x448)
+    # Verify default video filter is HD Crisp (0) -> 4x upscaled resolution (1024x896 or 1280x896)
     assert lib.host_get_video_filter() == 0, "Expected default VIDEO_FILTER_HD_CRISP (0)"
 
     # Verify warm-up boot immediately shows a non-blank frame
@@ -113,15 +113,15 @@ def main():
     title_rgb, title_c, w, h = grab()
     write_png(os.path.join(SHOTS, "title.png"), title_rgb, w, h)
     print(f"title:     {w}x{h}, {title_c} colours")
-    assert w >= 512 and h >= 448, f"Expected 2x HD upscaled frame, got {w}x{h}"
+    assert w >= 1024 and h >= 896, f"Expected 4x True HD upscaled frame, got {w}x{h}"
 
     # Verify switching video filter modes works dynamically
     lib.host_set_video_filter(2)  # Raw Pixel (1x)
     assert lib.host_get_video_filter() == 2
     run(1)
     _, _, raw_w, raw_h = grab()
-    assert raw_w * 2 == w and raw_h * 2 == h, f"Expected 1x raw dimensions, got {raw_w}x{raw_h}"
-    lib.host_set_video_filter(0)  # Restore HD Crisp (2x)
+    assert raw_w * 4 == w and raw_h * 4 == h, f"Expected 1x raw dimensions, got {raw_w}x{raw_h}"
+    lib.host_set_video_filter(0)  # Restore HD Crisp (4x)
     assert lib.host_get_video_filter() == 0
 
     # Advance through Character Select into Stage 1
@@ -138,7 +138,7 @@ def main():
     run(10, (1 << START) | (1 << B))
     run(260)
 
-    # Measure per-frame speed in True HD 2x Scale2x mode during active gameplay
+    # Measure per-frame speed in True HD 4x Scale4x mode during active gameplay
     t0 = time.perf_counter()
     for i in range(60):
         mask = (1 << RIGHT) | ((1 << B) if (i % 4 < 2) else 0)
