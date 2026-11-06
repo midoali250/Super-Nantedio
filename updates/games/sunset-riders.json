@@ -7,10 +7,10 @@
   "version_name": "1.1",
   "min_android_sdk": 26,
   "apk_url": "https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-v1.1/Sunset-Riders-1.1.apk",
-  "apk_sha256": "019865fe1ccd9727ac3e0a566baf589af01e5bd6d5f14d8ecc4d779fb9177f4a",
+  "apk_sha256": "716b021329505cde2537111790a4f9833346c5ce4707d9ed763f86d4bd534ba0",
   "apk_size_bytes": 20210307,
   "release_url": "https://github.com/midoali250/bitvault-engine/releases/tag/sunset-riders-v1.1",
-  "published_at": "2026-11-06T00:41:04Z",
+  "published_at": "2026-11-06T01:15:27Z",
   "release_notes_ar": "الإصدار 1.1: صورة بألوان زاهية مشبعة وساطعة (Vibrant Arcade Color LUT + Bright Gamma) مع تكبير 4x Scale4x فائق الوضوح (1024×896) بدون أي تمويه، وإزالة تشويش السماء والتدرجات بدقة، وصوت ستيريو نقي 60 إطار/ثانية، وشاشة عريضة بعرض الموبايل، وعصاية تحكم حرة 360°، وزر إعادة تشغيل اللعبة (Reset Game)، وزر About داخل الضبط.",
   "required": false
 }
