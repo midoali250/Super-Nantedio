@@ -20,8 +20,8 @@ import java.nio.ByteOrder;
 final class Emulator implements Runnable {
     private static final String TAG = "SnesEmu";
     private static final int AUDIO_FRAMES_PER_READ = 2048;
-    private static final int MAX_FB_W = 800;
-    private static final int MAX_FB_H = 600;
+    private static final int MAX_FB_W = 1600;
+    private static final int MAX_FB_H = 1200;
 
     private final Context context;
     private final byte[] rom;
@@ -42,7 +42,7 @@ final class Emulator implements Runnable {
     private ByteBuffer frameBuffer;
     private final short[] audioBuffer = new short[AUDIO_FRAMES_PER_READ * 2];
 
-    private int frameWidth = 640, frameHeight = 448;
+    private int frameWidth = 1024, frameHeight = 896;
 
     Emulator(Context context, byte[] rom, GameView view, VirtualPad pad) {
         this.context = context.getApplicationContext();
@@ -199,8 +199,8 @@ final class Emulator implements Runnable {
 
     private void ensureBitmap(int w, int h) {
         if (w <= 0 || h <= 0 || w > MAX_FB_W || h > MAX_FB_H) {
-            w = 640;
-            h = 448;
+            w = 1024;
+            h = 896;
         }
         if (bitmap == null || w != frameWidth || h != frameHeight) {
             frameWidth = w;

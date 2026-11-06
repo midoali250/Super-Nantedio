@@ -4,7 +4,7 @@ Self-contained native desktop build of **رعاة البقر (Sunset Riders)** f
 
 ## Features
 
-- **True HD 2x Scale2x + Genesis De-Dither + HD Color LUT** (`512x448` / `640x448` internal HD upscaling + smooth window scaling)
+- **True HD 4x Scale4x + Vibrant Arcade Color LUT + Strict 2D Checkerboard De-Dither** (`1024x896` / `1280x896` internal HD upscaling + smooth window scaling)
 - **Instant Boot & Reset Game (`Reset game` in menu or `F5` key)**: Starts immediately at the Konami logo / title screen with hardware reset support at any time.
 - **Full Widescreen (`Fill screen`)** or **Original 4:3 (`Fit`)**
 - **About Page (in Settings & Main Menu)**:

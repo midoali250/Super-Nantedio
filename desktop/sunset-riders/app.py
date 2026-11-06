@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sunset Riders (Cowboys) desktop frontend, Genesis Plus GX core + True HD 2x Scale2x Video."""
+"""Sunset Riders (Cowboys) desktop frontend, Genesis Plus GX core + True HD 4x Scale4x Video."""
 import ctypes as C
 import hashlib, json, math, os, re, subprocess, sys, tempfile, textwrap, threading, time, urllib.request
 from pathlib import Path
@@ -16,7 +16,7 @@ if sys.platform == 'win32':
 
 import pygame
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 CATALOG = 'https://raw.githubusercontent.com/midoali250/bitvault-engine/refs/heads/main/updates/desktop/sunset-riders.json'
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 
@@ -31,8 +31,8 @@ ABOUT_PLAIN_TEXT = ABOUT_RAW_MARKDOWN.replace('**', '')
 
 FILTER_MODES = ['hd_crisp', 'smooth', 'sharp']
 FILTER_LABELS = {
-    'hd_crisp': 'True HD Crisp (2x Scale2x + De-Dither + GPU Filter)',
-    'smooth': 'Ultra Smooth (2x Bilinear)',
+    'hd_crisp': 'True HD Crisp (4x Scale4x + Vibrant Arcade Colors)',
+    'smooth': 'Ultra Smooth (4x Bilinear)',
     'sharp': 'Raw Pixel (1x Sharp)',
 }
 FILTER_NATIVE = {
@@ -75,7 +75,7 @@ class Core:
             raise RuntimeError('Could not start ROM')
         self.w = self.lib.host_width()
         self.h = self.lib.host_height()
-        self.video = C.create_string_buffer(800 * 600 * 2)
+        self.video = C.create_string_buffer(1600 * 1200 * 2)
         self.audio = (C.c_int16 * 4096)()
 
     def frame(self, mask):
@@ -531,11 +531,11 @@ def self_test():
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
     pygame.init()
-    pygame.display.set_mode((640, 448))
+    pygame.display.set_mode((1024, 896))
     apply_window_icon()
     assert 'Ahmed Kamal Elgandy' in ABOUT_RAW_MARKDOWN and 'intellectual property rights' in ABOUT_PLAIN_TEXT
     core = Core()
-    assert core.w >= 512 and core.h >= 384, f'Expected 2x HD geometry, got: {core.w}x{core.h}'
+    assert core.w >= 1024 and core.h >= 768, f'Expected 4x HD geometry, got: {core.w}x{core.h}'
     raw0 = core.framebuffer()
     assert any(b != 0 for b in raw0), 'Expected non-blank warm-up boot frame'
 
@@ -549,7 +549,7 @@ def self_test():
         m = ((1 << 3) | (1 << 0)) if (i in range(150, 160) or i in range(300, 310) or i in range(420, 430) or i in range(520, 530)) else 0
         core.frame(m)
         core.samples()
-    assert core.w >= 512 and core.h == 448, f'Expected 2x True HD gameplay geometry, got: {core.w}x{core.h}'
+    assert core.w >= 1024 and core.h == 896, f'Expected 4x True HD gameplay geometry, got: {core.w}x{core.h}'
 
     core.lib.retro_get_memory_data.argtypes = [C.c_uint]
     core.lib.retro_get_memory_data.restype = C.POINTER(C.c_uint8)

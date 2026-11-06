@@ -158,16 +158,16 @@ python3 tools/host/test_boot.py
 
 [مشروع الأندرويد](games/sunset-riders/) — [مشروع سطح المكتب](desktop/sunset-riders/)
 
-### المزايا المدمجة (الإصدار 1.0 / 1.0.0)
-- **جودة صورة فائقة True HD (2x Scale2x + De-Dither + HD Color LUT + GPU Filter)**: تكبير فوري بضعف الدقة (`640×448` / `512×448`) مع إزالة التشرشر وتنقية ألوان Sega Genesis VDP وتسريع العتاد (`lockHardwareCanvas` + `RGB_565` بدون نسخ في الجافا).
+### المزايا المدمجة (الإصدار 1.1 / 1.1.0)
+- **جودة صورة فائقة True HD بألوان زاهية (`4x Scale4x + Vibrant Arcade Color LUT + Strict 2D De-Dither`)**: تكبير فوري بربع دقة (`1024×896` / `1280×896`) بدون أي تمويه، مع رفع سطوع وإشباع الألوان (Bright Arcade Gamma + Hue-Preserving Vibrance) وإزالة تشويش تدرجات السماء والصحراء بدقة، وتسريع العتاد (`lockHardwareCanvas` + `RGB_565` بدون نسخ في الجافا).
 - **أداء سريع جدًا (60 إطار/ثانية) وصوت ستيريو نقي**: ضبط نواة `Genesis-Plus-GX` (`YM2612 Enhanced` بدون استنزاف مرشحات التردد الفائق) مع تزامن صوتي سلس على الأندرويد وسطح المكتب.
 - **زر إعادة تشغيل اللعبة (`Reset Game` / `🔄 ريست`)**: متاح مباشرة في شريط التحكم العلوي وقائمة الإعدادات على الأندرويد، وفي القائمة الرئيسية أو اختصار `F5` على سطح المكتب (`Windows` / `Linux` / `macOS`).
 - **عصاية تحكم حرة 360° وشاشة عريضة بعرض الموبايل** + **قسم `About`** باسم **Ahmed Kamal Elgandy**.
 
 | النظام | الحزمة | ملف بصمة التحديثات | أرشيف الإصدارات |
 | --- | --- | --- | --- |
-| **Android APK** | [Sunset-Riders-1.0.apk](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-v1.0/Sunset-Riders-1.0.apk) | [`updates/games/sunset-riders.json`](updates/games/sunset-riders.json) | [`RELEASE-ARCHIVE/Android/Sunset-Riders/1.0/`](RELEASE-ARCHIVE/Android/Sunset-Riders/1.0/) |
-| **Windows x64 Portable EXE** | [Sunset-Riders-Windows-x64.exe](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.0.0/Sunset-Riders-Windows-x64.exe) | [`updates/desktop/sunset-riders.json`](updates/desktop/sunset-riders.json) | [`RELEASE-ARCHIVE/Windows/Sunset-Riders/1.0.0/`](RELEASE-ARCHIVE/Windows/Sunset-Riders/1.0.0/) |
-| **Linux x86_64 AppImage** | [Sunset-Riders-Linux-x86_64.AppImage](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.0.0/Sunset-Riders-Linux-x86_64.AppImage) | [`updates/desktop/sunset-riders.json`](updates/desktop/sunset-riders.json) | [`RELEASE-ARCHIVE/Linux/Sunset-Riders/1.0.0/`](RELEASE-ARCHIVE/Linux/Sunset-Riders/1.0.0/) |
-| **macOS Apple Silicon (App ZIP)** | [Sunset-Riders-macOS-arm64.zip](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.0.0/Sunset-Riders-macOS-arm64.zip) | [`updates/desktop/sunset-riders.json`](updates/desktop/sunset-riders.json) | [`RELEASE-ARCHIVE/macOS/Sunset-Riders/1.0.0/`](RELEASE-ARCHIVE/macOS/Sunset-Riders/1.0.0/) |
+| **Android APK** | [Sunset-Riders-1.1.apk](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-v1.1/Sunset-Riders-1.1.apk) | [`updates/games/sunset-riders.json`](updates/games/sunset-riders.json) | [`RELEASE-ARCHIVE/Android/Sunset-Riders/1.1/`](RELEASE-ARCHIVE/Android/Sunset-Riders/1.0/) |
+| **Windows x64 Portable EXE** | [Sunset-Riders-Windows-x64.exe](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-Windows-x64.exe) | [`updates/desktop/sunset-riders.json`](updates/desktop/sunset-riders.json) | [`RELEASE-ARCHIVE/Windows/Sunset-Riders/1.1.0/`](RELEASE-ARCHIVE/Windows/Sunset-Riders/1.1.0/) |
+| **Linux x86_64 AppImage** | [Sunset-Riders-Linux-x86_64.AppImage](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-Linux-x86_64.AppImage) | [`updates/desktop/sunset-riders.json`](updates/desktop/sunset-riders.json) | [`RELEASE-ARCHIVE/Linux/Sunset-Riders/1.1.0/`](RELEASE-ARCHIVE/Linux/Sunset-Riders/1.1.0/) |
+| **macOS Apple Silicon (App ZIP)** | [Sunset-Riders-macOS-arm64.zip](https://github.com/midoali250/bitvault-engine/releases/download/sunset-riders-desktop-v1.1.0/Sunset-Riders-macOS-arm64.zip) | [`updates/desktop/sunset-riders.json`](updates/desktop/sunset-riders.json) | [`RELEASE-ARCHIVE/macOS/Sunset-Riders/1.1.0/`](RELEASE-ARCHIVE/macOS/Sunset-Riders/1.1.0/) |
 

@@ -3,8 +3,8 @@
  * driven from Android through JNI and Desktop through hostjni.
  *
  * Features:
- *   1. Ultra-fast (-O3) True HD 2x Pixel-Art Upscaler (Scale2x / EPX +
- *      Genesis VDP horizontal de-dithering + 9-bit VDP to 16-bit HD color LUT).
+ *   1. Ultra-fast (-O3) True HD 4x Pixel-Art Upscaler (2-stage Scale2x / EPX +
+ *      strict 2D checkerboard de-dither + Vibrant Arcade CRT gamma & chroma LUT).
  *   2. Enhanced 14-bit YM2612 FM + SN76489 PSG stereo audio pipeline with
  *      zero heap allocations per frame.
  *   3. Clean hardware reset support (nativeReset / retro_reset) with instant
@@ -20,13 +20,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "libretro.h"
 
 #define SRC_MAX_W 400
 #define SRC_MAX_H 300
-#define FB_MAX_W  800
-#define FB_MAX_H  600
+#define MID_MAX_W 800
+#define MID_MAX_H 600
+#define FB_MAX_W  1600
+#define FB_MAX_H  1200
 #define AUDIO_RING_FRAMES 16384
 #define AUDIO_POP_MAX     4096
 
@@ -40,6 +43,7 @@ static size_t    g_rom_len;
 static uint16_t  g_color_lut[65536];
 static int       g_lut_ready;
 static uint16_t  g_dedith[SRC_MAX_W * SRC_MAX_H];
+static uint16_t  g_mid2x[MID_MAX_W * MID_MAX_H];
 static uint32_t  g_fb_aligned[(FB_MAX_W * FB_MAX_H) / 2];
 #define g_fb ((uint16_t *)g_fb_aligned)
 static int       g_fb_w, g_fb_h, g_fb_pitch_px;
@@ -76,7 +80,7 @@ static void core_log(enum retro_log_level level, const char *fmt, ...)
 
 static struct retro_log_callback g_log = { core_log };
 
-/* Precompute HD color & contrast enhancement LUT for Genesis 9-bit VDP RGB565 */
+/* Precompute Vibrant Arcade CRT Gamma & Hue-Preserving Chroma LUT for Genesis VDP RGB565 */
 static void init_hd_color_lut(void)
 {
    int v;
@@ -93,22 +97,55 @@ static void init_hd_color_lut(void)
       int g = (g6 << 2) | (g6 >> 4);
       int b = (b5 << 3) | (b5 >> 2);
 
-      /* Subtle HD contrast & vibrance boost: deepens shadows slightly and
-       * expands Genesis 9-bit DAC highlights to crisp full-scale white */
-      int luma = (r * 77 + g * 150 + b * 29) >> 8;
-      r = r + ((r - luma) * 3 >> 4);
-      g = g + ((g - luma) * 3 >> 4);
-      b = b + ((b - luma) * 3 >> 4);
+      if (r == 0 && g == 0 && b == 0)
+      {
+         g_color_lut[v] = 0;
+         continue;
+      }
 
-      r = ((r - 8) * 268) >> 8;
-      g = ((g - 8) * 268) >> 8;
-      b = ((b - 8) * 268) >> 8;
+      /* 1. Expand Genesis 9-bit normal DAC ceiling (238 -> 255) so level 7
+       * reaches true 100% full-scale white and bright primaries. */
+      r = (r * 255 + 119) / 238; if (r > 255) r = 255;
+      g = (g * 255 + 119) / 238; if (g > 255) g = 255;
+      b = (b * 255 + 119) / 238; if (b > 255) b = 255;
 
-      if (r < 0) r = 0; else if (r > 255) r = 255;
-      if (g < 0) g = 0; else if (g > 255) g = 255;
-      if (b < 0) b = 0; else if (b > 255) b = 255;
+      /* 2. Bright Arcade CRT Gamma Lift (gamma = 0.68): lifts dark and midtone
+       * steps (saloon wood, green crates, desert sand, cowboy outfits) so
+       * nothing looks dark, muddy, or dim, while keeping 0 as pure black. */
+      double rf = pow((double)r / 255.0, 0.68) * 255.0;
+      double gf = pow((double)g / 255.0, 0.68) * 255.0;
+      double bf = pow((double)b / 255.0, 0.68) * 255.0;
 
-      g_color_lut[v] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+      /* 3. Hue-Preserving HSV Vibrance & Chroma Boost:
+       * Increases color saturation without darkening secondary channels
+       * (keeps sky blue bright azure, sand warm golden-yellow, and greens
+       * lush emerald). */
+      double mx = rf;
+      if (gf > mx) mx = gf;
+      if (bf > mx) mx = bf;
+      double mn = rf;
+      if (gf < mn) mn = gf;
+      if (bf < mn) mn = bf;
+
+      if (mx > mn && mx > 0.0)
+      {
+         double boost_mx = mx * 1.08;
+         if (boost_mx > 255.0) boost_mx = 255.0;
+         double sat = (mx - mn) / mx;
+         double new_sat = sat * 1.32;
+         if (new_sat > 1.0) new_sat = 1.0;
+         double new_mn = boost_mx * (1.0 - new_sat);
+
+         rf = new_mn + ((rf - mn) / (mx - mn)) * (boost_mx - new_mn);
+         gf = new_mn + ((gf - mn) / (mx - mn)) * (boost_mx - new_mn);
+         bf = new_mn + ((bf - mn) / (mx - mn)) * (boost_mx - new_mn);
+      }
+
+      int ri = (int)(rf + 0.5); if (ri < 0) ri = 0; else if (ri > 255) ri = 255;
+      int gi = (int)(gf + 0.5); if (gi < 0) gi = 0; else if (gi > 255) gi = 255;
+      int bi = (int)(bf + 0.5); if (bi < 0) bi = 0; else if (bi > 255) bi = 255;
+
+      g_color_lut[v] = (uint16_t)(((ri >> 3) << 11) | ((gi >> 2) << 5) | (bi >> 3));
    }
    g_lut_ready = 1;
 }
@@ -231,31 +268,79 @@ static bool env_cb(unsigned cmd, void *data)
 }
 
 /* ---------------------------------------------------------------------------
- * Ultra-fast branchless bitwise RGB565 helpers + 2x HQ Scale2x Upscaler
+ * Ultra-fast branchless bitwise RGB565 helpers + 4x True HD Scale4x Upscaler
  * ------------------------------------------------------------------------- */
 static inline uint16_t rgb565_avg(uint16_t a, uint16_t b)
 {
    return (uint16_t)((a & b) + (((a ^ b) & 0xF7DEu) >> 1));
 }
 
-static inline uint16_t rgb565_mix31(uint16_t a, uint16_t b)
+static void bilinear2x(const uint16_t *src, int w, int h, uint16_t *dst)
 {
-   uint16_t m = rgb565_avg(a, b);
-   return rgb565_avg(a, m);
+   int dst_w = w * 2;
+   int x, y;
+   for (y = 0; y < h; y++)
+   {
+      int yp1 = (y + 1 < h) ? (y + 1) : y;
+      const uint16_t *row0 = src + y * w;
+      const uint16_t *row1 = src + yp1 * w;
+      uint16_t *out0 = dst + (y * 2) * dst_w;
+      uint16_t *out1 = dst + (y * 2 + 1) * dst_w;
+      for (x = 0; x < w; x++)
+      {
+         int xp1 = (x + 1 < w) ? (x + 1) : x;
+         uint16_t c00 = row0[x];
+         uint16_t c10 = row0[xp1];
+         uint16_t c01 = row1[x];
+         uint16_t c11 = row1[xp1];
+         uint16_t top = rgb565_avg(c00, c10);
+         uint16_t bot = rgb565_avg(c01, c11);
+         out0[x * 2]     = c00;
+         out0[x * 2 + 1] = top;
+         out1[x * 2]     = rgb565_avg(c00, c01);
+         out1[x * 2 + 1] = rgb565_avg(top, bot);
+      }
+   }
 }
 
-static inline int rgb565_diff(uint16_t a, uint16_t b)
+static void ep2x_upscale(const uint16_t *src, int w, int h, uint16_t *dst)
 {
-   int dr, dg, db;
-   if (a == b)
-      return 0;
-   dr = (int)((a >> 11) & 0x1F) - (int)((b >> 11) & 0x1F);
-   dg = (int)((a >> 6)  & 0x1F) - (int)((b >> 6)  & 0x1F);
-   db = (int)(a & 0x1F)         - (int)(b & 0x1F);
-   if (dr < 0) dr = -dr;
-   if (dg < 0) dg = -dg;
-   if (db < 0) db = -db;
-   return dr + dg + db;
+   int dst_w = w * 2;
+   int x, y;
+   for (y = 0; y < h; y++)
+   {
+      int ym1 = (y > 0) ? (y - 1) : 0;
+      int yp1 = (y + 1 < h) ? (y + 1) : (h - 1);
+      const uint16_t *rowA = src + ym1 * w;
+      const uint16_t *rowP = src + y * w;
+      const uint16_t *rowD = src + yp1 * w;
+      uint16_t *out0 = dst + (y * 2) * dst_w;
+      uint16_t *out1 = dst + (y * 2 + 1) * dst_w;
+
+      for (x = 0; x < w; x++)
+      {
+         int xm1 = (x > 0) ? (x - 1) : 0;
+         int xp1 = (x + 1 < w) ? (x + 1) : (w - 1);
+         uint16_t P = rowP[x];
+         uint16_t A = rowA[x];
+         uint16_t B = rowP[xp1];
+         uint16_t C = rowP[xm1];
+         uint16_t D = rowD[x];
+         uint16_t e0 = P, e1 = P, e2 = P, e3 = P;
+
+         if (C != B && A != D)
+         {
+            if (C == A) e0 = A;
+            if (A == B) e1 = B;
+            if (D == C) e2 = C;
+            if (B == D) e3 = D;
+         }
+         out0[x * 2]     = e0;
+         out0[x * 2 + 1] = e1;
+         out1[x * 2]     = e2;
+         out1[x * 2 + 1] = e3;
+      }
+   }
 }
 
 static void video_cb(const void *data, unsigned width, unsigned height, size_t pitch)
@@ -288,143 +373,61 @@ static void video_cb(const void *data, unsigned width, unsigned height, size_t p
       return;
    }
 
-   /* Pass 1: True 50/50 Genesis VDP horizontal dither blending + HD Color LUT.
-    * Converts A-B-A-B checkerboard gradients into smooth 16-bit gradients. */
-   for (y = 0; y < h; y++)
-   {
-      const uint16_t *src_row = (const uint16_t *)((const uint8_t *)data + y * pitch);
-      uint16_t *dst_row = g_dedith + y * w;
-      uint16_t prev = g_color_lut[src_row[0]];
-      uint16_t curr = (w > 1) ? g_color_lut[src_row[1]] : prev;
-      dst_row[0] = prev;
-      for (x = 1; x < w - 1; x++)
-      {
-         uint16_t next = g_color_lut[src_row[x + 1]];
-         if (prev == next && prev != curr && rgb565_diff(prev, curr) < 36)
-            dst_row[x] = rgb565_avg(curr, prev);
-         else
-            dst_row[x] = curr;
-         prev = curr;
-         curr = next;
-      }
-      if (w > 1)
-         dst_row[w - 1] = curr;
-   }
-
-   g_fb_w = w * 2;
-   g_fb_h = h * 2;
-   g_fb_pitch_px = g_fb_w;
-
-   if (g_video_filter == VIDEO_FILTER_SMOOTH)
-   {
-      /* Fast 2x Bilinear interpolation using single-instruction bitwise average */
-      for (y = 0; y < h; y++)
-      {
-         int yp1 = (y + 1 < h) ? (y + 1) : y;
-         const uint16_t *row0 = g_dedith + y * w;
-         const uint16_t *row1 = g_dedith + yp1 * w;
-         uint16_t *out0 = g_fb + (y * 2) * g_fb_w;
-         uint16_t *out1 = g_fb + (y * 2 + 1) * g_fb_w;
-         for (x = 0; x < w; x++)
-         {
-            int xp1 = (x + 1 < w) ? (x + 1) : x;
-            uint16_t c00 = row0[x];
-            uint16_t c10 = row0[xp1];
-            uint16_t c01 = row1[x];
-            uint16_t c11 = row1[xp1];
-            uint16_t top = rgb565_avg(c00, c10);
-            uint16_t bot = rgb565_avg(c01, c11);
-            out0[x * 2]     = c00;
-            out0[x * 2 + 1] = top;
-            out1[x * 2]     = rgb565_avg(c00, c01);
-            out1[x * 2 + 1] = rgb565_avg(top, bot);
-         }
-      }
-      g_have_frame = 1;
-      return;
-   }
-
-   /* Pass 2 (VIDEO_FILTER_HD_CRISP): 9-tap HQ2x / xBR-style edge-directed 2x
-    * upscaler with 2:1 slope extension and symmetric anti-aliasing. */
+   /* Pass 1: Apply Vibrant Arcade Color LUT + Strict 2D Checkerboard Sky
+    * Resolver (ONLY blends true 2D alternating checkerboard gradient tiles
+    * where left==right, top/bottom match, and >=2 diagonals match P; never
+    * blurs 1-pixel text strokes, eyes, guns, or sprite outlines). */
    for (y = 0; y < h; y++)
    {
       int ym1 = (y > 0) ? (y - 1) : 0;
       int yp1 = (y + 1 < h) ? (y + 1) : (h - 1);
-      const uint16_t *rowA = g_dedith + ym1 * w;
-      const uint16_t *rowP = g_dedith + y * w;
-      const uint16_t *rowD = g_dedith + yp1 * w;
-      uint16_t *out0 = g_fb + (y * 2) * g_fb_w;
-      uint16_t *out1 = g_fb + (y * 2 + 1) * g_fb_w;
+      const uint16_t *rowA = (const uint16_t *)((const uint8_t *)data + ym1 * pitch);
+      const uint16_t *rowP = (const uint16_t *)((const uint8_t *)data + y * pitch);
+      const uint16_t *rowD = (const uint16_t *)((const uint8_t *)data + yp1 * pitch);
+      uint16_t *dst_row = g_dedith + y * w;
 
       for (x = 0; x < w; x++)
       {
          int xm1 = (x > 0) ? (x - 1) : 0;
          int xp1 = (x + 1 < w) ? (x + 1) : (w - 1);
-         uint16_t P = rowP[x];
-         uint16_t A = rowA[x];
-         uint16_t B = rowP[xp1];
-         uint16_t C = rowP[xm1];
-         uint16_t D = rowD[x];
-         uint16_t UL, UR, DL, DR;
-         uint16_t e0, e1, e2, e3;
+         uint16_t rawP = rowP[x];
+         uint16_t rawC = rowP[xm1];
+         uint16_t rawB = rowP[xp1];
+         uint16_t rawA = rowA[x];
+         uint16_t rawD = rowD[x];
+         uint16_t P = g_color_lut[rawP];
 
-         if (P == A && P == B && P == C && P == D)
+         if (rawC == rawB && rawC != rawP && (rawA == rawC || rawD == rawC))
          {
-            out0[x * 2]     = P;
-            out0[x * 2 + 1] = P;
-            out1[x * 2]     = P;
-            out1[x * 2 + 1] = P;
-            continue;
-         }
-
-         UL = rowA[xm1];
-         UR = rowA[xp1];
-         DL = rowD[xm1];
-         DR = rowD[xp1];
-         e0 = P; e1 = P; e2 = P; e3 = P;
-
-         if (C != B && A != D)
-         {
-            int ca = (C == A || rgb565_diff(C, A) < 8);
-            int ab = (A == B || rgb565_diff(A, B) < 8);
-            int dc = (D == C || rgb565_diff(D, C) < 8);
-            int bd = (B == D || rgb565_diff(B, D) < 8);
-
-            if (ca && !ab && !dc)
+            int diag = (rowA[xm1] == rawP) + (rowA[xp1] == rawP) +
+                       (rowD[xm1] == rawP) + (rowD[xp1] == rawP);
+            if (diag >= 2)
             {
-               uint16_t m = rgb565_avg(C, A);
-               e0 = (P == B || P == D) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
-               if (A == UR && P != UR) e1 = rgb565_mix31(P, m);
-               if (C == DL && P != DL) e2 = rgb565_mix31(P, m);
-            }
-            if (ab && !ca && !bd)
-            {
-               uint16_t m = rgb565_avg(A, B);
-               e1 = (P == C || P == D) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
-               if (A == UL && P != UL) e0 = rgb565_mix31(P, m);
-               if (B == DR && P != DR) e3 = rgb565_mix31(P, m);
-            }
-            if (dc && !ca && !bd)
-            {
-               uint16_t m = rgb565_avg(D, C);
-               e2 = (P == B || P == A) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
-               if (C == UL && P != UL) e0 = rgb565_mix31(P, m);
-               if (D == DR && P != DR) e3 = rgb565_mix31(P, m);
-            }
-            if (bd && !ab && !dc)
-            {
-               uint16_t m = rgb565_avg(B, D);
-               e3 = (P == C || P == A) ? rgb565_mix31(m, P) : rgb565_avg(P, m);
-               if (B == UR && P != UR) e1 = rgb565_mix31(P, m);
-               if (D == DL && P != DL) e2 = rgb565_mix31(P, m);
+               dst_row[x] = rgb565_avg(P, g_color_lut[rawC]);
+               continue;
             }
          }
-         out0[x * 2]     = e0;
-         out0[x * 2 + 1] = e1;
-         out1[x * 2]     = e2;
-         out1[x * 2 + 1] = e3;
+         dst_row[x] = P;
       }
    }
+
+   /* Pass 2: 2-Stage Pure Scale4x (1x -> 2x -> 4x: 1024x896 / 1280x896)
+    * Preserves 100% pure vibrant colors and crisp black outlines while
+    * rounding diagonal edges at 4x HD resolution with zero blur. */
+   if (g_video_filter == VIDEO_FILTER_SMOOTH)
+   {
+      /* Optional smooth mode: 2x bilinear -> 2x bilinear (soft 4x HD) */
+      bilinear2x(g_dedith, w, h, g_mid2x);
+      bilinear2x(g_mid2x, w * 2, h * 2, g_fb);
+   }
+   else
+   {
+      ep2x_upscale(g_dedith, w, h, g_mid2x);
+      ep2x_upscale(g_mid2x, w * 2, h * 2, g_fb);
+   }
+   g_fb_w = w * 4;
+   g_fb_h = h * 4;
+   g_fb_pitch_px = g_fb_w;
    g_have_frame = 1;
 }
 

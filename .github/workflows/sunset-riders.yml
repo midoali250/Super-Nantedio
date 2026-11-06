@@ -69,13 +69,13 @@ jobs:
           SDK="$ANDROID_HOME/build-tools/35.0.0"
           APK="app/build/outputs/apk/release/app-release.apk"
           "$SDK/apksigner" verify --verbose --print-certs "$APK"
-          "$SDK/aapt" dump badging "$APK" | grep "package: name='com.midoali.snes.sunsetriders' versionCode='1' versionName='1.0'"
+          "$SDK/aapt" dump badging "$APK" | grep "package: name='com.midoali.snes.sunsetriders' versionCode='2' versionName='1.1'"
           python3 ../../tools/naming/verify_apks.py "$APK"
-          cp "$APK" Sunset-Riders-1.0.apk
+          cp "$APK" Sunset-Riders-1.1.apk
       - uses: actions/upload-artifact@v4
         with:
           name: sunset-riders-android
-          path: games/sunset-riders/Sunset-Riders-1.0.apk
+          path: games/sunset-riders/Sunset-Riders-1.1.apk
           if-no-files-found: error
 
   windows:
@@ -214,26 +214,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          APK="/tmp/sr-artifacts/sunset-riders-android/Sunset-Riders-1.0.apk"
+          APK="/tmp/sr-artifacts/sunset-riders-android/Sunset-Riders-1.1.apk"
           WIN="/tmp/sr-artifacts/Sunset-Riders-Windows-x64/Sunset-Riders-Windows-x64.exe"
           LIN="/tmp/sr-artifacts/Sunset-Riders-linux-x86_64/Sunset-Riders-Linux-x86_64.AppImage"
           MAC="/tmp/sr-artifacts/Sunset-Riders-macos-arm64/Sunset-Riders-macOS-arm64.zip"
           chmod +x "$LIN"
 
-          if gh release view sunset-riders-v1.0 >/dev/null 2>&1; then
-            gh release upload sunset-riders-v1.0 "$APK" --clobber
+          if gh release view sunset-riders-v1.1 >/dev/null 2>&1; then
+            gh release upload sunset-riders-v1.1 "$APK" --clobber
           else
-            gh release create sunset-riders-v1.0 "$APK" \
-              --title "رعاة البقر — Sunset Riders 1.0 (Android)" \
-              --notes "الإصدار 1.0 للعبة رعاة البقر (Sunset Riders) على أندرويد بجودة صورة فائقة True HD 2x Scale2x + GPU، وصوت ستيريو نقي 60 إطار/ثانية، وشاشة عريضة بعرض الموبايل، وعصاية تحكم حرة 360°، وزر Reset Game، وزر About داخل الضبط."
+            gh release create sunset-riders-v1.1 "$APK" \
+              --title "رعاة البقر — Sunset Riders 1.1 (Android)" \
+              --notes "الإصدار 1.1: صور بألوان زاهية مشبعة وساطعة (Vibrant Arcade Color LUT + Gamma) مع تكبير 4x Scale4x فائق الوضوح (1024×896) بدون أي تمويه، وإزالة تشويش السماء/التدرجات بدقة، وصوت ستيريو نقي 60 إطار/ثانية، وشاشة عريضة، وعصاية تحكم حرة 360°، وزر Reset Game."
           fi
 
-          if gh release view sunset-riders-desktop-v1.0.0 >/dev/null 2>&1; then
-            gh release upload sunset-riders-desktop-v1.0.0 "$WIN" "$LIN" "$MAC" --clobber
+          if gh release view sunset-riders-desktop-v1.1.0 >/dev/null 2>&1; then
+            gh release upload sunset-riders-desktop-v1.1.0 "$WIN" "$LIN" "$MAC" --clobber
           else
-            gh release create sunset-riders-desktop-v1.0.0 "$WIN" "$LIN" "$MAC" \
-              --title "رعاة البقر — Sunset Riders Desktop 1.0.0 (Windows / Linux / macOS)" \
-              --notes "الإصدار 1.0.0 لسطح المكتب للعبة رعاة البقر (Sunset Riders): Windows Portable EXE و Linux AppImage و macOS arm64 App بجودة True HD 2x Scale2x وزر Reset Game."
+            gh release create sunset-riders-desktop-v1.1.0 "$WIN" "$LIN" "$MAC" \
+              --title "رعاة البقر — Sunset Riders Desktop 1.1.0 (Windows / Linux / macOS)" \
+              --notes "الإصدار 1.1.0 لسطح المكتب: Windows Portable EXE و Linux AppImage و macOS arm64 App بجودة صورة True HD 4x Scale4x (1024×896) وألوان زاهية مشبعة (Vibrant Arcade Color LUT)، مع زر Reset Game."
           fi
 
           python3 tools/publish_sunset_riders.py
@@ -245,13 +245,13 @@ jobs:
             git checkout d54a58c -- RELEASE-ARCHIVE/Windows/1.4.0 RELEASE-ARCHIVE/Linux/1.4.0 RELEASE-ARCHIVE/macOS/1.4.0 RELEASE-ARCHIVE/Windows/The-Mask RELEASE-ARCHIVE/Linux/The-Mask RELEASE-ARCHIVE/macOS/The-Mask || true
             git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/
           else
-            git checkout HEAD -- RELEASE-ARCHIVE/Android/Sunset-Riders/1.0/Sunset-Riders-1.0.apk RELEASE-ARCHIVE/Windows/Sunset-Riders/1.0.0/Sunset-Riders-Windows-x64.exe RELEASE-ARCHIVE/Linux/Sunset-Riders/1.0.0/Sunset-Riders-Linux-x86_64.AppImage RELEASE-ARCHIVE/macOS/Sunset-Riders/1.0.0/Sunset-Riders-macOS-arm64.zip || true
-            git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/Android/Sunset-Riders/1.0/SHA256SUMS.txt RELEASE-ARCHIVE/Windows/Sunset-Riders/1.0.0/SHA256SUMS.txt RELEASE-ARCHIVE/Linux/Sunset-Riders/1.0.0/SHA256SUMS.txt RELEASE-ARCHIVE/macOS/Sunset-Riders/1.0.0/SHA256SUMS.txt
+            git checkout HEAD -- RELEASE-ARCHIVE/Android/Sunset-Riders/1.1/Sunset-Riders-1.1.apk RELEASE-ARCHIVE/Windows/Sunset-Riders/1.1.0/Sunset-Riders-Windows-x64.exe RELEASE-ARCHIVE/Linux/Sunset-Riders/1.1.0/Sunset-Riders-Linux-x86_64.AppImage RELEASE-ARCHIVE/macOS/Sunset-Riders/1.1.0/Sunset-Riders-macOS-arm64.zip || true
+            git add updates/games/sunset-riders.json updates/desktop/sunset-riders.json RELEASE-ARCHIVE/Android/Sunset-Riders/1.1/SHA256SUMS.txt RELEASE-ARCHIVE/Windows/Sunset-Riders/1.1.0/SHA256SUMS.txt RELEASE-ARCHIVE/Linux/Sunset-Riders/1.1.0/SHA256SUMS.txt RELEASE-ARCHIVE/macOS/Sunset-Riders/1.1.0/SHA256SUMS.txt
           fi
           python3 tools/naming/audit.py
           rm -f brand-audit.json
           if ! git diff --cached --quiet; then
-            git commit -m "Archive Sunset Riders (رعاة البقر) v1.0 binaries and update SHA-256 manifests"
+            git commit -m "Archive Sunset Riders (رعاة البقر) v1.1 vibrant 4x binaries and update SHA-256 manifests"
             git pull --rebase origin "${GITHUB_REF_NAME}" || true
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
