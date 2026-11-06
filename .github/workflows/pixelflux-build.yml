@@ -162,8 +162,8 @@ jobs:
           printf '[Desktop Entry]\nType=Application\nName=PixelFlux\nExec=PixelFlux\nIcon=pixelflux\nCategories=Game;Emulator;\nTerminal=false\n' > AppDir/pixelflux.desktop
           printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/PixelFlux" "$@"\n' > AppDir/AppRun
           chmod +x AppDir/AppRun
-          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          echo '62aebc77c2149e96b593b94da9bbd1881e0984a56399ff6d7a03b7ddd7c9ce68  appimagetool' | sha256sum -c -
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo 'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool' | sha256sum -c -
           chmod +x appimagetool
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir PixelFlux-Linux-x86_64.AppImage
       - name: Package macOS ZIP
