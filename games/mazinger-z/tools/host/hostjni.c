@@ -72,6 +72,8 @@ jint     Java_com_midoali_snes_SnesCore_nativeApplyCheatCode(JNIEnv *, jclass, j
 jint     Java_com_midoali_snes_SnesCore_nativeReadRamByte(JNIEnv *, jclass, jint);
 void     Java_com_midoali_snes_SnesCore_nativeSetCoreOption(JNIEnv *, jclass, jint, jstring);
 jstring  Java_com_midoali_snes_SnesCore_nativeGetCoreOption(JNIEnv *, jclass, jint);
+jint     Java_com_midoali_snes_SnesCore_nativeSaveState(JNIEnv *, jclass, jbyteArray);
+jboolean Java_com_midoali_snes_SnesCore_nativeLoadState(JNIEnv *, jclass, jbyteArray, jint);
 void     Java_com_midoali_snes_SnesCore_nativeWriteRamByte(JNIEnv *, jclass, jint, jint);
 
 static unsigned char g_video[1024 * 1024];
@@ -160,4 +162,20 @@ void host_set_core_option(int index, const char *value)
 const char *host_get_core_option(int index)
 {
    return (const char *)Java_com_midoali_snes_SnesCore_nativeGetCoreOption(&g_env, NULL, index);
+}
+/* Savestates, used by the tests to make RAM hunting deterministic. */
+static unsigned char g_state[1024 * 1024];
+int host_save_state(void)
+{
+   ByteArrayObj arr;
+   arr.data = g_state;
+   arr.len = (int)sizeof(g_state);
+   return (int)Java_com_midoali_snes_SnesCore_nativeSaveState(&g_env, NULL, (jbyteArray)&arr);
+}
+int host_load_state(void)
+{
+   ByteArrayObj arr;
+   arr.data = g_state;
+   arr.len = (int)sizeof(g_state);
+   return Java_com_midoali_snes_SnesCore_nativeLoadState(&g_env, NULL, (jbyteArray)&arr, arr.len) ? 1 : 0;
 }

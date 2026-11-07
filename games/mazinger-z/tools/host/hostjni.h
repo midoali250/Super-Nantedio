@@ -18,4 +18,6 @@ int  host_get_cheats(void);
 int  host_apply_cheat_code(int index, int enabled, const char *code);
 int  host_read_ram(int address);
 void host_write_ram(int address, int value);
+int  host_save_state(void);
+int  host_load_state(void);
 #endif

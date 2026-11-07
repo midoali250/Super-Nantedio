@@ -1,0 +1,10 @@
+# Built artifacts and ROM images are fetched at build time, never committed.
+*.so
+*.dll
+*.dylib
+*.smc
+*.sfc
+__pycache__/
+*.pyc
+build/
+dist/
