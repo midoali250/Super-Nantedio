@@ -40,9 +40,17 @@ static void  iface_set(JNIEnv *env, jshortArray a, jint start, jint len, const j
    if (!a) return;
    memcpy(((ShortArrayObj *)a)->data + start, buf, (size_t)len * sizeof(int16_t));
 }
+static void iface_setbytes(JNIEnv *env, jbyteArray a, jint start, jint len, const jbyte *buf)
+{
+   (void)env;
+   if (!a) return;
+   memcpy(((ByteArrayObj *)a)->data + start, buf, (size_t)len);
+}
+static jstring iface_newstr(JNIEnv *env, const char *utf) { (void)env; return (jstring)utf; }
 
 static const struct JNINativeInterface_ g_iface = {
    iface_len, iface_get, iface_str, iface_rel, iface_buf, iface_cap, iface_set,
+   iface_setbytes, iface_newstr,
 };
 static JNIEnv g_env = &g_iface;
 
@@ -55,6 +63,16 @@ jint     Java_com_midoali_snes_SnesCore_nativeFrameHeight(JNIEnv *, jclass);
 jint     Java_com_midoali_snes_SnesCore_nativeCopyVideo(JNIEnv *, jclass, jobject);
 void     Java_com_midoali_snes_SnesCore_nativeSetInput(JNIEnv *, jclass, jint);
 jint     Java_com_midoali_snes_SnesCore_nativeReadAudio(JNIEnv *, jclass, jshortArray, jint);
+void     Java_com_midoali_snes_SnesCore_nativeReset(JNIEnv *, jclass);
+void     Java_com_midoali_snes_SnesCore_nativeSetVideoFilter(JNIEnv *, jclass, jint);
+jint     Java_com_midoali_snes_SnesCore_nativeGetVideoFilter(JNIEnv *, jclass);
+void     Java_com_midoali_snes_SnesCore_nativeSetCheats(JNIEnv *, jclass, jint);
+jint     Java_com_midoali_snes_SnesCore_nativeGetCheats(JNIEnv *, jclass);
+jint     Java_com_midoali_snes_SnesCore_nativeApplyCheatCode(JNIEnv *, jclass, jint, jboolean, jstring);
+jint     Java_com_midoali_snes_SnesCore_nativeReadRamByte(JNIEnv *, jclass, jint);
+void     Java_com_midoali_snes_SnesCore_nativeSetCoreOption(JNIEnv *, jclass, jint, jstring);
+jstring  Java_com_midoali_snes_SnesCore_nativeGetCoreOption(JNIEnv *, jclass, jint);
+void     Java_com_midoali_snes_SnesCore_nativeWriteRamByte(JNIEnv *, jclass, jint, jint);
 
 static unsigned char g_video[1024 * 1024];
 static int16_t g_audio[65536];
@@ -121,4 +139,25 @@ int host_audio_total(void)
       n += got;
    }
    return n;
+}
+
+void host_reset(void) { Java_com_midoali_snes_SnesCore_nativeReset(&g_env, NULL); }
+void host_set_video_filter(int mode) { Java_com_midoali_snes_SnesCore_nativeSetVideoFilter(&g_env, NULL, mode); }
+int  host_get_video_filter(void) { return Java_com_midoali_snes_SnesCore_nativeGetVideoFilter(&g_env, NULL); }
+void host_set_cheats(int mask) { Java_com_midoali_snes_SnesCore_nativeSetCheats(&g_env, NULL, mask); }
+int  host_get_cheats(void) { return Java_com_midoali_snes_SnesCore_nativeGetCheats(&g_env, NULL); }
+int  host_apply_cheat_code(int index, int enabled, const char *code)
+{
+   return Java_com_midoali_snes_SnesCore_nativeApplyCheatCode(&g_env, NULL, index,
+                                                             enabled ? 1 : 0, (jstring)code);
+}
+int  host_read_ram(int address) { return Java_com_midoali_snes_SnesCore_nativeReadRamByte(&g_env, NULL, address); }
+void host_write_ram(int address, int value) { Java_com_midoali_snes_SnesCore_nativeWriteRamByte(&g_env, NULL, address, value); }
+void host_set_core_option(int index, const char *value)
+{
+   Java_com_midoali_snes_SnesCore_nativeSetCoreOption(&g_env, NULL, index, (jstring)value);
+}
+const char *host_get_core_option(int index)
+{
+   return (const char *)Java_com_midoali_snes_SnesCore_nativeGetCoreOption(&g_env, NULL, index);
 }

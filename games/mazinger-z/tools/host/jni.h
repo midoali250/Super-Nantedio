@@ -42,6 +42,8 @@ struct JNINativeInterface_ {
    void       *(*GetDirectBufferAddress)(JNIEnv *env, jobject buf);
    jlong       (*GetDirectBufferCapacity)(JNIEnv *env, jobject buf);
    void        (*SetShortArrayRegion)(JNIEnv *env, jshortArray array, jint start, jint len, const jshort *buf);
+   void        (*SetByteArrayRegion)(JNIEnv *env, jbyteArray array, jint start, jint len, const jbyte *buf);
+   jstring     (*NewStringUTF)(JNIEnv *env, const char *utf);
 };
 
 #endif
